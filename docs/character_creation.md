@@ -11,8 +11,7 @@ process that mirrors the official SRD onboarding rules.
    default languages.
 3. **Class Configuration** – Choose a class, then select the exact number of
    skill proficiencies required by that class.
-4. **Background & Languages** – Choose a background and satisfy any additional
-   language proficiencies granted by it.
+4. **Background** – Choose a background to gain the listed proficiencies.
 5. **Starting Equipment** – Resolve every class equipment choice (each option is
    drawn from the SRD starting packages) before continuing.
 6. **Confirmation** – Review the full summary (ability scores, proficiencies,
