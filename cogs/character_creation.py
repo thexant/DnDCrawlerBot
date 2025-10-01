@@ -395,7 +395,7 @@ class LanguageSelectionModal(discord.ui.Modal):
             style=discord.TextStyle.long,
             placeholder=placeholder,
             required=required > 0,
-            value=", ".join(view.get_languages(source)) if required else "",
+            default=", ".join(view.get_languages(source)),
         )
         self.add_item(self.input)
         self.required = required
