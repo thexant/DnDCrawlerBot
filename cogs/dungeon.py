@@ -12,12 +12,14 @@ from discord import app_commands
 from discord.ext import commands
 
 from dnd.combat import saving_throw
+from dnd.content import ContentLibrary, ContentLoadError
 from dnd.dungeon import Dungeon, DungeonGenerator, Room, Theme, ThemeRegistry
+from dnd.dungeon.state import DungeonMetadataStore
 from dnd.sessions import SessionKey, SessionManager
 
 
 def _default_data_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "data" / "themes"
+    return Path(__file__).resolve().parent.parent / "data"
 
 
 @dataclass
@@ -97,10 +99,15 @@ class DungeonCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        data_path = _default_data_path()
-        self.theme_registry = ThemeRegistry.load_from_path(data_path)
+        self.data_path = _default_data_path()
+        self.theme_registry = ThemeRegistry()
+        self.content_library: ContentLibrary | None = None
+        self._content_error: ContentLoadError | None = None
         self.sessions: SessionManager[DungeonSession] = SessionManager()
-        self.guild_themes: Dict[int, str] = {}
+        self._guild_theme_cache: Dict[int, Optional[str]] = {}
+        metadata_path = self.data_path / "sessions" / "metadata.json"
+        self.metadata_store = DungeonMetadataStore(metadata_path)
+        self._load_content(silent=True)
 
     def cog_unload(self) -> None:  # noqa: D401 - discord.py hook
         try:
@@ -109,20 +116,43 @@ class DungeonCog(commands.Cog):
             pass
 
     # ------------------------------------------------------------------
+    def _load_content(self, *, silent: bool = False) -> None:
+        try:
+            library = ContentLibrary.load_from_path(self.data_path)
+        except ContentLoadError as exc:
+            self._content_error = exc
+            if not silent:
+                raise
+        else:
+            self.content_library = library
+            self.theme_registry = library.themes
+            self._content_error = None
+
     def _session_key(self, guild_id: Optional[int], channel_id: Optional[int]) -> SessionKey:
         return SessionManager.make_key(guild_id, channel_id)
 
-    def _resolve_theme(self, theme_name: Optional[str], guild_id: Optional[int]) -> Theme:
+    async def _resolve_theme(self, theme_name: Optional[str], guild_id: Optional[int]) -> Theme:
         if theme_name:
             return self.theme_registry.get(theme_name)
         if guild_id is not None:
-            default = self.guild_themes.get(guild_id)
-            if default:
-                return self.theme_registry.get(default)
-        try:
-            return next(iter(self.theme_registry.values()))
-        except StopIteration as exc:
-            raise RuntimeError("No dungeon themes are available") from exc
+            cached = self._guild_theme_cache.get(guild_id)
+            if cached:
+                return self.theme_registry.get(cached)
+            stored = await self.metadata_store.get_default_theme(guild_id)
+            if stored:
+                try:
+                    theme = self.theme_registry.get(stored)
+                except KeyError:
+                    await self.metadata_store.set_default_theme(guild_id, None)
+                    self._guild_theme_cache[guild_id] = None
+                else:
+                    self._guild_theme_cache[guild_id] = theme.key
+                    return theme
+            self._guild_theme_cache[guild_id] = None
+        theme = self.theme_registry.first()
+        if theme is None:
+            raise RuntimeError("No dungeon themes are available")
+        return theme
 
     def _party_display(self, interaction: discord.Interaction, session: DungeonSession) -> str:
         if not session.party_ids:
@@ -239,14 +269,14 @@ class DungeonCog(commands.Cog):
         seed: Optional[int] = None,
     ) -> None:
         if not self.theme_registry.values():
-            await interaction.response.send_message(
-                "No dungeon themes are available. Please add files under data/themes.",
-                ephemeral=True,
-            )
+            message = "No dungeon themes are available. Please add files under data/<category>/ and reload."
+            if self._content_error is not None:
+                message += f" Last load error: {self._content_error}."
+            await interaction.response.send_message(message, ephemeral=True)
             return
 
         try:
-            theme_obj = self._resolve_theme(theme, interaction.guild_id)
+            theme_obj = await self._resolve_theme(theme, interaction.guild_id)
         except KeyError:
             available = ", ".join(sorted(t.name for t in self.theme_registry.values()))
             await interaction.response.send_message(
@@ -279,6 +309,12 @@ class DungeonCog(commands.Cog):
         )
         session.party_ids.add(interaction.user.id)
         await self.sessions.set(key, session)
+        if interaction.guild_id is not None:
+            await self.metadata_store.record_session(
+                interaction.guild_id,
+                theme=theme_obj.key,
+                seed=seed,
+            )
 
         embed = self._build_room_embed(interaction, session)
         view = self._build_navigation_view(session)
@@ -313,6 +349,18 @@ class DungeonCog(commands.Cog):
                 pass
         await interaction.followup.send("The dungeon session has been reset.", ephemeral=True)
 
+    @dungeon_group.command(name="reload", description="Reload dungeon content from disk.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def reload_content(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            self._load_content(silent=False)
+        except ContentLoadError as exc:
+            await interaction.followup.send(f"Failed to reload dungeon content: {exc}", ephemeral=True)
+            return
+        self._guild_theme_cache.clear()
+        await interaction.followup.send("Dungeon content reloaded.", ephemeral=True)
+
     @dungeon_group.command(name="theme", description="Configure the default dungeon theme for this guild.")
     @app_commands.describe(name="Theme name to use as default", clear="Clear the configured default theme")
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -330,7 +378,8 @@ class DungeonCog(commands.Cog):
             return
 
         if clear:
-            self.guild_themes.pop(interaction.guild_id, None)
+            await self.metadata_store.set_default_theme(interaction.guild_id, None)
+            self._guild_theme_cache.pop(interaction.guild_id, None)
             await interaction.response.send_message("Cleared the default dungeon theme.", ephemeral=True)
             return
 
@@ -351,7 +400,8 @@ class DungeonCog(commands.Cog):
             )
             return
 
-        self.guild_themes[interaction.guild_id] = theme.name
+        await self.metadata_store.set_default_theme(interaction.guild_id, theme.key)
+        self._guild_theme_cache[interaction.guild_id] = theme.key
         await interaction.response.send_message(
             f"Default dungeon theme set to {theme.name}.",
             ephemeral=True,

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import random
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Mapping, Sequence
+from typing import Sequence
+
+from dnd.content import EncounterTable, Item, Monster, RoomTemplate, Theme, Trap
 
 __all__ = [
     "Corridor",
@@ -14,78 +14,13 @@ __all__ = [
     "DungeonGenerator",
     "EncounterResult",
     "EncounterTable",
-    "LootDefinition",
-    "MonsterDefinition",
+    "Item",
+    "Monster",
     "Room",
     "RoomTemplate",
     "Theme",
-    "ThemeRegistry",
-    "TrapDefinition",
+    "Trap",
 ]
-
-
-@dataclass(frozen=True)
-class MonsterDefinition:
-    """Static data describing a monster that can appear in encounters."""
-
-    name: str
-    challenge: float
-    armor_class: int
-    hit_points: int
-    attack_bonus: int
-    damage: str
-    ability_scores: Mapping[str, int] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class TrapDefinition:
-    """Static data describing a trap."""
-
-    name: str
-    description: str
-    saving_throw: Mapping[str, object] | None = None
-    damage: str | None = None
-
-
-@dataclass(frozen=True)
-class LootDefinition:
-    """Static data describing potential loot."""
-
-    name: str
-    rarity: str
-    description: str | None = None
-
-
-@dataclass(frozen=True)
-class RoomTemplate:
-    """Template used during room generation."""
-
-    name: str
-    description: str
-    encounter_weights: Mapping[str, int] = field(default_factory=dict)
-    weight: int = 1
-    tags: Sequence[str] = field(default_factory=tuple)
-
-
-class EncounterTable:
-    """Weighted table used to select an encounter type or entry."""
-
-    def __init__(self, entries: Mapping[str, int]) -> None:
-        self._entries: Dict[str, int] = {
-            key: int(value)
-            for key, value in entries.items()
-            if int(value) > 0
-        }
-        if not self._entries:
-            raise ValueError("Encounter table must contain at least one positive weight entry")
-
-    def roll(self, rng: random.Random) -> str:
-        population = list(self._entries.keys())
-        weights = [self._entries[key] for key in population]
-        return rng.choices(population, weights=weights, k=1)[0]
-
-    def entries(self) -> Mapping[str, int]:
-        return dict(self._entries)
 
 
 @dataclass
@@ -94,9 +29,9 @@ class EncounterResult:
 
     kind: str
     summary: str
-    monsters: Sequence[MonsterDefinition] = field(default_factory=tuple)
-    traps: Sequence[TrapDefinition] = field(default_factory=tuple)
-    loot: Sequence[LootDefinition] = field(default_factory=tuple)
+    monsters: Sequence[Monster] = field(default_factory=tuple)
+    traps: Sequence[Trap] = field(default_factory=tuple)
+    loot: Sequence[Item] = field(default_factory=tuple)
 
 
 @dataclass
@@ -125,7 +60,7 @@ class Dungeon:
 
     name: str
     seed: int | None
-    theme: "Theme"
+    theme: Theme
     rooms: Sequence[Room]
     corridors: Sequence[Corridor]
 
@@ -134,146 +69,6 @@ class Dungeon:
             if room.id == room_id:
                 return room
         raise KeyError(room_id)
-
-
-@dataclass(frozen=True)
-class Theme:
-    """Domain model describing a dungeon theme."""
-
-    name: str
-    description: str
-    room_templates: Sequence[RoomTemplate]
-    monsters: Sequence[MonsterDefinition]
-    traps: Sequence[TrapDefinition]
-    loot: Sequence[LootDefinition]
-    encounter_table: EncounterTable
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, object]) -> "Theme":
-        name = str(data["name"])
-        description = str(data.get("description", ""))
-
-        templates: List[RoomTemplate] = []
-        for template_data in data.get("room_templates", []):
-            template = RoomTemplate(
-                name=str(template_data.get("name", "Unknown Room")),
-                description=str(template_data.get("description", "")),
-                encounter_weights={
-                    str(key): int(value)
-                    for key, value in dict(template_data.get("encounter_weights", {})).items()
-                },
-                weight=int(template_data.get("weight", 1)),
-                tags=tuple(template_data.get("tags", [])),
-            )
-            templates.append(template)
-
-        monster_defs: List[MonsterDefinition] = []
-        for monster_data in data.get("monsters", []):
-            monster_defs.append(
-                MonsterDefinition(
-                    name=str(monster_data.get("name", "Mysterious Entity")),
-                    challenge=float(monster_data.get("challenge", 0)),
-                    armor_class=int(monster_data.get("armor_class", 10)),
-                    hit_points=int(monster_data.get("hit_points", 5)),
-                    attack_bonus=int(monster_data.get("attack_bonus", 0)),
-                    damage=str(monster_data.get("damage", "1d6")),
-                    ability_scores=dict(monster_data.get("ability_scores", {})),
-                )
-            )
-
-        trap_defs: List[TrapDefinition] = []
-        for trap_data in data.get("traps", []):
-            trap_defs.append(
-                TrapDefinition(
-                    name=str(trap_data.get("name", "Hidden Trap")),
-                    description=str(trap_data.get("description", "")),
-                    saving_throw=dict(trap_data.get("saving_throw")) if trap_data.get("saving_throw") else None,
-                    damage=(str(trap_data.get("damage")) if trap_data.get("damage") else None),
-                )
-            )
-
-        loot_defs: List[LootDefinition] = []
-        for loot_data in data.get("loot", []):
-            loot_defs.append(
-                LootDefinition(
-                    name=str(loot_data.get("name", "Treasure")),
-                    rarity=str(loot_data.get("rarity", "Common")),
-                    description=(str(loot_data.get("description")) if loot_data.get("description") else None),
-                )
-            )
-
-        encounter_data = dict(data.get("encounters", {}))
-        if not encounter_data:
-            encounter_data = {"combat": 3, "trap": 1, "treasure": 1, "empty": 1}
-
-        encounter_table = EncounterTable(
-            {
-                str(key): int(value)
-                for key, value in encounter_data.items()
-            }
-        )
-
-        return cls(
-            name=name,
-            description=description,
-            room_templates=tuple(templates),
-            monsters=tuple(monster_defs),
-            traps=tuple(trap_defs),
-            loot=tuple(loot_defs),
-            encounter_table=encounter_table,
-        )
-
-    def random_room_template(self, rng: random.Random) -> RoomTemplate:
-        if not self.room_templates:
-            raise ValueError(f"Theme '{self.name}' has no room templates")
-        weights = [max(1, template.weight) for template in self.room_templates]
-        return rng.choices(list(self.room_templates), weights=weights, k=1)[0]
-
-    def random_monsters(self, rng: random.Random, count: int) -> Sequence[MonsterDefinition]:
-        if not self.monsters:
-            return ()
-        return tuple(rng.choices(list(self.monsters), k=count))
-
-    def random_trap(self, rng: random.Random) -> Sequence[TrapDefinition]:
-        if not self.traps:
-            return ()
-        return (rng.choice(list(self.traps)),)
-
-    def random_loot(self, rng: random.Random, count: int = 1) -> Sequence[LootDefinition]:
-        if not self.loot:
-            return ()
-        return tuple(rng.choices(list(self.loot), k=count))
-
-
-class ThemeRegistry:
-    """Registry responsible for loading and providing access to themes."""
-
-    def __init__(self) -> None:
-        self._themes: Dict[str, Theme] = {}
-
-    def register(self, theme: Theme) -> None:
-        self._themes[theme.name.lower()] = theme
-
-    def get(self, name: str) -> Theme:
-        try:
-            return self._themes[name.lower()]
-        except KeyError as exc:
-            raise KeyError(f"Theme '{name}' is not registered") from exc
-
-    def values(self) -> Sequence[Theme]:
-        return tuple(self._themes.values())
-
-    @classmethod
-    def load_from_path(cls, path: Path) -> "ThemeRegistry":
-        registry = cls()
-        if not path.exists():
-            return registry
-        for file_path in sorted(path.glob("*.json")):
-            with file_path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            theme = Theme.from_dict(data)
-            registry.register(theme)
-        return registry
 
 
 class DungeonGenerator:

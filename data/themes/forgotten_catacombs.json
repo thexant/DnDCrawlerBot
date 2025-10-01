@@ -25,52 +25,18 @@
     }
   ],
   "monsters": [
-    {
-      "name": "Skeletal Guardian",
-      "challenge": 2,
-      "armor_class": 14,
-      "hit_points": 27,
-      "attack_bonus": 4,
-      "damage": "1d8+2",
-      "ability_scores": {"STR": 13, "DEX": 14, "CON": 15}
-    },
-    {
-      "name": "Ghast",
-      "challenge": 3,
-      "armor_class": 12,
-      "hit_points": 36,
-      "attack_bonus": 5,
-      "damage": "2d6+3",
-      "ability_scores": {"STR": 16, "DEX": 17, "CON": 13}
-    },
-    {
-      "name": "Wight Captain",
-      "challenge": 5,
-      "armor_class": 14,
-      "hit_points": 60,
-      "attack_bonus": 6,
-      "damage": "1d10+4",
-      "ability_scores": {"STR": 16, "DEX": 14, "WIS": 12}
-    }
+    "skeletal_guardian",
+    "ghast",
+    "wight_captain"
   ],
   "traps": [
-    {
-      "name": "Falling Sarcophagus Lid",
-      "description": "A hidden trigger drops a heavy stone lid from the ceiling.",
-      "saving_throw": {"ability": "DEX", "dc": 13},
-      "damage": "3d10 bludgeoning"
-    },
-    {
-      "name": "Necrotic Miasma",
-      "description": "A swirling cloud of necrotic energy drains warmth and hope.",
-      "saving_throw": {"ability": "CON", "dc": 14},
-      "damage": "3d6 necrotic"
-    }
+    "falling_sarcophagus_lid",
+    "necrotic_miasma"
   ],
   "loot": [
-    {"name": "Ruby Eye Gem", "rarity": "Rare"},
-    {"name": "Blessed Reliquary", "rarity": "Uncommon"},
-    {"name": "Potion of Vitality", "rarity": "Rare"}
+    "ruby_eye_gem",
+    "blessed_reliquary",
+    "potion_of_vitality"
   ],
   "encounters": {"combat": 5, "trap": 3, "treasure": 1, "empty": 1}
 }

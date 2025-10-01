@@ -25,52 +25,18 @@
     }
   ],
   "monsters": [
-    {
-      "name": "Animated Armor",
-      "challenge": 3,
-      "armor_class": 18,
-      "hit_points": 33,
-      "attack_bonus": 5,
-      "damage": "1d8+3",
-      "ability_scores": {"STR": 14, "DEX": 11, "CON": 13}
-    },
-    {
-      "name": "Spectral Mage",
-      "challenge": 4,
-      "armor_class": 12,
-      "hit_points": 40,
-      "attack_bonus": 6,
-      "damage": "2d8+4",
-      "ability_scores": {"INT": 18, "DEX": 14, "WIS": 12}
-    },
-    {
-      "name": "Arcane Sentinel",
-      "challenge": 5,
-      "armor_class": 17,
-      "hit_points": 68,
-      "attack_bonus": 7,
-      "damage": "2d10+4",
-      "ability_scores": {"STR": 18, "CON": 16, "WIS": 10}
-    }
+    "animated_armor",
+    "spectral_mage",
+    "arcane_sentinel"
   ],
   "traps": [
-    {
-      "name": "Glyph of Detonation",
-      "description": "A hidden rune unleashes a burst of force when stepped upon.",
-      "saving_throw": {"ability": "DEX", "dc": 15},
-      "damage": "4d6 force"
-    },
-    {
-      "name": "Temporal Snare",
-      "description": "An amber field freezes victims in a loop of slow time.",
-      "saving_throw": {"ability": "WIS", "dc": 14},
-      "damage": null
-    }
+    "glyph_of_detonation",
+    "temporal_snare"
   ],
   "loot": [
-    {"name": "Spell Scroll of Counterspell", "rarity": "Rare"},
-    {"name": "Wand of the War Mage", "rarity": "Uncommon"},
-    {"name": "Potion of Arcane Recovery", "rarity": "Uncommon"}
+    "spell_scroll_of_counterspell",
+    "wand_of_the_war_mage",
+    "potion_of_arcane_recovery"
   ],
   "encounters": {"combat": 4, "trap": 2, "treasure": 2, "empty": 1}
 }

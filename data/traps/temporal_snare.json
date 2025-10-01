@@ -1,0 +1,6 @@
+{
+  "name": "Temporal Snare",
+  "description": "An amber field freezes victims in a loop of slow time.",
+  "saving_throw": {"ability": "WIS", "dc": 14},
+  "tags": ["arcane", "control"]
+}

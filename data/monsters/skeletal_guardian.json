@@ -1,0 +1,10 @@
+{
+  "name": "Skeletal Guardian",
+  "challenge": 2,
+  "armor_class": 14,
+  "hit_points": 27,
+  "attack_bonus": 4,
+  "damage": "1d8+2",
+  "ability_scores": {"STR": 13, "DEX": 14, "CON": 15},
+  "tags": ["undead", "minion"]
+}
