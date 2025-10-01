@@ -20,7 +20,7 @@ from dnd import (
     Character,
     CharacterRepository,
 )
-from dnd.characters import EquipmentChoice, EquipmentChoiceOption
+from dnd.characters import EquipmentChoice, EquipmentChoiceOption, SkillSelection
 
 LANGUAGE_OPTIONS: tuple[str, ...] = (
     "Common",
@@ -414,6 +414,94 @@ class LanguageSelectionModal(discord.ui.Modal):
         await self.creation_view.refresh(interaction)
 
 
+class SkillSelectionView(discord.ui.View):
+    def __init__(
+        self,
+        creation_view: "CharacterCreationView",
+        selection: SkillSelection,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.creation_view = creation_view
+        self.selection = selection
+
+        skill_select = discord.ui.Select(
+            placeholder=f"Choose {selection.count} class skill(s)",
+            min_values=selection.count,
+            max_values=selection.count,
+            options=[
+                discord.SelectOption(
+                    label=skill,
+                    value=skill,
+                    default=skill in self.creation_view.state.class_skill_choices,
+                )
+                for skill in selection.options
+            ],
+        )
+
+        async def callback(interaction: discord.Interaction) -> None:
+            try:
+                self.creation_view.state.set_class_skills(skill_select.values)
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            await self.creation_view.refresh()
+            await interaction.response.edit_message(
+                content="Class skills updated.", view=None
+            )
+
+        skill_select.callback = callback  # type: ignore[assignment]
+        self.add_item(skill_select)
+
+
+class EquipmentSelectionView(discord.ui.View):
+    def __init__(
+        self,
+        creation_view: "CharacterCreationView",
+        choice: EquipmentChoice,
+        *,
+        index: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.creation_view = creation_view
+        self.choice = choice
+        self.index = index
+
+        placeholder = f"Equipment choice {index}: select {choice.choose} option(s)"
+        current_values = self.creation_view.state.equipment_choices.get(choice.key, ())
+        equipment_select = discord.ui.Select(
+            placeholder=placeholder,
+            min_values=choice.choose,
+            max_values=choice.choose,
+            options=[
+                discord.SelectOption(
+                    label=option.name,
+                    value=option.key,
+                    description=", ".join(
+                        stack.as_label() for stack in option.items
+                    )[:100],
+                    default=option.key in current_values,
+                )
+                for option in choice.options
+            ],
+        )
+
+        async def callback(interaction: discord.Interaction) -> None:
+            try:
+                self.creation_view.state.set_equipment_choice(
+                    self.choice.key, equipment_select.values
+                )
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            await self.creation_view.refresh()
+            await interaction.response.edit_message(
+                content=f"Equipment choice {self.index} updated.", view=None
+            )
+
+        equipment_select.callback = callback  # type: ignore[assignment]
+        self.add_item(equipment_select)
+
+
 class CharacterCreationView(discord.ui.View):
     def __init__(self, repository: CharacterRepository, user: discord.abc.User) -> None:
         super().__init__(timeout=900)
@@ -453,6 +541,7 @@ class CharacterCreationView(discord.ui.View):
         assign_button = discord.ui.Button(
             label=roll_label,
             style=discord.ButtonStyle.primary,
+            row=0,
         )
 
         async def assign_callback(interaction: discord.Interaction) -> None:
@@ -482,6 +571,7 @@ class CharacterCreationView(discord.ui.View):
             min_values=1,
             max_values=1,
             options=race_options,
+            row=2,
         )
 
         async def race_callback(interaction: discord.Interaction) -> None:
@@ -497,8 +587,12 @@ class CharacterCreationView(discord.ui.View):
             race = AVAILABLE_RACES[self.state.race_key]
             if race.languages.choices > 0:
                 race_lang_button = discord.ui.Button(
-                    label=f"Select Race Languages ({len(self.state.race_languages)}/{race.languages.choices})",
+                    label=(
+                        f"Select Race Languages "
+                        f"({len(self.state.race_languages)}/{race.languages.choices})"
+                    ),
                     style=discord.ButtonStyle.secondary,
+                    row=0,
                 )
 
                 async def race_lang_callback(interaction: discord.Interaction) -> None:
@@ -527,6 +621,7 @@ class CharacterCreationView(discord.ui.View):
             min_values=1,
             max_values=1,
             options=class_options,
+            row=3,
         )
 
         async def class_callback(interaction: discord.Interaction) -> None:
@@ -542,31 +637,28 @@ class CharacterCreationView(discord.ui.View):
             character_class = AVAILABLE_CLASSES[self.state.class_key]
             skill_selection = character_class.skill_proficiency_options
             if skill_selection.count > 0:
-                skill_select = discord.ui.Select(
-                    placeholder=f"Choose {skill_selection.count} class skill(s)",
-                    min_values=skill_selection.count,
-                    max_values=skill_selection.count,
-                    options=[
-                        discord.SelectOption(
-                            label=skill,
-                            value=skill,
-                            default=skill in self.state.class_skill_choices,
-                        )
-                        for skill in skill_selection.options
-                    ],
+                skill_button = discord.ui.Button(
+                    label=(
+                        f"Select Class Skills "
+                        f"({len(self.state.class_skill_choices)}/{skill_selection.count})"
+                    ),
+                    style=discord.ButtonStyle.secondary,
+                    row=1,
                 )
 
-                async def skill_callback(interaction: discord.Interaction) -> None:
-                    try:
-                        self.state.set_class_skills(skill_select.values)
-                    except ValueError as exc:
-                        await interaction.response.send_message(str(exc), ephemeral=True)
-                        return
-                    await self.refresh(interaction)
+                async def skill_callback(
+                    interaction: discord.Interaction,
+                    selection: SkillSelection = skill_selection,
+                ) -> None:
+                    await interaction.response.send_message(
+                        "Choose class skills:",
+                        ephemeral=True,
+                        view=SkillSelectionView(self, selection),
+                    )
 
-                skill_select.callback = skill_callback  # type: ignore[assignment]
-                skill_select.disabled = step < 3
-                self.add_item(skill_select)
+                skill_button.callback = skill_callback  # type: ignore[assignment]
+                skill_button.disabled = step < 3
+                self.add_item(skill_button)
 
         # Background selection
         background_options = [
@@ -583,6 +675,7 @@ class CharacterCreationView(discord.ui.View):
             min_values=1,
             max_values=1,
             options=background_options,
+            row=4,
         )
 
         async def background_callback(interaction: discord.Interaction) -> None:
@@ -602,6 +695,7 @@ class CharacterCreationView(discord.ui.View):
                         f"({len(self.state.background_languages)}/{background.language_choices})"
                     ),
                     style=discord.ButtonStyle.secondary,
+                    row=0,
                 )
 
                 async def background_lang_callback(interaction: discord.Interaction) -> None:
@@ -620,42 +714,39 @@ class CharacterCreationView(discord.ui.View):
         # Equipment selection
         if self.state.class_key:
             character_class = AVAILABLE_CLASSES[self.state.class_key]
-            for choice in character_class.equipment_choices:
-                current_values = self.state.equipment_choices.get(choice.key, ())
-                equipment_select = discord.ui.Select(
-                    placeholder=f"Choose {choice.choose} option(s) for equipment",
-                    min_values=choice.choose,
-                    max_values=choice.choose,
-                    options=[
-                        discord.SelectOption(
-                            label=option.name,
-                            value=option.key,
-                            description=", ".join(stack.as_label() for stack in option.items)[:100],
-                            default=option.key in current_values,
-                        )
-                        for option in choice.options
-                    ],
+            for index, choice in enumerate(character_class.equipment_choices, start=1):
+                selected = self.state.equipment_choices.get(choice.key, ())
+                label = (
+                    f"Equipment Choice {index} "
+                    f"({len(selected)}/{choice.choose})"
+                )
+                equipment_button = discord.ui.Button(
+                    label=label,
+                    style=discord.ButtonStyle.secondary,
+                    row=1,
                 )
 
                 async def equipment_callback(
                     interaction: discord.Interaction,
-                    *,
                     choice_obj: EquipmentChoice = choice,
-                    select_component: discord.ui.Select = equipment_select,
+                    idx: int = index,
                 ) -> None:
-                    try:
-                        self.state.set_equipment_choice(choice_obj.key, select_component.values)
-                    except ValueError as exc:
-                        await interaction.response.send_message(str(exc), ephemeral=True)
-                        return
-                    await self.refresh(interaction)
+                    await interaction.response.send_message(
+                        f"Choose equipment for option {idx}:",
+                        ephemeral=True,
+                        view=EquipmentSelectionView(self, choice_obj, index=idx),
+                    )
 
-                equipment_select.callback = equipment_callback  # type: ignore[assignment]
-                equipment_select.disabled = step < 5
-                self.add_item(equipment_select)
+                equipment_button.callback = equipment_callback  # type: ignore[assignment]
+                equipment_button.disabled = step < 5
+                self.add_item(equipment_button)
 
         # Reset and confirm buttons
-        reset_button = discord.ui.Button(label="Reset", style=discord.ButtonStyle.danger)
+        reset_button = discord.ui.Button(
+            label="Reset",
+            style=discord.ButtonStyle.danger,
+            row=0,
+        )
 
         async def reset_callback(interaction: discord.Interaction) -> None:
             self.state = CreationState()
@@ -665,7 +756,10 @@ class CharacterCreationView(discord.ui.View):
         self.add_item(reset_button)
 
         confirm_button = discord.ui.Button(
-            label="Confirm Character", style=discord.ButtonStyle.success, disabled=not self.state.is_ready()
+            label="Confirm Character",
+            style=discord.ButtonStyle.success,
+            disabled=not self.state.is_ready(),
+            row=0,
         )
 
         async def confirm_callback(interaction: discord.Interaction) -> None:
