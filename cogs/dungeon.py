@@ -8,13 +8,14 @@ import re
 import secrets
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, Iterable, List, Literal, Optional
+from typing import Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Sequence
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from dnd.combat import attack_roll, saving_throw
+from dnd.combat import ability_modifier, attack_roll, saving_throw
+from dnd.characters import EQUIPMENT, Character
 from dnd.repository import CharacterRepository
 from dnd.content import ContentLibrary, ContentLoadError
 from dnd.dungeon import Dungeon, DungeonGenerator, Room, Theme, ThemeRegistry
@@ -29,6 +30,92 @@ DEFAULT_PLAYER_HP = 20
 DEFAULT_PLAYER_ARMOR_CLASS = 13
 DEFAULT_PLAYER_ATTACK_BONUS = 5
 DEFAULT_PLAYER_DAMAGE = "1d8+3"
+PROFICIENCY_BONUS = 2
+SPELLCASTING_ABILITIES: Dict[str, str] = {
+    "wizard": "INT",
+}
+
+
+@dataclass(frozen=True)
+class ArmorDefinition:
+    base_ac: int
+    dex_cap: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class WeaponDefinition:
+    damage_die: str
+    categories: Sequence[str]
+    finesse: bool = False
+    ranged: bool = False
+    name: Optional[str] = None
+    quantity: int = 1
+
+
+ARMOR_DEFINITIONS: Dict[str, ArmorDefinition] = {
+    "chain_mail": ArmorDefinition(base_ac=16, dex_cap=0),
+    "leather_armor": ArmorDefinition(base_ac=11, dex_cap=None),
+    "scale_mail": ArmorDefinition(base_ac=14, dex_cap=2),
+}
+
+SHIELD_BONUSES: Dict[str, int] = {
+    "shield": 2,
+}
+
+WEAPON_DEFINITIONS: Dict[str, WeaponDefinition] = {
+    "dagger": WeaponDefinition(
+        damage_die="1d4",
+        categories=("simple weapons", "daggers"),
+        finesse=True,
+        name="Dagger",
+    ),
+    "light_crossbow": WeaponDefinition(
+        damage_die="1d8",
+        categories=("simple weapons", "light crossbows"),
+        ranged=True,
+        name="Light Crossbow",
+    ),
+    "longbow": WeaponDefinition(
+        damage_die="1d8",
+        categories=("martial weapons", "longbows"),
+        ranged=True,
+        name="Longbow",
+    ),
+    "longsword": WeaponDefinition(
+        damage_die="1d8",
+        categories=("martial weapons", "longswords"),
+        name="Longsword",
+    ),
+    "mace": WeaponDefinition(
+        damage_die="1d6",
+        categories=("simple weapons", "maces"),
+        name="Mace",
+    ),
+    "quarterstaff": WeaponDefinition(
+        damage_die="1d6",
+        categories=("simple weapons", "quarterstaffs"),
+        name="Quarterstaff",
+    ),
+    "rapier": WeaponDefinition(
+        damage_die="1d8",
+        categories=("martial weapons", "rapiers"),
+        finesse=True,
+        name="Rapier",
+    ),
+    "shortbow": WeaponDefinition(
+        damage_die="1d6",
+        categories=("simple weapons", "shortbows"),
+        ranged=True,
+        name="Shortbow",
+    ),
+    "shortsword_pair": WeaponDefinition(
+        damage_die="1d6",
+        categories=("martial weapons", "shortswords"),
+        finesse=True,
+        name="Shortsword",
+        quantity=2,
+    ),
+}
 MAX_COMBAT_LOG_ENTRIES = 12
 _DAMAGE_ROLL_PATTERN = re.compile(r"(?i)(?P<count>\d+)d(?P<sides>\d+)(?P<modifier>[+-]\d+)?")
 
@@ -696,6 +783,218 @@ class DungeonCog(commands.Cog):
         state.log.append(message)
         self._trim_combat_log(state)
 
+    @staticmethod
+    def _format_damage_expression(damage_die: str, ability_mod: int) -> str:
+        if ability_mod > 0:
+            return f"{damage_die}+{ability_mod}"
+        if ability_mod < 0:
+            return f"{damage_die}{ability_mod}"
+        return damage_die
+
+    def _calculate_armor_class(
+        self, ability_scores: Dict[str, int], equipment_keys: Sequence[str]
+    ) -> tuple[int, Optional[str], bool]:
+        dex_mod = ability_modifier(int(ability_scores.get("DEX", 10)))
+        armor_ac: Optional[int] = None
+        armor_key: Optional[str] = None
+        for key in equipment_keys:
+            definition = ARMOR_DEFINITIONS.get(key)
+            if definition is None:
+                continue
+            dex_bonus: int
+            if definition.dex_cap is None:
+                dex_bonus = dex_mod
+            elif definition.dex_cap == 0:
+                dex_bonus = 0
+            elif dex_mod >= 0:
+                dex_bonus = min(dex_mod, definition.dex_cap)
+            else:
+                dex_bonus = dex_mod
+            total = definition.base_ac + dex_bonus
+            if armor_ac is None or total > armor_ac:
+                armor_ac = total
+                armor_key = key
+        if armor_ac is None:
+            armor_ac = 10 + dex_mod
+        shield_bonus = 0
+        shield_equipped = False
+        for key in equipment_keys:
+            bonus = SHIELD_BONUSES.get(key, 0)
+            if bonus:
+                shield_equipped = True
+                shield_bonus += bonus
+        return armor_ac + shield_bonus, armor_key, shield_equipped
+
+    def _weapon_attack_options(
+        self,
+        character: Character,
+        equipment_keys: Sequence[str],
+        ability_scores: Dict[str, int],
+    ) -> tuple[List[Dict[str, object]], List[str]]:
+        proficiencies = {value.lower() for value in character.proficiencies}
+        proficiencies.update(value.lower() for value in character.character_class.weapon_proficiencies)
+        strength_mod = ability_modifier(int(ability_scores.get("STR", 10)))
+        dexterity_mod = ability_modifier(int(ability_scores.get("DEX", 10)))
+        options: List[Dict[str, object]] = []
+        warnings: List[str] = []
+        seen: set[str] = set()
+        for key in equipment_keys:
+            definition = WEAPON_DEFINITIONS.get(key)
+            if definition is None:
+                continue
+            if key in seen and definition.quantity == 1:
+                continue
+            seen.add(key)
+            ability = "STR"
+            ability_mod = strength_mod
+            if definition.ranged:
+                ability = "DEX"
+                ability_mod = dexterity_mod
+            elif definition.finesse:
+                if dexterity_mod >= strength_mod:
+                    ability = "DEX"
+                    ability_mod = dexterity_mod
+            proficient = any(tag.lower() in proficiencies for tag in definition.categories)
+            attack_bonus = ability_mod + (PROFICIENCY_BONUS if proficient else 0)
+            damage = self._format_damage_expression(definition.damage_die, ability_mod)
+            item = EQUIPMENT.get(key)
+            display_name = definition.name or (item.name if item else key.replace("_", " ").title())
+            try:
+                dice_count_str, dice_sides_str = definition.damage_die.lower().split("d", 1)
+                dice_count = int(dice_count_str)
+                dice_sides = int(dice_sides_str)
+            except (AttributeError, ValueError):
+                dice_count = 1
+                dice_sides = 4
+            average_damage = dice_count * (dice_sides + 1) / 2 + ability_mod
+            option: Dict[str, object] = {
+                "name": display_name,
+                "weapon_key": key,
+                "attack_bonus": attack_bonus,
+                "damage": damage,
+                "damage_die": definition.damage_die,
+                "ability": ability,
+                "ability_modifier": ability_mod,
+                "proficient": proficient,
+                "quantity": definition.quantity,
+                "average_damage": average_damage,
+            }
+            options.append(option)
+            if not proficient:
+                warnings.append(f"Not proficient with {display_name}—attacks will suffer.")
+        if not options:
+            ability = "STR" if strength_mod >= dexterity_mod else "DEX"
+            ability_mod = strength_mod if ability == "STR" else dexterity_mod
+            attack_bonus = ability_mod + PROFICIENCY_BONUS
+            damage_die = "1d4"
+            options.append(
+                {
+                    "name": "Unarmed Strike",
+                    "weapon_key": "unarmed",
+                    "attack_bonus": attack_bonus,
+                    "damage": self._format_damage_expression(damage_die, ability_mod),
+                    "damage_die": damage_die,
+                    "ability": ability,
+                    "ability_modifier": ability_mod,
+                    "proficient": True,
+                    "quantity": 1,
+                    "average_damage": (4 + 1) / 2 + ability_mod,
+                }
+            )
+            warnings.append("No weapon found—defaulting to an unarmed strike.")
+        options.sort(
+            key=lambda option: (option["attack_bonus"], option.get("average_damage", 0.0)),
+            reverse=True,
+        )
+        return options, warnings
+
+    def _spellcasting_profile(
+        self, character: Character, ability_scores: Dict[str, int]
+    ) -> tuple[Optional[Dict[str, object]], List[str]]:
+        ability_key = SPELLCASTING_ABILITIES.get(character.character_class.key)
+        warnings: List[str] = []
+        if ability_key is None:
+            return None, warnings
+        ability_score = ability_scores.get(ability_key)
+        if ability_score is None:
+            warnings.append(
+                f"Spellcasting ability {ability_key} is missing—spell attacks will be unavailable."
+            )
+            return None, warnings
+        ability_mod = ability_modifier(int(ability_score))
+        profile = {
+            "ability": ability_key,
+            "attack_bonus": ability_mod + PROFICIENCY_BONUS,
+            "save_dc": 8 + PROFICIENCY_BONUS + ability_mod,
+        }
+        return profile, warnings
+
+    def _build_character_combat_profile(self, character: Character) -> tuple[Dict[str, object], List[str]]:
+        warnings: List[str] = []
+        ability_scores = {key: int(value) for key, value in character.ability_scores.values.items()}
+        initiative_bonus = ability_modifier(ability_scores.get("DEX", 10))
+        constitution_mod = ability_modifier(ability_scores.get("CON", 10))
+        hit_die = int(character.character_class.hit_die)
+        max_hp = max(1, hit_die + constitution_mod)
+        equipment_keys = [entry.lower() for entry in character.equipment]
+        armor_class, armor_key, has_shield = self._calculate_armor_class(ability_scores, equipment_keys)
+        weapon_options, weapon_warnings = self._weapon_attack_options(
+            character, equipment_keys, ability_scores
+        )
+        warnings.extend(weapon_warnings)
+        spellcasting_profile, spell_warnings = self._spellcasting_profile(character, ability_scores)
+        warnings.extend(spell_warnings)
+        features = [feature.name for feature in character.character_class.features if feature.level <= 1]
+        equipment_summary = []
+        for key in equipment_keys:
+            item = EQUIPMENT.get(key)
+            equipment_summary.append(item.name if item else key.replace("_", " ").title())
+        metadata: Dict[str, object] = {
+            "armor_class": armor_class,
+            "initiative_bonus": initiative_bonus,
+            "attack_options": weapon_options,
+            "default_attack_index": 0,
+            "combat_options": {
+                "weapons": weapon_options,
+                "spellcasting": spellcasting_profile or {},
+                "features": features,
+            },
+            "equipment": equipment_summary,
+            "proficiency_bonus": PROFICIENCY_BONUS,
+            "features": features,
+            "character_name": character.name,
+            "character_class": character.character_class.name,
+            "race": character.race.name,
+            "hit_die": hit_die,
+            "max_hp": max_hp,
+        }
+        if weapon_options:
+            metadata["attack_bonus"] = weapon_options[0]["attack_bonus"]
+            metadata["damage"] = weapon_options[0]["damage"]
+            metadata["weapon_name"] = weapon_options[0]["name"]
+        else:
+            metadata["attack_bonus"] = DEFAULT_PLAYER_ATTACK_BONUS
+            metadata["damage"] = DEFAULT_PLAYER_DAMAGE
+        if spellcasting_profile:
+            metadata["spellcasting"] = spellcasting_profile
+            metadata["spell_attack_bonus"] = spellcasting_profile["attack_bonus"]
+            metadata["spell_save_dc"] = spellcasting_profile["save_dc"]
+        if armor_key:
+            armor_item = EQUIPMENT.get(armor_key)
+            metadata["armor"] = {
+                "key": armor_key,
+                "name": armor_item.name if armor_item else armor_key.replace("_", " ").title(),
+            }
+        metadata["shield"] = has_shield
+        metadata["warnings"] = warnings
+        profile = {
+            "max_hp": max_hp,
+            "initiative_bonus": initiative_bonus,
+            "armor_class": armor_class,
+            "metadata": metadata,
+        }
+        return profile, warnings
+
     def _run_automatic_turns(self, session: DungeonSession, state: CombatState) -> None:
         if not state.active:
             return
@@ -737,26 +1036,45 @@ class DungeonCog(commands.Cog):
             return "There are no foes left to strike."
         target = targets[0]
         attack_bonus = int(player.metadata.get("attack_bonus", DEFAULT_PLAYER_ATTACK_BONUS))
+        damage_expr = str(player.metadata.get("damage", DEFAULT_PLAYER_DAMAGE))
+        weapon_label = str(player.metadata.get("weapon_name", "weapon"))
+        options = player.metadata.get("attack_options")
+        if isinstance(options, list) and options:
+            index_raw = player.metadata.get("default_attack_index", 0)
+            try:
+                option_index = int(index_raw)
+            except (TypeError, ValueError):
+                option_index = 0
+            if option_index < 0 or option_index >= len(options):
+                option_index = 0
+            option = options[option_index]
+            attack_bonus = int(option.get("attack_bonus", attack_bonus))
+            damage_expr = str(option.get("damage", damage_expr))
+            weapon_label = str(option.get("name", weapon_label))
         target_ac = int(target.metadata.get("armor_class", 10))
         result = attack_roll(attack_bonus, target_ac)
         if result.hits:
-            damage_expr = str(player.metadata.get("damage", DEFAULT_PLAYER_DAMAGE))
             damage = self._roll_damage(damage_expr)
             target.current_hp = max(0, target.current_hp - damage)
+            weapon_text = "" if weapon_label.lower() == "weapon" else f" with your {weapon_label}"
             summary = (
-                f"You hit {target.name} for {damage} damage! "
+                f"You hit {target.name}{weapon_text} for {damage} damage! "
                 f"(Attack {result.total} vs AC {target_ac})"
             )
             log_entry = (
-                f"{player.name} hits {target.name} for {damage} damage. "
+                f"{player.name} hits {target.name}{weapon_text} for {damage} damage. "
                 f"(Attack {result.total} vs AC {target_ac})"
             )
             if target.defeated:
                 log_entry += f" {target.name} is defeated!"
         else:
-            summary = f"Your attack misses {target.name}. (Attack {result.total} vs AC {target_ac})"
+            weapon_text = "" if weapon_label.lower() == "weapon" else f" with your {weapon_label}"
+            summary = (
+                f"Your attack{weapon_text} misses {target.name}. "
+                f"(Attack {result.total} vs AC {target_ac})"
+            )
             log_entry = (
-                f"{player.name}'s attack misses {target.name}. "
+                f"{player.name}'s attack{weapon_text} misses {target.name}. "
                 f"(Attack {result.total} vs AC {target_ac})"
             )
         state.log.append(log_entry)
@@ -770,28 +1088,120 @@ class DungeonCog(commands.Cog):
         self._trim_combat_log(state)
         return "You brace yourself, gaining no additional effects but readying for the next turn."
 
-    def _build_combat_state(
-        self, interaction: discord.Interaction, session: DungeonSession
+    async def _build_combat_state(
+        self,
+        interaction: discord.Interaction,
+        session: DungeonSession,
+        party_order: Optional[Sequence[int]] = None,
     ) -> CombatState:
         combatants: List[CombatantState] = []
-        for user_id in sorted(session.party_ids):
+        warnings_log: List[str] = []
+        guild_id = interaction.guild_id
+        party_ids = list(party_order) if party_order is not None else sorted(session.party_ids)
+        for user_id in party_ids:
             roll = random.randint(1, 20)
             name = self._display_name_for_user(interaction, user_id)
+            metadata: Dict[str, object]
+            initiative_bonus = 0
+            max_hp = DEFAULT_PLAYER_HP
+            armor_class = DEFAULT_PLAYER_ARMOR_CLASS
+            warnings: List[str] = []
+            profile: Optional[Dict[str, object]] = None
+            character: Optional[Character] = None
+            if guild_id is not None:
+                try:
+                    character = await self.characters.get(guild_id, user_id)
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.exception("Failed to load character for user %s", user_id, exc_info=exc)
+                    warnings.append("Character data could not be loaded—using default combat profile.")
+            else:
+                warnings.append("Characters are unavailable outside of guilds—using default combat profile.")
+            if character is not None:
+                try:
+                    profile, profile_warnings = self._build_character_combat_profile(character)
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.exception("Failed to derive combat stats for %s", character, exc_info=exc)
+                    profile = None
+                    profile_warnings = ["Character data invalid—using default combat profile."]
+                warnings.extend(profile_warnings)
+            if profile:
+                initiative_bonus = int(profile.get("initiative_bonus", 0))
+                max_hp = int(profile.get("max_hp", DEFAULT_PLAYER_HP))
+                armor_class = int(profile.get("armor_class", DEFAULT_PLAYER_ARMOR_CLASS))
+                metadata = dict(profile.get("metadata", {}))
+            else:
+                metadata = {
+                    "armor_class": DEFAULT_PLAYER_ARMOR_CLASS,
+                    "initiative_bonus": 0,
+                    "attack_options": [
+                        {
+                            "name": "Fallback Strike",
+                            "weapon_key": "fallback",
+                            "attack_bonus": DEFAULT_PLAYER_ATTACK_BONUS,
+                            "damage": DEFAULT_PLAYER_DAMAGE,
+                            "damage_die": "1d8",
+                            "ability": "STR",
+                            "ability_modifier": ability_modifier(16),
+                            "proficient": True,
+                            "quantity": 1,
+                            "average_damage": ((8 + 1) / 2) + ability_modifier(16),
+                        }
+                    ],
+                    "default_attack_index": 0,
+                    "combat_options": {
+                        "weapons": [],
+                        "spellcasting": {},
+                        "features": [],
+                    },
+                    "proficiency_bonus": PROFICIENCY_BONUS,
+                    "features": [],
+                    "weapon_name": "Fallback Strike",
+                    "attack_bonus": DEFAULT_PLAYER_ATTACK_BONUS,
+                    "damage": DEFAULT_PLAYER_DAMAGE,
+                    "character_name": name,
+                    "max_hp": DEFAULT_PLAYER_HP,
+                }
+                metadata["combat_options"]["weapons"] = metadata["attack_options"]
+                warnings.append("Using default combat profile.")
+            metadata.setdefault("armor_class", armor_class)
+            metadata.setdefault("initiative_bonus", initiative_bonus)
+            metadata.setdefault("attack_options", [])
+            metadata.setdefault("default_attack_index", 0)
+            metadata.setdefault("weapon_name", metadata.get("weapon_name", "weapon"))
+            metadata.setdefault("attack_bonus", DEFAULT_PLAYER_ATTACK_BONUS)
+            metadata.setdefault("damage", DEFAULT_PLAYER_DAMAGE)
+            metadata.setdefault("combat_options", {
+                "weapons": metadata.get("attack_options", []),
+                "spellcasting": {},
+                "features": metadata.get("features", []),
+            })
+            existing_warnings = list(metadata.get("warnings", []))
+            existing_warnings.extend(warnings)
+            metadata["warnings"] = list(dict.fromkeys(existing_warnings))
+            metadata["armor_class"] = int(metadata.get("armor_class", armor_class))
+            armor_class = int(metadata["armor_class"])
+            metadata["initiative_bonus"] = int(metadata.get("initiative_bonus", initiative_bonus))
+            initiative_bonus = int(metadata["initiative_bonus"])
+            metadata["max_hp"] = max_hp
+            metadata["character_loaded"] = character is not None and profile is not None
+            metadata["user_id"] = user_id
+            if character is not None:
+                metadata["character_id"] = character.user_id
+            if metadata["warnings"]:
+                for warning in metadata["warnings"]:
+                    warnings_log.append(f"{name}: {warning}")
+            initiative_total = roll + int(metadata.get("initiative_bonus", 0))
             combatants.append(
                 CombatantState(
                     identifier=f"player:{user_id}",
                     name=name,
                     initiative_roll=roll,
-                    initiative_total=roll,
-                    max_hp=DEFAULT_PLAYER_HP,
-                    current_hp=DEFAULT_PLAYER_HP,
+                    initiative_total=initiative_total,
+                    max_hp=max_hp,
+                    current_hp=max_hp,
                     is_player=True,
                     user_id=user_id,
-                    metadata={
-                        "armor_class": DEFAULT_PLAYER_ARMOR_CLASS,
-                        "attack_bonus": DEFAULT_PLAYER_ATTACK_BONUS,
-                        "damage": DEFAULT_PLAYER_DAMAGE,
-                    },
+                    metadata=metadata,
                 )
             )
         for index, monster in enumerate(session.room.encounter.monsters):
@@ -818,6 +1228,8 @@ class DungeonCog(commands.Cog):
             )
         combatants.sort(key=lambda combatant: (combatant.initiative_total, combatant.initiative_roll), reverse=True)
         state = CombatState(order=combatants)
+        if warnings_log:
+            state.log.extend(warnings_log)
         if combatants:
             order_summary = ", ".join(
                 f"{combatant.name} ({combatant.initiative_total})" for combatant in combatants
@@ -1650,13 +2062,15 @@ class DungeonCog(commands.Cog):
         started_combat = False
         combat_in_progress = False
         no_targets = False
+        should_start_combat = False
+        party_snapshot: tuple[int, ...] = ()
 
         if interaction.user.id not in current_session.party_ids:
             if not await self._ensure_character_available(interaction):
                 return
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal added_member, started_combat, combat_in_progress, no_targets
+            nonlocal added_member, combat_in_progress, no_targets, should_start_combat, party_snapshot
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
@@ -1667,15 +2081,31 @@ class DungeonCog(commands.Cog):
             if not run.room.encounter.monsters:
                 no_targets = True
                 return
-            combat = self._build_combat_state(interaction, run)
-            run.combat_state = combat
-            started_combat = True
-            self._run_automatic_turns(run, combat)
+            party_snapshot = tuple(sorted(run.party_ids))
+            should_start_combat = True
 
         session = await self.sessions.update(key, mutate)
         if session is None:
             await interaction.response.send_message("No foes stand before the party right now.", ephemeral=True)
             return
+
+        combat: Optional[CombatState] = None
+        if should_start_combat and not combat_in_progress and not no_targets and session is not None:
+            combat = await self._build_combat_state(interaction, session, party_snapshot)
+
+            def apply_combat(run: DungeonSession) -> None:
+                nonlocal started_combat, combat_in_progress
+                if run.combat_state and run.combat_state.active:
+                    combat_in_progress = True
+                    return
+                run.combat_state = combat
+                started_combat = True
+                self._run_automatic_turns(run, combat)
+
+            session = await self.sessions.update(key, apply_combat)
+            if session is None:
+                await interaction.response.send_message("No foes stand before the party right now.", ephemeral=True)
+                return
 
         if added_member and interaction.guild_id is not None:
             await self._handle_party_membership_change(interaction.guild_id, session)
