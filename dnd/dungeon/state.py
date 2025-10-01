@@ -77,6 +77,7 @@ class GuildSessionMetadata:
         last_seed = raw.get("last_seed")
         last_difficulty = raw.get("last_difficulty")
         last_name = raw.get("last_name")
+        last_room_count = raw.get("last_room_count")
         dungeons: Dict[str, StoredDungeon] = {}
         raw_dungeons = raw.get("dungeons")
         if isinstance(raw_dungeons, Mapping):
