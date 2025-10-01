@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -63,94 +64,27 @@ class ClassSelect(discord.ui.Select[discord.ui.View]):
         await self._creation_view.refresh(interaction)
 
 
-class AbilityScoreModal(discord.ui.Modal, title="Assign Ability Scores"):
-    def __init__(self, view: "CharacterCreationView") -> None:
-        super().__init__(timeout=180)
-        self._creation_view = view
-
-        default_lines = []
-        if view.ability_scores:
-            for ability in ABILITY_NAMES:
-                value = view.ability_scores.values.get(ability, "")
-                default_lines.append(f"{ability}: {value}")
-        default = "\n".join(default_lines)
-
-        placeholder_lines = [f"{ability}: <score>" for ability in ABILITY_NAMES]
-        placeholder = "\n".join(placeholder_lines)
-
-        self.assignment_input = discord.ui.TextInput(
-            label="Ability assignments",
-            placeholder=placeholder,
-            default=default,
-            style=discord.TextStyle.paragraph,
-            required=True,
-            max_length=300,
-        )
-        self.add_item(self.assignment_input)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
-        raw_assignments = self.assignment_input.value
-        ability_lookup = {ability.lower(): ability for ability in ABILITY_NAMES}
-        ability_lookup.update({ability[:3].lower(): ability for ability in ABILITY_NAMES})
-
-        assignments: Dict[str, int] = {}
-        errors = []
-        for line in raw_assignments.splitlines():
-            if not line.strip():
-                continue
-            key, sep, value = line.partition(":")
-            if not sep:
-                parts = line.split()
-                if len(parts) >= 2:
-                    key = parts[0]
-                    value = parts[1]
-                else:
-                    errors.append(f"Could not parse line: '{line}'")
-                    continue
-            key = key.strip().lower()
-            ability = ability_lookup.get(key)
-            if not ability:
-                errors.append(f"Unknown ability name: '{key}'")
-                continue
-            value = value.strip()
-            try:
-                assignments[ability] = int(value)
-            except ValueError:
-                errors.append(f"Invalid score for {ability}: '{value}'")
-
-        missing = [ability for ability in ABILITY_NAMES if ability not in assignments]
-        if missing:
-            errors.append("Missing scores for: " + ", ".join(missing))
-
-        if errors:
-            await interaction.response.send_message(
-                "❌ " + "\n".join(errors),
-                ephemeral=True,
-            )
-            return
-
-        try:
-            scores = AbilityScores.from_assignments(assignments, method="standard_array")
-        except ValueError as exc:
-            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
-            return
-
-        self._creation_view.set_ability_scores(scores)
-        await interaction.response.send_message(
-            "✅ Ability scores updated using the standard array.",
-            ephemeral=True,
-        )
-        await self._creation_view.refresh()
-
-
 class AbilityScoreButton(discord.ui.Button[discord.ui.View]):
     def __init__(self, view: "CharacterCreationView") -> None:
-        super().__init__(label="Assign ability scores", style=discord.ButtonStyle.primary)
+        super().__init__(label="Roll ability scores", style=discord.ButtonStyle.primary)
         self._creation_view = view
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
-        modal = AbilityScoreModal(self._creation_view)
-        await interaction.response.send_modal(modal)
+        scores = self._creation_view.roll_random_ability_scores()
+        await interaction.response.edit_message(
+            embed=self._creation_view.build_embed(),
+            view=self._creation_view,
+        )
+        await interaction.followup.send(
+            "🎲 Rolled ability scores:\n" + "\n".join(scores.as_lines()) +
+            "\nUse the button again to reroll or confirm to keep them.",
+            ephemeral=True,
+        )
+
+
+def _roll_4d6_drop_lowest() -> int:
+    dice = sorted(random.randint(1, 6) for _ in range(4))
+    return sum(dice[1:])
 
 
 class ResetButton(discord.ui.Button[discord.ui.View]):
@@ -253,6 +187,12 @@ class CharacterCreationView(discord.ui.View):
         self.ability_scores = scores
         self._update_confirm_state()
 
+    def roll_random_ability_scores(self) -> AbilityScores:
+        rolls = {ability: _roll_4d6_drop_lowest() for ability in ABILITY_NAMES}
+        scores = AbilityScores.from_dict(rolls)
+        self.set_ability_scores(scores)
+        return scores
+
     def reset(self) -> None:
         self.selected_race = None
         self.selected_class = None
@@ -273,7 +213,7 @@ class CharacterCreationView(discord.ui.View):
     def build_embed(self) -> discord.Embed:
         description = (
             "Use the menus and buttons below to assemble your adventurer. "
-            "Ability scores use the D&D 5e standard array (15, 14, 13, 12, 10, 8)."
+            "Ability scores are generated by rolling 4d6 and keeping the highest three for each ability."
         )
         embed = discord.Embed(title="D&D Character Creation", description=description, colour=discord.Colour.blurple())
         embed.add_field(
@@ -322,6 +262,9 @@ class CharacterCreationView(discord.ui.View):
     def _update_confirm_state(self) -> None:
         self.confirm_button.disabled = not (
             self.selected_race and self.selected_class and self.ability_scores
+        )
+        self.ability_button.label = (
+            "Reroll ability scores" if self.ability_scores else "Roll ability scores"
         )
 
     async def on_timeout(self) -> None:
