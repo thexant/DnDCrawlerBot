@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import random
 from typing import Dict, Mapping, Optional, Sequence
 
 import discord
@@ -42,7 +43,7 @@ class CreationStateError(ValueError):
 class CreationState:
     """Pure data container describing a user's creation progress."""
 
-    method: str = "standard_array"
+    method: str = "rolled"
     base_scores: AbilityScores | None = None
     ability_scores: AbilityScores | None = None
     race_key: str | None = None
@@ -54,22 +55,12 @@ class CreationState:
     equipment_choices: Dict[str, tuple[str, ...]] = field(default_factory=dict)
     racial_bonuses: Dict[str, int] = field(default_factory=dict)
 
-    def set_method(self, method: str) -> None:
-        method = method.lower()
-        if method not in {"standard_array", "point_buy"}:
-            raise CreationStateError("Unsupported ability assignment method")
-        if method != self.method:
-            self.method = method
-            self.base_scores = None
-            self.ability_scores = None
-            self.racial_bonuses = {}
-
-    def assign_scores(self, assignments: Mapping[str, int], *, method: str | None = None) -> AbilityScores:
-        if method:
-            self.set_method(method)
-        if not self.method:
-            raise CreationStateError("Ability assignment method must be selected before assigning scores")
-        base = AbilityScores.from_assignments(assignments, method=self.method)
+    def assign_scores(self, assignments: Mapping[str, int]) -> AbilityScores:
+        normalized = {
+            ability.upper(): int(value)
+            for ability, value in assignments.items()
+        }
+        base = AbilityScores(normalized)
         self.base_scores = base
         if self.race_key:
             self.apply_race(self.race_key, languages=self.race_languages)
@@ -77,6 +68,18 @@ class CreationState:
             self.ability_scores = base
             self.racial_bonuses = {}
         return base
+
+    def roll_scores(self) -> AbilityScores:
+        assignments = {
+            ability: self._roll_ability_score()
+            for ability in ABILITY_NAMES
+        }
+        return self.assign_scores(assignments)
+
+    @staticmethod
+    def _roll_ability_score() -> int:
+        rolls = sorted(random.randint(1, 6) for _ in range(4))
+        return sum(rolls[1:])
 
     def _require_base_scores(self) -> AbilityScores:
         if not self.base_scores:
@@ -373,38 +376,6 @@ class CreationState:
         raise CreationStateError("Unknown equipment option")
 
 
-class AbilityAssignmentModal(discord.ui.Modal, title="Assign Ability Scores"):
-    def __init__(self, view: "CharacterCreationView") -> None:
-        super().__init__(timeout=None)
-        self.creation_view = view
-        self.inputs: list[discord.ui.TextInput] = []
-        for ability in ABILITY_NAMES:
-            component = discord.ui.TextInput(
-                label=f"{ability} score",
-                placeholder="Enter an integer value",
-                required=True,
-            )
-            self.inputs.append(component)
-            self.add_item(component)
-
-    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
-        assignments: Dict[str, int] = {}
-        for ability, component in zip(ABILITY_NAMES, self.inputs):
-            try:
-                assignments[ability] = int(component.value)
-            except (TypeError, ValueError):
-                await interaction.response.send_message(
-                    f"{ability} must be an integer value.", ephemeral=True
-                )
-                return
-        try:
-            self.creation_view.state.assign_scores(assignments)
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return
-        await self.creation_view.refresh(interaction)
-
-
 class LanguageSelectionModal(discord.ui.Modal):
     def __init__(self, view: "CharacterCreationView", *, source: str, required: int) -> None:
         if source == "race":
@@ -428,7 +399,6 @@ class LanguageSelectionModal(discord.ui.Modal):
         )
         self.add_item(self.input)
         self.required = required
-        self.choices_hint = choices
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         raw_value = self.input.value or ""
@@ -479,43 +449,19 @@ class CharacterCreationView(discord.ui.View):
     def rebuild_items(self) -> None:
         self.clear_items()
         step = self.state.current_step()
-        # Ability method select
-        method_select = discord.ui.Select(
-            placeholder="Choose ability score method",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(
-                    label="Standard Array",
-                    value="standard_array",
-                    default=self.state.method == "standard_array",
-                    description="Assign the standard 15,14,13,12,10,8 array.",
-                ),
-                discord.SelectOption(
-                    label="Point Buy",
-                    value="point_buy",
-                    default=self.state.method == "point_buy",
-                    description="Spend 27 points for scores between 8-15.",
-                ),
-            ],
-        )
-
-        async def method_callback(interaction: discord.Interaction) -> None:
-            self.state.set_method(method_select.values[0])
-            await self.refresh(interaction)
-
-        method_select.callback = method_callback  # type: ignore[assignment]
-        method_select.disabled = False
-        self.add_item(method_select)
-
+        roll_label = "Roll Ability Scores" if self.state.base_scores is None else "Re-roll Ability Scores"
         assign_button = discord.ui.Button(
-            label="Assign Ability Scores",
+            label=roll_label,
             style=discord.ButtonStyle.primary,
-            disabled=step < 1,
         )
 
         async def assign_callback(interaction: discord.Interaction) -> None:
-            await interaction.response.send_modal(AbilityAssignmentModal(self))
+            scores = self.state.roll_scores()
+            await self.refresh(interaction)
+            summary = ", ".join(f"{ability}: {scores.values[ability]}" for ability in ABILITY_NAMES)
+            await interaction.followup.send(
+                f"New ability scores: {summary}", ephemeral=True
+            )
 
         assign_button.callback = assign_callback  # type: ignore[assignment]
         assign_button.disabled = False
@@ -733,7 +679,8 @@ class CharacterCreationView(discord.ui.View):
         title = "D&D Character Creation"
         description = self._build_step_description(step)
         embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
-        embed.add_field(name="Ability Method", value=self.state.method.replace("_", " ").title(), inline=True)
+        ability_method_label = "Rolled (4d6 drop lowest)"
+        embed.add_field(name="Ability Method", value=ability_method_label, inline=True)
         embed.add_field(
             name="Base Ability Scores",
             value=self._format_scores(self.state.base_scores),
@@ -771,7 +718,7 @@ class CharacterCreationView(discord.ui.View):
 
     def _build_step_description(self, step: int) -> str:
         messages = {
-            1: "Step 1: Assign ability scores using your chosen method.",
+            1: "Step 1: Roll your ability scores until you're happy with the results.",
             2: "Step 2: Select a race and resolve any language choices.",
             3: "Step 3: Select a class and choose the required skill proficiencies.",
             4: "Step 4: Choose a background and any additional languages it grants.",

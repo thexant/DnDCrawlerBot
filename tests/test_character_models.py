@@ -27,7 +27,7 @@ def test_character_serialization_round_trip() -> None:
         "WIS": 10,
         "CHA": 8,
     }
-    state.assign_scores(base_assignments, method="standard_array")
+    state.assign_scores(base_assignments)
     state.apply_race("human")
     state.set_race_languages(["Dwarvish"])
     state.set_class("fighter")
@@ -56,7 +56,7 @@ def test_creation_state_validations() -> None:
     state = CreationState()
     with pytest.raises(CreationStateError):
         state.apply_race("human")
-    state.assign_scores({ability: 8 for ability in ABILITY_NAMES}, method="point_buy")
+    state.assign_scores({ability: 8 for ability in ABILITY_NAMES})
     state.apply_race("elf")
     state.set_class("wizard")
     with pytest.raises(CreationStateError):
