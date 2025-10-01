@@ -339,6 +339,7 @@ class DungeonNavigationView(discord.ui.View):
         button = discord.ui.Button(
             label=f"Status: {status_label}",
             style=style,
+            custom_id=f"dungeon:status:{session.channel_id}",
             disabled=True,
         )
         self.add_item(button)
@@ -432,6 +433,7 @@ class CombatActionView(discord.ui.View):
         button = discord.ui.Button(
             label=f"Status: {status_label}",
             style=style,
+            custom_id=f"dungeon:combat:status:{session.channel_id}",
             disabled=True,
         )
         self.add_item(button)
