@@ -67,26 +67,69 @@ class AbilityScoreModal(discord.ui.Modal, title="Assign Ability Scores"):
     def __init__(self, view: "CharacterCreationView") -> None:
         super().__init__(timeout=180)
         self._creation_view = view
-        self.inputs: Dict[str, discord.ui.TextInput] = {}
-        for ability in ABILITY_NAMES:
-            default = (
-                str(view.ability_scores.values.get(ability))
-                if view.ability_scores
-                else ""
-            )
-            input_field = discord.ui.TextInput(
-                label=f"{ability} score",
-                placeholder="Use the standard array values",
-                default=default,
-                required=True,
-                max_length=2,
-            )
-            self.add_item(input_field)
-            self.inputs[ability] = input_field
+
+        default_lines = []
+        if view.ability_scores:
+            for ability in ABILITY_NAMES:
+                value = view.ability_scores.values.get(ability, "")
+                default_lines.append(f"{ability}: {value}")
+        default = "\n".join(default_lines)
+
+        placeholder_lines = [f"{ability}: <score>" for ability in ABILITY_NAMES]
+        placeholder = "\n".join(placeholder_lines)
+
+        self.assignment_input = discord.ui.TextInput(
+            label="Ability assignments",
+            placeholder=placeholder,
+            default=default,
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=300,
+        )
+        self.add_item(self.assignment_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        raw_assignments = self.assignment_input.value
+        ability_lookup = {ability.lower(): ability for ability in ABILITY_NAMES}
+        ability_lookup.update({ability[:3].lower(): ability for ability in ABILITY_NAMES})
+
+        assignments: Dict[str, int] = {}
+        errors = []
+        for line in raw_assignments.splitlines():
+            if not line.strip():
+                continue
+            key, sep, value = line.partition(":")
+            if not sep:
+                parts = line.split()
+                if len(parts) >= 2:
+                    key = parts[0]
+                    value = parts[1]
+                else:
+                    errors.append(f"Could not parse line: '{line}'")
+                    continue
+            key = key.strip().lower()
+            ability = ability_lookup.get(key)
+            if not ability:
+                errors.append(f"Unknown ability name: '{key}'")
+                continue
+            value = value.strip()
+            try:
+                assignments[ability] = int(value)
+            except ValueError:
+                errors.append(f"Invalid score for {ability}: '{value}'")
+
+        missing = [ability for ability in ABILITY_NAMES if ability not in assignments]
+        if missing:
+            errors.append("Missing scores for: " + ", ".join(missing))
+
+        if errors:
+            await interaction.response.send_message(
+                "❌ " + "\n".join(errors),
+                ephemeral=True,
+            )
+            return
+
         try:
-            assignments = {ability: int(field.value) for ability, field in self.inputs.items()}
             scores = AbilityScores.from_assignments(assignments, method="standard_array")
         except ValueError as exc:
             await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
