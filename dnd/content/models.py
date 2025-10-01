@@ -207,6 +207,26 @@ class EncounterTable:
         return dict(self._entries)
 
 
+def _rarity_score(rarity: str) -> int:
+    order = {
+        "common": 0,
+        "uncommon": 1,
+        "rare": 2,
+        "very rare": 3,
+        "legendary": 4,
+        "artifact": 5,
+    }
+    return order.get(rarity.strip().lower(), 0)
+
+
+def _trap_dc(trap: Trap) -> float:
+    if trap.saving_throw and isinstance(trap.saving_throw, Mapping):
+        dc = trap.saving_throw.get("dc")
+        if isinstance(dc, (int, float)):
+            return float(dc)
+    return 10.0
+
+
 @dataclass(frozen=True)
 class Theme:
     """Domain model describing a dungeon theme."""
@@ -226,17 +246,89 @@ class Theme:
         weights = [max(1, template.weight) for template in self.room_templates]
         return rng.choices(list(self.room_templates), weights=weights, k=1)[0]
 
-    def random_monsters(self, rng: random.Random, count: int) -> Sequence[Monster]:
-        if not self.monsters:
+    def random_monsters(
+        self,
+        rng: random.Random,
+        count: int,
+        *,
+        challenge_bias: float = 1.0,
+    ) -> Sequence[Monster]:
+        if not self.monsters or count <= 0:
             return ()
-        return tuple(rng.choices(list(self.monsters), k=count))
+        population = list(self.monsters)
+        weights = []
+        for monster in population:
+            base = max(0.0, float(monster.challenge)) + 1.0
+            weight = base ** challenge_bias
+            weights.append(max(weight, 1e-6))
+        return tuple(rng.choices(population, weights=weights, k=count))
 
-    def random_trap(self, rng: random.Random) -> Sequence[Trap]:
-        if not self.traps:
+    def random_traps(
+        self,
+        rng: random.Random,
+        count: int = 1,
+        *,
+        danger_bias: float = 1.0,
+        min_dc: float | None = None,
+        max_dc: float | None = None,
+    ) -> Sequence[Trap]:
+        if not self.traps or count <= 0:
             return ()
-        return (rng.choice(list(self.traps)),)
+        population = list(self.traps)
+        filtered: list[Trap] = []
+        for trap in population:
+            dc = _trap_dc(trap)
+            if min_dc is not None and dc < min_dc:
+                continue
+            if max_dc is not None and dc > max_dc:
+                continue
+            filtered.append(trap)
+        if not filtered:
+            if min_dc is not None:
+                highest = max(_trap_dc(trap) for trap in population)
+                filtered = [trap for trap in population if _trap_dc(trap) == highest]
+            elif max_dc is not None:
+                lowest = min(_trap_dc(trap) for trap in population)
+                filtered = [trap for trap in population if _trap_dc(trap) == lowest]
+            else:
+                filtered = population
+        weights = []
+        for trap in filtered:
+            dc = _trap_dc(trap)
+            base = max(1.0, dc)
+            weight = base ** danger_bias
+            weights.append(max(weight, 1e-6))
+        return tuple(rng.choices(filtered, weights=weights, k=count))
 
-    def random_loot(self, rng: random.Random, count: int = 1) -> Sequence[Item]:
-        if not self.loot:
+    def random_trap(
+        self,
+        rng: random.Random,
+        *,
+        danger_bias: float = 1.0,
+        min_dc: float | None = None,
+        max_dc: float | None = None,
+    ) -> Sequence[Trap]:
+        return self.random_traps(
+            rng,
+            1,
+            danger_bias=danger_bias,
+            min_dc=min_dc,
+            max_dc=max_dc,
+        )
+
+    def random_loot(
+        self,
+        rng: random.Random,
+        count: int = 1,
+        *,
+        rarity_bias: float = 1.0,
+    ) -> Sequence[Item]:
+        if not self.loot or count <= 0:
             return ()
-        return tuple(rng.choices(list(self.loot), k=count))
+        population = list(self.loot)
+        weights = []
+        for item in population:
+            base = float(_rarity_score(item.rarity)) + 1.0
+            weight = base ** rarity_bias
+            weights.append(max(weight, 1e-6))
+        return tuple(rng.choices(population, weights=weights, k=count))
