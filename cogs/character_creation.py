@@ -290,16 +290,13 @@ class CharacterCreationView(discord.ui.View):
             await self.message.edit(embed=timeout_embed, view=None)
 
 
-class CharacterCreation(commands.Cog):
+class CharacterCreation(commands.GroupCog, name="character", description="Create and manage D&D characters"):
     def __init__(self, bot: commands.Bot) -> None:
+        super().__init__()
         self.bot = bot
         self.repository = CharacterRepository(Path("data") / "characters.json")
 
-    character_group = app_commands.Group(
-        name="character", description="Create and manage D&D characters"
-    )
-
-    @character_group.command(name="create", description="Create a new D&D character")
+    @app_commands.command(name="create", description="Create a new D&D character")
     async def character_create(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message(
@@ -318,13 +315,6 @@ class CharacterCreation(commands.Cog):
 
         view = CharacterCreationView(self.repository, interaction.user)
         await view.start(interaction)
-
-    async def cog_load(self) -> None:
-        self.bot.tree.add_command(self.character_group)
-
-    async def cog_unload(self) -> None:
-        self.bot.tree.remove_command(self.character_group.name, type=self.character_group.type)
-
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(CharacterCreation(bot))
