@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import List, Sequence
 
 from dnd.content import EncounterTable, Item, Monster, RoomTemplate, Theme, Trap
 
@@ -61,6 +61,7 @@ class Dungeon:
     name: str
     seed: int | None
     theme: Theme
+    difficulty: str
     rooms: Sequence[Room]
     corridors: Sequence[Corridor]
 
@@ -74,20 +75,37 @@ class Dungeon:
 class DungeonGenerator:
     """Generate dungeons from theme data using deterministic RNG."""
 
-    def __init__(self, theme: Theme, seed: int | None = None) -> None:
+    def __init__(self, theme: Theme, seed: int | None = None, *, difficulty: str = "standard") -> None:
         self.theme = theme
         self.seed = seed
         self._rng = random.Random(seed)
+        self.difficulty = self._normalise_difficulty(difficulty)
 
-    def generate(self, *, room_count: int = 5, name: str | None = None) -> Dungeon:
+    def _normalise_difficulty(self, difficulty: str | None) -> str:
+        if not difficulty:
+            return "standard"
+        lowered = difficulty.lower()
+        if lowered not in {"easy", "standard", "hard"}:
+            return "standard"
+        return lowered
+
+    def generate(
+        self,
+        *,
+        room_count: int = 5,
+        name: str | None = None,
+        difficulty: str | None = None,
+    ) -> Dungeon:
         if room_count <= 0:
             raise ValueError("room_count must be positive")
+
+        active_difficulty = self._normalise_difficulty(difficulty) if difficulty else self.difficulty
 
         rooms: List[Room] = []
         corridors: List[Corridor] = []
 
         for index in range(room_count):
-            room = self._generate_room(index)
+            room = self._generate_room(index, difficulty=active_difficulty)
             rooms.append(room)
             if index > 0:
                 corridor = self._generate_corridor(rooms[index - 1], room)
@@ -98,14 +116,15 @@ class DungeonGenerator:
             name=dungeon_name,
             seed=self.seed,
             theme=self.theme,
+            difficulty=active_difficulty,
             rooms=tuple(rooms),
             corridors=tuple(corridors),
         )
 
-    def _generate_room(self, room_index: int) -> Room:
+    def _generate_room(self, room_index: int, *, difficulty: str) -> Room:
         template = self.theme.random_room_template(self._rng)
         encounter_kind = self._select_encounter_kind(template)
-        encounter = self._build_encounter(encounter_kind)
+        encounter = self._build_encounter(encounter_kind, difficulty)
 
         description_parts = [template.description]
         if encounter.summary:
@@ -134,12 +153,25 @@ class DungeonGenerator:
             table = self.theme.encounter_table
         return table.roll(self._rng)
 
-    def _build_encounter(self, kind: str) -> EncounterResult:
+    def _build_encounter(self, kind: str, difficulty: str) -> EncounterResult:
         if kind == "combat":
-            monster_count = self._rng.randint(1, max(1, min(3, len(self.theme.monsters) or 1)))
+            available = len(self.theme.monsters) or 1
+            standard_max = max(1, min(3, available))
+            if difficulty == "easy":
+                upper = max(1, standard_max - 1)
+                lower = 1
+            elif difficulty == "hard":
+                upper = min(available, standard_max + 1)
+                lower = min(2, upper)
+            else:
+                upper = standard_max
+                lower = 1
+            if upper < lower:
+                upper = lower
+            monster_count = self._rng.randint(lower, upper)
             monsters = self.theme.random_monsters(self._rng, monster_count)
             monster_names = ", ".join(monster.name for monster in monsters)
-            summary = f"Hostile presence detected: {monster_names}."
+            summary = f"Hostile presence detected ({difficulty.title()}): {monster_names}."
             loot = self.theme.random_loot(self._rng, self._rng.randint(0, 2))
             return EncounterResult(kind=kind, summary=summary, monsters=monsters, loot=loot)
         if kind == "trap":
