@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Literal, Optional
 
 import discord
 from discord import app_commands
@@ -227,8 +227,11 @@ class DungeonCog(commands.Cog):
         embed.add_field(name="Available Actions", value="\n".join(f"• {line}" for line in actions), inline=False)
 
         footer_parts = [f"Theme: {dungeon.theme.name}"]
-        if session.seed is not None:
-            footer_parts.append(f"Seed: {session.seed}")
+        footer_parts.append(
+            f"Difficulty: {dungeon.difficulty.title() if getattr(dungeon, 'difficulty', None) else 'Standard'}"
+        )
+        if dungeon.seed is not None:
+            footer_parts.append(f"Seed: {dungeon.seed}")
         embed.set_footer(text=" • ".join(footer_parts))
         return embed
 
@@ -259,16 +262,22 @@ class DungeonCog(commands.Cog):
 
     # ---- Slash commands --------------------------------------------------
     @dungeon_group.command(name="start", description="Generate a themed dungeon and begin exploring.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(
         theme="Name of the dungeon theme to use",
-        rooms="Number of rooms to generate",
+        size="How large the dungeon should be (in rooms)",
+        difficulty="Challenge level for encounters",
+        name="Custom name for the dungeon",
         seed="Optional RNG seed",
     )
     async def start(
         self,
         interaction: discord.Interaction,
         theme: Optional[str] = None,
-        rooms: app_commands.Range[int, 1, 20] = 5,
+        size: app_commands.Range[int, 1, 20] = 5,
+        difficulty: Literal["easy", "standard", "hard"] = "standard",
+        name: Optional[str] = None,
         seed: Optional[int] = None,
     ) -> None:
         if not self.theme_registry.values():
@@ -302,8 +311,8 @@ class DungeonCog(commands.Cog):
 
         if seed is None:
             seed = random.randint(0, 999999)
-        generator = DungeonGenerator(theme_obj, seed=seed)
-        dungeon = generator.generate(room_count=int(rooms))
+        generator = DungeonGenerator(theme_obj, seed=seed, difficulty=difficulty)
+        dungeon = generator.generate(room_count=int(size), name=name, difficulty=difficulty)
         session = DungeonSession(
             dungeon=dungeon,
             guild_id=interaction.guild_id,
@@ -317,6 +326,8 @@ class DungeonCog(commands.Cog):
                 interaction.guild_id,
                 theme=theme_obj.key,
                 seed=seed,
+                difficulty=difficulty,
+                name=dungeon.name,
             )
 
         embed = self._build_room_embed(interaction, session)
