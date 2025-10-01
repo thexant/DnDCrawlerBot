@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional, Set, TYPE_CHECKING
+from typing import Optional, Sequence, Set, TYPE_CHECKING
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 from dnd import CharacterRepository, TavernConfig, TavernConfigStore
+from dnd.dungeon.state import StoredDungeon
 
 if TYPE_CHECKING:  # pragma: no cover - typing helper
     from cogs.dungeon import DungeonCog
@@ -19,6 +20,79 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
 log = logging.getLogger(__name__)
 
 TAVERN_ROLE_NAME = "Tavern Adventurer"
+
+
+class DungeonMapSelect(discord.ui.Select):
+    """Select menu for choosing a prepared dungeon to explore."""
+
+    def __init__(
+        self,
+        tavern: "Tavern",
+        *,
+        guild_id: int,
+        dungeons: Sequence[StoredDungeon],
+    ) -> None:
+        options: list[discord.SelectOption] = []
+        for dungeon in dungeons[:25]:
+            details: list[str] = []
+            if dungeon.difficulty:
+                details.append(dungeon.difficulty.title())
+            if dungeon.room_count:
+                details.append(f"{dungeon.room_count} rooms")
+            if dungeon.seed is not None:
+                details.append(f"Seed {dungeon.seed}")
+            description = ", ".join(details) or "Ready for adventure"
+            options.append(
+                discord.SelectOption(
+                    label=dungeon.name[:100],
+                    value=dungeon.name,
+                    description=description[:100],
+                )
+            )
+        placeholder = "Select a prepared dungeon to begin"
+        super().__init__(
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="tavern:dungeon_select",
+        )
+        self.tavern = tavern
+        self.guild_id = guild_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # noqa: D401
+        dungeon_cog = self.tavern._get_dungeon_cog()
+        if dungeon_cog is None:
+            await interaction.response.send_message(
+                "Dungeon operations are currently unavailable.",
+                ephemeral=True,
+            )
+            return
+
+        choice = self.values[0]
+        stored = await dungeon_cog.metadata_store.get_dungeon(self.guild_id, choice)
+        if stored is None:
+            await interaction.response.send_message(
+                "That expedition is no longer on the map. Try refreshing the tavern board.",
+                ephemeral=True,
+            )
+            return
+
+        await dungeon_cog._start_prepared_dungeon(interaction, stored)
+
+
+class DungeonMapView(discord.ui.View):
+    """View wrapper for the dungeon selection dropdown."""
+
+    def __init__(
+        self,
+        tavern: "Tavern",
+        *,
+        guild_id: int,
+        dungeons: Sequence[StoredDungeon],
+    ) -> None:
+        super().__init__(timeout=120)
+        self.add_item(DungeonMapSelect(tavern, guild_id=guild_id, dungeons=dungeons))
 
 
 class TavernControlView(discord.ui.View):
@@ -51,8 +125,11 @@ class TavernControlView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        description = await self.cog.build_dungeon_map_description(interaction.guild.id)
-        await interaction.response.send_message(description, ephemeral=True)
+        embed, view, fallback = await self.cog.build_dungeon_map_components(interaction.guild.id)
+        if embed is None or view is None:
+            await interaction.response.send_message(fallback, ephemeral=True)
+            return
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 class Tavern(commands.GroupCog, name="tavern", description="Configure the guild's tavern hub"):
@@ -67,18 +144,63 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
     def cog_unload(self) -> None:  # noqa: D401 - discord.py hook
         self.refresh_views.cancel()
 
-    async def build_dungeon_map_description(self, guild_id: int) -> str:
+    async def build_dungeon_map_components(
+        self, guild_id: int
+    ) -> tuple[Optional[discord.Embed], Optional[discord.ui.View], str]:
         dungeon_cog = self._get_dungeon_cog()
         if dungeon_cog is None:
-            return "Dungeon operations are currently unavailable."
-        names = await dungeon_cog.metadata_store.list_dungeon_names(guild_id)
-        if not names:
             return (
-                "No expeditions are prepared yet. Ask an administrator to generate a dungeon "
-                "so the map can be charted."
+                None,
+                None,
+                "Dungeon operations are currently unavailable.",
             )
-        lines = "\n".join(f"• {name}" for name in names)
-        return f"Available dungeon expeditions:\n{lines}"
+
+        dungeons = await dungeon_cog.metadata_store.list_dungeons(guild_id)
+        if not dungeons:
+            return (
+                None,
+                None,
+                (
+                    "No expeditions are prepared yet. Ask an administrator to use "
+                    "/dungeon prepare so the map can be charted."
+                ),
+            )
+
+        display_dungeons = list(dungeons[:25])
+        lines: list[str] = []
+        for stored in display_dungeons:
+            try:
+                theme = dungeon_cog.theme_registry.get(stored.theme)
+                theme_name = theme.name
+            except KeyError:
+                theme_name = stored.theme
+            details: list[str] = [theme_name]
+            if stored.difficulty:
+                details.append(stored.difficulty.title())
+            if stored.room_count:
+                details.append(f"{stored.room_count} rooms")
+            if stored.seed is not None:
+                details.append(f"Seed {stored.seed}")
+            summary = ", ".join(details)
+            lines.append(f"• **{stored.name}** — {summary}")
+
+        embed = discord.Embed(
+            title="Dungeon Map",
+            description="Select a prepared expedition from the map below.",
+            color=discord.Color.dark_purple(),
+        )
+        embed.add_field(
+            name="Prepared Expeditions",
+            value="\n".join(lines),
+            inline=False,
+        )
+        if len(dungeons) > len(display_dungeons):
+            embed.set_footer(text="Only the first 25 expeditions are shown. Use /dungeon start for others.")
+        else:
+            embed.set_footer(text="Choose an expedition to rally the party.")
+
+        view = DungeonMapView(self, guild_id=guild_id, dungeons=display_dungeons)
+        return embed, view, ""
 
     @app_commands.command(name="set", description="Designate a channel as the guild's tavern hub")
     @app_commands.describe(channel="Text channel to host the tavern. Defaults to the current channel.")

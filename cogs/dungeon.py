@@ -308,8 +308,88 @@ class DungeonCog(commands.Cog):
         except discord.HTTPException:
             pass
 
+    async def _send_ephemeral_message(
+        self, interaction: discord.Interaction, message: str
+    ) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+    async def _start_prepared_dungeon(
+        self, interaction: discord.Interaction, stored: StoredDungeon
+    ) -> bool:
+        if interaction.guild_id is None:
+            await self._send_ephemeral_message(
+                interaction,
+                "Prepared dungeons can only be started from within a guild channel.",
+            )
+            return False
+
+        key = self._session_key(interaction.guild_id, interaction.channel_id)
+        existing = await self.sessions.get(key)
+        if existing is not None:
+            await self._send_ephemeral_message(
+                interaction,
+                "A party is already exploring this channel. Use /dungeon reset to start over.",
+            )
+            return False
+
+        try:
+            theme = self.theme_registry.get(stored.theme)
+        except KeyError:
+            await self._send_ephemeral_message(
+                interaction,
+                "The theme for this dungeon is no longer available. Ask an administrator to prepare it again.",
+            )
+            return False
+
+        room_count = stored.room_count if stored.room_count and stored.room_count > 0 else 5
+        generator = DungeonGenerator(
+            theme,
+            seed=stored.seed,
+            difficulty=stored.difficulty or "standard",
+        )
+        dungeon = generator.generate(
+            room_count=room_count,
+            name=stored.name,
+            difficulty=stored.difficulty or "standard",
+        )
+        session = DungeonSession(
+            dungeon=dungeon,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id or interaction.user.id,
+            seed=stored.seed,
+        )
+        session.party_ids.add(interaction.user.id)
+        await self.sessions.set(key, session)
+
+        embed = self._build_room_embed(interaction, session)
+        view = self._build_navigation_view(session)
+        if interaction.response.is_done():
+            message = await interaction.followup.send(embed=embed, view=view)
+        else:
+            await interaction.response.send_message(embed=embed, view=view)
+            message = await interaction.original_response()
+
+        session = await self.sessions.update(
+            key, lambda run: setattr(run, "message_id", message.id)
+        )
+        if session is not None:
+            self.bot.add_view(view, message_id=message.id)
+
+        await self.metadata_store.record_session(
+            interaction.guild_id,
+            theme=theme.key,
+            seed=stored.seed,
+            difficulty=dungeon.difficulty,
+            name=dungeon.name,
+            room_count=room_count,
+        )
+        return True
+
     # ---- Slash commands --------------------------------------------------
-    @dungeon_group.command(name="start", description="Generate a themed dungeon and begin exploring.")
+    @dungeon_group.command(name="prepare", description="Generate and store a dungeon expedition for later exploration.")
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(
@@ -319,7 +399,7 @@ class DungeonCog(commands.Cog):
         name="Custom name for the dungeon",
         seed="Optional RNG seed",
     )
-    async def start(
+    async def prepare(
         self,
         interaction: discord.Interaction,
         theme: Optional[str] = None,
@@ -328,6 +408,13 @@ class DungeonCog(commands.Cog):
         name: Optional[str] = None,
         seed: Optional[int] = None,
     ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Prepared dungeons can only be created inside a guild.",
+                ephemeral=True,
+            )
+            return
+
         if not self.theme_registry.values():
             message = "No dungeon themes are available. Please add files under data/<category>/ and reload."
             if self._content_error is not None:
@@ -348,51 +435,77 @@ class DungeonCog(commands.Cog):
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
-        key = self._session_key(interaction.guild_id, interaction.channel_id)
-        existing = await self.sessions.get(key)
-        if existing is not None:
-            await interaction.response.send_message(
-                "A party is already exploring this channel. Use /dungeon reset to start over.",
-                ephemeral=True,
-            )
-            return
-
         if seed is None:
             seed = random.randint(0, 999999)
         generator = DungeonGenerator(theme_obj, seed=seed, difficulty=difficulty)
-        dungeon = generator.generate(room_count=int(size), name=name, difficulty=difficulty)
-        session = DungeonSession(
-            dungeon=dungeon,
-            guild_id=interaction.guild_id,
-            channel_id=interaction.channel_id or interaction.user.id,
-            seed=seed,
+        dungeon = generator.generate(
+            room_count=int(size), name=name, difficulty=difficulty
         )
-        session.party_ids.add(interaction.user.id)
-        await self.sessions.set(key, session)
-        if interaction.guild_id is not None:
-            await self.metadata_store.record_session(
-                interaction.guild_id,
-                theme=theme_obj.key,
-                seed=seed,
-                difficulty=difficulty,
-                name=dungeon.name,
-            )
+        await self.metadata_store.record_session(
+            interaction.guild_id,
+            theme=theme_obj.key,
+            seed=seed,
+            difficulty=difficulty,
+            name=dungeon.name,
+            room_count=int(size),
+        )
 
-        embed = self._build_room_embed(interaction, session)
-        view = self._build_navigation_view(session)
-        await interaction.response.send_message(embed=embed, view=view)
-        message = await interaction.original_response()
-        session = await self.sessions.update(key, lambda run: setattr(run, "message_id", message.id))
-        if session is not None:
-            self.bot.add_view(view, message_id=message.id)
+        details = [f"Theme: {theme_obj.name}"]
+        details.append(f"Rooms: {int(size)}")
+        if difficulty:
+            details.append(f"Difficulty: {difficulty.title()}")
+        details.append(f"Seed: {seed}")
+        await interaction.response.send_message(
+            (
+                f"Prepared the dungeon **{dungeon.name}** for adventurers.\n"
+                + "\n".join(details)
+                + "\nParties can begin this expedition with /dungeon start."
+            ),
+            ephemeral=True,
+        )
 
-    @start.autocomplete("theme")
+    @prepare.autocomplete("theme")
     async def theme_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> Iterable[app_commands.Choice[str]]:
         names = [theme.name for theme in self.theme_registry.values()]
         filtered = [name for name in names if current.lower() in name.lower()][:25]
         return [app_commands.Choice(name=name, value=name) for name in filtered]
+
+    @dungeon_group.command(name="start", description="Begin a prepared dungeon expedition in this channel.")
+    @app_commands.describe(name="Name of the stored dungeon to explore")
+    async def start(self, interaction: discord.Interaction, name: str) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Stored dungeons can only be started within a guild channel.",
+                ephemeral=True,
+            )
+            return
+
+        stored = await self.metadata_store.get_dungeon(interaction.guild_id, name)
+        if stored is None:
+            names = await self.metadata_store.list_dungeon_names(interaction.guild_id)
+            if names:
+                available = ", ".join(names)
+                message = (
+                    f"No stored dungeon named '{name}'. Available expeditions: {available}."
+                )
+            else:
+                message = "No prepared dungeons are available. Ask an administrator to use /dungeon prepare."
+            await interaction.response.send_message(message, ephemeral=True)
+            return
+
+        await self._start_prepared_dungeon(interaction, stored)
+
+    @start.autocomplete("name")
+    async def start_name_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> Iterable[app_commands.Choice[str]]:
+        if interaction.guild_id is None:
+            return []
+        names = await self.metadata_store.list_dungeon_names(interaction.guild_id)
+        filtered = [candidate for candidate in names if current.lower() in candidate.lower()][:25]
+        return [app_commands.Choice(name=candidate, value=candidate) for candidate in filtered]
 
     @dungeon_group.command(name="reset", description="Reset the active dungeon session in this channel.")
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -443,6 +556,8 @@ class DungeonCog(commands.Cog):
             summary_lines.append(f"Difficulty: {stored.difficulty.title()}")
         if stored.seed is not None:
             summary_lines.append(f"Seed: {stored.seed}")
+        if stored.room_count:
+            summary_lines.append(f"Rooms: {stored.room_count}")
 
         view = DungeonDeleteConfirmation(
             self,
