@@ -21,3 +21,11 @@ process that mirrors the official SRD onboarding rules.
 If any SRD rule is violated (for example selecting too many skills or
 overspending on point-buy) the bot returns a descriptive, actionable error. Use
 the **Reset** button at any time to restart the workflow.
+
+## Managing saved characters
+
+* Use `/character view` to review the full details of your saved hero at any
+  time. The bot will show your ability scores, proficiencies, equipment, and
+  chosen background.
+* Use `/character delete` to remove your stored character. You'll be asked for
+  confirmation before anything is erased.

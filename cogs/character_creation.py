@@ -892,6 +892,54 @@ class CharacterCreationView(discord.ui.View):
             await self.message.edit(embed=timeout_embed, view=None)
 
 
+class CharacterDeleteConfirmation(discord.ui.View):
+    """Confirmation dialog for deleting a stored character."""
+
+    def __init__(
+        self,
+        repository: CharacterRepository,
+        *,
+        requester_id: int,
+        guild_id: int,
+        user_id: int,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.repository = repository
+        self.requester_id = requester_id
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # noqa: D401
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the player who requested this deletion can respond.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:  # noqa: D401
+        await self.repository.clear(self.guild_id, self.user_id)
+        await interaction.response.edit_message(
+            content="Your saved character has been deleted.",
+            view=None,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:  # noqa: D401
+        await interaction.response.edit_message(
+            content="Deletion cancelled.",
+            view=None,
+        )
+        self.stop()
+
+
 class CharacterCreation(commands.GroupCog, name="character", description="Create and manage D&D characters"):
     def __init__(self, bot: commands.Bot) -> None:
         super().__init__()
@@ -916,6 +964,89 @@ class CharacterCreation(commands.GroupCog, name="character", description="Create
         view = CharacterCreationView(self.repository, interaction.user)
         view.rebuild_items()
         await view.start(interaction)
+
+    @app_commands.command(name="view", description="View your saved D&D character")
+    async def character_view(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "You can only view saved characters from within a server.",
+                ephemeral=True,
+            )
+            return
+        character = await self.repository.get(interaction.guild.id, interaction.user.id)
+        if not character:
+            await interaction.response.send_message(
+                "You don't have a saved character yet. Run /character create to begin.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title=character.name,
+            description="Saved character overview",
+            colour=discord.Colour.blurple(),
+        )
+        embed.add_field(name="Race", value=character.race.name, inline=True)
+        embed.add_field(name="Class", value=character.character_class.name, inline=True)
+        if character.background:
+            embed.add_field(name="Background", value=character.background.name, inline=True)
+        embed.add_field(
+            name="Ability Method",
+            value=character.ability_method.replace("_", " ").title(),
+            inline=True,
+        )
+        embed.add_field(
+            name="Base Ability Scores",
+            value="\n".join(character.base_ability_scores.as_lines()),
+            inline=False,
+        )
+        if character.racial_bonuses:
+            bonuses = ", ".join(
+                f"{ability}+{bonus}"
+                for ability, bonus in sorted(character.racial_bonuses.items())
+            )
+            embed.add_field(name="Racial Bonuses", value=bonuses, inline=False)
+        embed.add_field(
+            name="Final Ability Scores",
+            value="\n".join(character.ability_scores.as_lines()),
+            inline=False,
+        )
+        proficiencies = "\n".join(character.proficiencies) or "None"
+        embed.add_field(name="Proficiencies", value=proficiencies, inline=False)
+        equipment = "\n".join(character.equipment) or "None"
+        embed.add_field(name="Equipment", value=equipment, inline=False)
+        embed.set_footer(text="Use /character delete if you want to remove this hero.")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="delete", description="Delete your saved D&D character")
+    async def character_delete(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "You can only delete saved characters from within a server.",
+                ephemeral=True,
+            )
+            return
+
+        exists = await self.repository.exists(interaction.guild.id, interaction.user.id)
+        if not exists:
+            await interaction.response.send_message(
+                "You don't have a saved character yet.",
+                ephemeral=True,
+            )
+            return
+
+        view = CharacterDeleteConfirmation(
+            self.repository,
+            requester_id=interaction.user.id,
+            guild_id=interaction.guild.id,
+            user_id=interaction.user.id,
+        )
+        await interaction.response.send_message(
+            "Are you sure you want to delete your saved character?",
+            view=view,
+            ephemeral=True,
+        )
 
 
 async def setup(bot: commands.Bot) -> None:
