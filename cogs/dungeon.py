@@ -111,7 +111,10 @@ class DungeonCog(commands.Cog):
 
     def cog_unload(self) -> None:  # noqa: D401 - discord.py hook
         try:
-            self.bot.tree.remove_command(self.dungeon_group.name, type=self.dungeon_group.type)
+            self.bot.tree.remove_command(
+                self.dungeon_group.name,
+                type=app_commands.CommandType.chat_input,
+            )
         except (app_commands.CommandTreeException, KeyError):
             pass
 
@@ -534,7 +537,13 @@ class DungeonCog(commands.Cog):
 async def setup(bot: commands.Bot) -> None:
     cog = DungeonCog(bot)
     await bot.add_cog(cog)
-    existing = bot.tree.get_command(cog.dungeon_group.name, type=cog.dungeon_group.type)
+    existing = bot.tree.get_command(
+        cog.dungeon_group.name,
+        type=app_commands.CommandType.chat_input,
+    )
     if existing is not None:
-        bot.tree.remove_command(cog.dungeon_group.name, type=cog.dungeon_group.type)
+        bot.tree.remove_command(
+            cog.dungeon_group.name,
+            type=app_commands.CommandType.chat_input,
+        )
     bot.tree.add_command(cog.dungeon_group)
