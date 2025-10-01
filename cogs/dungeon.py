@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import random
@@ -1148,21 +1149,41 @@ class DungeonCog(commands.Cog):
             )
         return success, summary
 
-    def _party_display(self, interaction: discord.Interaction, session: DungeonSession) -> str:
+    def _party_display(
+        self, interaction: Optional[discord.Interaction], session: DungeonSession
+    ) -> str:
         if not session.party_ids:
             return "No adventurers yet."
 
         names: list[str] = []
+        guild: Optional[discord.Guild]
+        if interaction is not None and interaction.guild is not None:
+            guild = interaction.guild
+        elif session.guild_id is not None:
+            guild = self.bot.get_guild(session.guild_id)
+        else:
+            guild = None
         for user_id in sorted(session.party_ids):
-            names.append(self._display_name_for_user(interaction, user_id))
+            names.append(
+                self._display_name_for_user(
+                    user_id, interaction=interaction, guild=guild
+                )
+            )
         return "\n".join(f"• {name}" for name in names)
 
     def _display_name_for_user(
-        self, interaction: discord.Interaction, user_id: int
+        self,
+        user_id: int,
+        *,
+        interaction: Optional[discord.Interaction] = None,
+        guild: Optional[discord.Guild] = None,
     ) -> str:
         name: Optional[str] = None
-        if interaction.guild:
-            member = interaction.guild.get_member(user_id)
+        lookup_guild = guild
+        if lookup_guild is None and interaction is not None:
+            lookup_guild = interaction.guild
+        if lookup_guild is not None:
+            member = lookup_guild.get_member(user_id)
             if member is not None:
                 name = member.display_name
         if name is None:
@@ -1655,14 +1676,16 @@ class DungeonCog(commands.Cog):
             key=lambda action: priority.get(str(action.get("type", "attack")).lower(), 5),
         )
 
-    def _resolve_monster_action(self, state: CombatState, monster: CombatantState) -> None:
+    def _resolve_monster_action(
+        self, state: CombatState, monster: CombatantState
+    ) -> Optional[str]:
         potential_targets = [
             combatant
             for combatant in state.order
             if combatant.is_player and not combatant.is_dead
         ]
         if not potential_targets:
-            return
+            return None
         conscious_targets = [target for target in potential_targets if target.current_hp > 0]
         if conscious_targets:
             target = random.choice(conscious_targets)
@@ -1720,6 +1743,7 @@ class DungeonCog(commands.Cog):
             message = f"{monster.name} hesitates, accomplishing nothing."
         state.log.append(message)
         self._trim_combat_log(state)
+        return message
 
     def _execute_monster_multiattack(
         self,
@@ -2247,12 +2271,15 @@ class DungeonCog(commands.Cog):
         }
         return profile, warnings
 
-    def _run_automatic_turns(self, session: DungeonSession, state: CombatState) -> None:
+    async def _run_automatic_turns(
+        self, session: DungeonSession, state: CombatState
+    ) -> None:
         if not state.active:
             return
         current = self._ensure_current_combatant(state)
         if current is None:
             self._finish_combat(session, state, victory=False)
+            await self._refresh_session_view(session)
             return
         while state.active:
             current = state.current_combatant()
@@ -2262,6 +2289,7 @@ class DungeonCog(commands.Cog):
                 handled = self._handle_player_zero_hp_turn(state, current)
                 if handled:
                     self._evaluate_combat_state(session, state)
+                    await self._refresh_session_view(session)
                     if not state.active:
                         break
                     next_combatant = state.advance_turn()
@@ -2275,10 +2303,19 @@ class DungeonCog(commands.Cog):
                 continue
             if current.is_player:
                 state.waiting_for = current.user_id
+                await self._refresh_session_view(session)
                 break
             state.waiting_for = None
+            thinking_entry = "Enemy is thinking..."
+            state.log.append(thinking_entry)
+            self._trim_combat_log(state)
+            await self._refresh_session_view(session)
+            await asyncio.sleep(random.uniform(5, 10))
+            if state.log and state.log[-1] == thinking_entry:
+                state.log.pop()
             self._resolve_monster_action(state, current)
             self._evaluate_combat_state(session, state)
+            await self._refresh_session_view(session)
             if not state.active:
                 break
             next_combatant = state.advance_turn()
@@ -2286,6 +2323,24 @@ class DungeonCog(commands.Cog):
                 break
         if not state.active:
             state.waiting_for = None
+            await self._refresh_session_view(session)
+
+    def _schedule_automatic_turns(
+        self, session: DungeonSession, state: Optional[CombatState]
+    ) -> None:
+        if state is None or not state.active:
+            return
+        result = self._run_automatic_turns(session, state)
+        if asyncio.iscoroutine(result):
+            task = asyncio.create_task(result)
+            task.add_done_callback(self._handle_automatic_turn_completion)
+
+    @staticmethod
+    def _handle_automatic_turn_completion(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except Exception:  # pragma: no cover - background task logging
+            log.exception("Automatic combat turn task failed")
 
     def _player_weapon_attack(
         self,
@@ -2574,7 +2629,7 @@ class DungeonCog(commands.Cog):
         party_ids = list(party_order) if party_order is not None else sorted(session.party_ids)
         for user_id in party_ids:
             roll = random.randint(1, 20)
-            name = self._display_name_for_user(interaction, user_id)
+            name = self._display_name_for_user(user_id, interaction=interaction)
             metadata: Dict[str, object]
             initiative_bonus = 0
             max_hp = DEFAULT_PLAYER_HP
@@ -2733,7 +2788,9 @@ class DungeonCog(commands.Cog):
         self._ensure_current_combatant(state)
         return state
 
-    def _build_room_embed(self, interaction: discord.Interaction, session: DungeonSession) -> discord.Embed:
+    def _build_room_embed(
+        self, interaction: Optional[discord.Interaction], session: DungeonSession
+    ) -> discord.Embed:
         room = session.room
         dungeon = session.dungeon
         embed = discord.Embed(
@@ -2772,7 +2829,9 @@ class DungeonCog(commands.Cog):
         if approach_lines:
             embed.add_field(name="Approach", value="\n".join(approach_lines), inline=False)
 
-        embed.add_field(name="Party", value=self._party_display(interaction, session), inline=False)
+        embed.add_field(
+            name="Party", value=self._party_display(interaction, session), inline=False
+        )
 
         if room.encounter.monsters or session.stealthed:
             combat = session.combat_state
@@ -2935,6 +2994,32 @@ class DungeonCog(commands.Cog):
             disable_disarm=not bool(room.encounter.traps),
             disable_engage=not bool(room.encounter.monsters),
         )
+
+    async def _refresh_session_view(self, session: DungeonSession) -> None:
+        if session.message_id is None:
+            return
+        channel = self.bot.get_channel(session.channel_id)
+        if channel is None:
+            return
+        partial_getter = getattr(channel, "get_partial_message", None)
+        if callable(partial_getter):
+            message = partial_getter(session.message_id)
+        else:
+            try:
+                message = await channel.fetch_message(session.message_id)
+            except (discord.HTTPException, AttributeError):
+                return
+        room_embed = self._build_room_embed(None, session)
+        embeds: List[discord.Embed] = [room_embed]
+        combat_embed = self._build_combat_embed(session)
+        if combat_embed is not None:
+            embeds.append(combat_embed)
+        view = self._build_navigation_view(session)
+        try:
+            await message.edit(embeds=embeds, view=view)
+        except discord.HTTPException:
+            return
+        self.bot.add_view(view, message_id=session.message_id)
 
     async def _refresh_session_message(self, interaction: discord.Interaction, session: DungeonSession) -> None:
         if session.message_id is None:
@@ -3503,6 +3588,7 @@ class DungeonCog(commands.Cog):
 
         stealth_summary: Optional[str] = None
         started_combat = False
+        trigger_monster_turns = False
         monsters_present = bool(destination_room and destination_room.encounter.monsters)
         combat_active = bool(session.combat_state and session.combat_state.active)
         if (
@@ -3535,7 +3621,8 @@ class DungeonCog(commands.Cog):
                     run.stealthed = False
                     run.combat_state = combat
                     if combat is not None:
-                        self._run_automatic_turns(run, combat)
+                        nonlocal trigger_monster_turns
+                        trigger_monster_turns = True
 
                 session = await self.sessions.update(key, engage_combat)
                 if session is None:
@@ -3544,6 +3631,8 @@ class DungeonCog(commands.Cog):
                     )
                     return
                 started_combat = combat is not None
+                if trigger_monster_turns:
+                    self._schedule_automatic_turns(session, session.combat_state)
 
         await self._refresh_session_message(interaction, session)
 
@@ -3779,6 +3868,7 @@ class DungeonCog(commands.Cog):
         combat_in_progress = False
         no_targets = False
         should_start_combat = False
+        trigger_monster_turns = False
         party_snapshot: tuple[int, ...] = ()
 
         if interaction.user.id not in current_session.party_ids:
@@ -3811,18 +3901,20 @@ class DungeonCog(commands.Cog):
             combat = await self._build_combat_state(interaction, session, party_snapshot)
 
             def apply_combat(run: DungeonSession) -> None:
-                nonlocal started_combat, combat_in_progress
+                nonlocal started_combat, combat_in_progress, trigger_monster_turns
                 if run.combat_state and run.combat_state.active:
                     combat_in_progress = True
                     return
                 run.combat_state = combat
                 started_combat = True
-                self._run_automatic_turns(run, combat)
+                trigger_monster_turns = True
 
             session = await self.sessions.update(key, apply_combat)
             if session is None:
                 await interaction.response.send_message("No foes stand before the party right now.", ephemeral=True)
                 return
+            if trigger_monster_turns:
+                self._schedule_automatic_turns(session, session.combat_state)
 
         if added_member and interaction.guild_id is not None:
             await self._handle_party_membership_change(interaction.guild_id, session)
@@ -3890,13 +3982,14 @@ class DungeonCog(commands.Cog):
         added_member = False
         error: Optional[str] = None
         summary: Optional[str] = None
+        trigger_monster_turns = False
 
         if interaction.user.id not in current_session.party_ids:
             if not await self._ensure_character_available(interaction):
                 return
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal added_member, error, summary
+            nonlocal added_member, error, summary, trigger_monster_turns
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
@@ -3936,7 +4029,8 @@ class DungeonCog(commands.Cog):
                 if next_combatant is None:
                     self._finish_combat(run, combat, victory=False)
                 else:
-                    self._run_automatic_turns(run, combat)
+                    nonlocal trigger_monster_turns
+                    trigger_monster_turns = True
 
         session = await self.sessions.update(key, mutate)
         if session is None:
@@ -3945,6 +4039,9 @@ class DungeonCog(commands.Cog):
                 "No active dungeon for this party.",
             )
             return
+
+        if trigger_monster_turns:
+            self._schedule_automatic_turns(session, session.combat_state)
 
         if added_member and interaction.guild_id is not None:
             await self._handle_party_membership_change(interaction.guild_id, session)
