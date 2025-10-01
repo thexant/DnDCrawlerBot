@@ -1,0 +1,170 @@
+- key: fighter
+  name: Fighter
+  hit_die: 10
+  primary_abilities:
+    - STR
+    - CON
+  saving_throws:
+    - STR
+    - CON
+  armor_proficiencies:
+    - All armor
+    - Shields
+  weapon_proficiencies:
+    - Simple weapons
+    - Martial weapons
+  tool_proficiencies: []
+  skill_proficiency_options:
+    count: 2
+    options:
+      - Acrobatics
+      - Animal Handling
+      - Athletics
+      - History
+      - Insight
+      - Intimidation
+      - Perception
+      - Survival
+  equipment:
+    fixed:
+      - explorers_pack
+    choices:
+      - key: fighter_weapon
+        choose: 1
+        options:
+          - key: fighter_defense
+            name: Chain Mail, shield, and longsword
+            items:
+              - chain_mail
+              - shield
+              - longsword
+          - key: fighter_archer
+            name: Leather armor, longbow, and 20 arrows
+            items:
+              - leather_armor
+              - longbow
+              - arrows_20
+  features:
+    - level: 1
+      name: Fighting Style
+      description: You adopt a particular style of fighting as your specialty.
+    - level: 1
+      name: Second Wind
+      description: You can use a bonus action to regain hit points.
+- key: wizard
+  name: Wizard
+  hit_die: 6
+  primary_abilities:
+    - INT
+  saving_throws:
+    - INT
+    - WIS
+  armor_proficiencies: []
+  weapon_proficiencies:
+    - Daggers
+    - Darts
+    - Slings
+    - Quarterstaffs
+    - Light crossbows
+  tool_proficiencies: []
+  skill_proficiency_options:
+    count: 2
+    options:
+      - Arcana
+      - History
+      - Insight
+      - Investigation
+      - Medicine
+      - Religion
+  equipment:
+    fixed:
+      - spellbook
+    choices:
+      - key: wizard_focus
+        choose: 1
+        options:
+          - key: wizard_component
+            name: Component pouch and scholar's pack
+            items:
+              - component_pouch
+              - scholars_pack
+          - key: wizard_focus
+            name: Quarterstaff and scholar's pack
+            items:
+              - quarterstaff
+              - scholars_pack
+  features:
+    - level: 1
+      name: Spellcasting
+      description: You have learned to untangle and reshape the fabric of reality.
+    - level: 1
+      name: Arcane Recovery
+      description: You regain some spell slots on a short rest.
+- key: rogue
+  name: Rogue
+  hit_die: 8
+  primary_abilities:
+    - DEX
+    - INT
+  saving_throws:
+    - DEX
+    - INT
+  armor_proficiencies:
+    - Light armor
+  weapon_proficiencies:
+    - Simple weapons
+    - Hand crossbows
+    - Longswords
+    - Rapiers
+    - Shortswords
+  tool_proficiencies:
+    - Thieves' tools
+  skill_proficiency_options:
+    count: 4
+    options:
+      - Acrobatics
+      - Athletics
+      - Deception
+      - Insight
+      - Intimidation
+      - Investigation
+      - Perception
+      - Performance
+      - Persuasion
+      - Sleight of Hand
+      - Stealth
+  equipment:
+    fixed:
+      - burglars_pack
+    choices:
+      - key: rogue_weapon
+        choose: 1
+        options:
+          - key: rogue_rapier
+            name: Rapier
+            items:
+              - rapier
+          - key: rogue_shortsword
+            name: Shortsword pair
+            items:
+              - shortsword_pair
+      - key: rogue_ranged
+        choose: 1
+        options:
+          - key: rogue_shortbow
+            name: Shortbow and quiver of 20 arrows
+            items:
+              - shortbow
+              - arrows_20_shortbow
+          - key: rogue_daggers
+            name: Two daggers
+            items:
+              - dagger
+              - dagger
+  features:
+    - level: 1
+      name: Sneak Attack
+      description: Deal extra damage to creatures you hit with finesse or ranged weapons.
+    - level: 1
+      name: Thieves' Cant
+      description: You have learned thieves' cant, a secret mix of dialect, jargon, and code.

@@ -2,9 +2,12 @@
 
 from .characters import (
     ABILITY_NAMES,
+    AVAILABLE_BACKGROUNDS,
     AVAILABLE_CLASSES,
     AVAILABLE_RACES,
+    EQUIPMENT,
     AbilityScores,
+    Background,
     Character,
     CharacterClass,
     Race,
@@ -43,9 +46,12 @@ from .tavern import TavernConfig, TavernConfigStore
 
 __all__ = [
     "ABILITY_NAMES",
+    "AVAILABLE_BACKGROUNDS",
     "AVAILABLE_CLASSES",
     "AVAILABLE_RACES",
+    "EQUIPMENT",
     "AbilityScores",
+    "Background",
     "Character",
     "CharacterClass",
     "Race",

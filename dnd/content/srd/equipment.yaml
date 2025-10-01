@@ -1,0 +1,79 @@
+items:
+  chain_mail:
+    name: Chain Mail
+    category: Armor
+  leather_armor:
+    name: Leather Armor
+    category: Armor
+  longsword:
+    name: Longsword
+    category: Weapon
+  shield:
+    name: Shield
+    category: Armor
+  longbow:
+    name: Longbow
+    category: Weapon
+  arrows_20:
+    name: Arrows (20)
+    category: Ammunition
+  shortsword_pair:
+    name: Two Shortswords
+    category: Weapon
+  component_pouch:
+    name: Component Pouch
+    category: Gear
+  spellbook:
+    name: Spellbook
+    category: Gear
+  dagger:
+    name: Dagger
+    category: Weapon
+  explorers_pack:
+    name: Explorer's Pack
+    category: Pack
+  dungeoneers_pack:
+    name: Dungeoneer's Pack
+    category: Pack
+  burglars_pack:
+    name: Burglar's Pack
+    category: Pack
+  holy_symbol:
+    name: Holy Symbol
+    category: Gear
+  mace:
+    name: Mace
+    category: Weapon
+  scale_mail:
+    name: Scale Mail
+    category: Armor
+  light_crossbow:
+    name: Light Crossbow
+    category: Weapon
+  bolts_20:
+    name: Crossbow Bolts (20)
+    category: Ammunition
+  quarterstaff:
+    name: Quarterstaff
+    category: Weapon
+  scholars_pack:
+    name: Scholar's Pack
+    category: Pack
+  thieves_tools:
+    name: Thieves' Tools
+    category: Tool
+  rapier:
+    name: Rapier
+    category: Weapon
+  shortbow:
+    name: Shortbow
+    category: Weapon
+  arrows_20_shortbow:
+    name: Shortbow Arrows (20)
+    category: Ammunition
+  insignia_of_rank:
+    name: Insignia of Rank
+    category: Gear
+  trophy_of_war:
+    name: Trophy of War
+    category: Gear
