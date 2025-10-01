@@ -41,17 +41,34 @@ async def load_cogs(bot: commands.Bot, cogs_path: Path) -> None:
         logging.info("Loaded cog: %s", module_name)
 
 
-def create_bot() -> commands.Bot:
-    intents = discord.Intents.default()
-    bot = commands.Bot(command_prefix="!", intents=intents)
+class SlashCommandBot(commands.Bot):
+    """Bot subclass that only supports slash (application) commands."""
 
-    @bot.event
-    async def setup_hook() -> None:  # type: ignore[override]
-        cogs_path = Path(__file__).parent / "cogs"
-        await load_cogs(bot, cogs_path)
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        super().__init__(
+            command_prefix=commands.when_mentioned,
+            intents=intents,
+            help_command=None,
+        )
+        self._cogs_path = Path(__file__).parent / "cogs"
+
+    async def setup_hook(self) -> None:  # type: ignore[override]
+        await load_cogs(self, self._cogs_path)
         logging.info("All cogs loaded")
 
-    return bot
+    def add_command(  # type: ignore[override]
+        self, command: commands.Command, *args, **kwargs
+    ) -> None:
+        raise TypeError("SlashCommandBot does not support prefixed commands.")
+
+    async def process_commands(self, message: discord.Message) -> None:  # type: ignore[override]
+        """Override to disable prefix command processing entirely."""
+        return
+
+
+def create_bot() -> commands.Bot:
+    return SlashCommandBot()
 
 
 def main() -> None:
