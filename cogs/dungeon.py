@@ -28,7 +28,16 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from dnd.combat import ability_modifier, attack_roll, saving_throw
+from dnd.combat import (
+    Attack,
+    DamagePacket,
+    ability_modifier,
+    apply_damage,
+    attack_roll,
+    resolve_attack,
+    resolve_multiattack,
+    saving_throw,
+)
 from dnd.characters import EQUIPMENT, Character
 from dnd.repository import CharacterRepository
 from dnd.content import ContentLibrary, ContentLoadError
@@ -219,10 +228,21 @@ class CombatantState:
     death_save_successes: int = 0
     death_save_failures: int = 0
     resources: Dict[str, object] = field(default_factory=dict)
+    stable: bool = False
 
     @property
     def defeated(self) -> bool:
-        return self.current_hp <= 0
+        if not self.is_player:
+            return self.current_hp <= 0
+        if self.current_hp > 0:
+            return False
+        return self.is_dead or self.stable
+
+    @property
+    def is_dead(self) -> bool:
+        if not self.is_player:
+            return self.current_hp <= 0
+        return self.current_hp <= 0 and self.death_save_failures >= 3
 
 
 @dataclass
@@ -1033,9 +1053,13 @@ class DungeonCog(commands.Cog):
         metadata["death_saves"] = {
             "successes": combatant.death_save_successes,
             "failures": combatant.death_save_failures,
+            "stable": combatant.stable,
         }
+        metadata["is_dead"] = combatant.is_dead
 
-    def _apply_damage_to_combatant(self, combatant: CombatantState, amount: int) -> int:
+    def _apply_damage_to_combatant(
+        self, combatant: CombatantState, amount: int, *, critical: bool = False
+    ) -> int:
         if amount <= 0:
             return 0
         previous = combatant.current_hp
@@ -1043,7 +1067,25 @@ class DungeonCog(commands.Cog):
         if combatant.current_hp <= 0:
             combatant.conditions.add("Unconscious")
             combatant.concentration = None
+            if combatant.is_player and previous > 0:
+                combatant.death_save_successes = 0
+                combatant.death_save_failures = 0
+                combatant.stable = False
+        else:
+            combatant.conditions.discard("Unconscious")
         dealt = previous - combatant.current_hp
+        if combatant.is_player and previous <= 0 and dealt > 0:
+            combatant.stable = False
+            failures = 2 if critical else 1
+            combatant.death_save_failures = min(3, combatant.death_save_failures + failures)
+        if combatant.is_player and combatant.death_save_failures >= 3:
+            combatant.conditions.add("Dead")
+            combatant.conditions.discard("Unconscious")
+        if combatant.is_player and combatant.current_hp > 0:
+            combatant.death_save_successes = 0
+            combatant.death_save_failures = 0
+            combatant.stable = False
+            combatant.conditions.discard("Dead")
         self._sync_combatant_state(combatant)
         return dealt
 
@@ -1054,9 +1096,60 @@ class DungeonCog(commands.Cog):
         combatant.current_hp = min(combatant.max_hp, combatant.current_hp + amount)
         if combatant.current_hp > 0:
             combatant.conditions.discard("Unconscious")
+            combatant.conditions.discard("Dead")
+            combatant.death_save_successes = 0
+            combatant.death_save_failures = 0
+            combatant.stable = False
         healed = combatant.current_hp - previous
         self._sync_combatant_state(combatant)
         return healed
+
+    @staticmethod
+    def _death_save_roll() -> int:
+        return random.randint(1, 20)
+
+    def _resolve_player_death_save(self, player: CombatantState) -> str:
+        roll = self._death_save_roll()
+        message: list[str] = [f"{player.name} rolls a {roll} on their death save."]
+        if roll == 20:
+            player.current_hp = max(1, player.current_hp)
+            player.death_save_successes = 0
+            player.death_save_failures = 0
+            player.stable = False
+            player.conditions.discard("Unconscious")
+            player.conditions.discard("Dead")
+            message.append(f"{player.name} surges back to life with 1 HP!")
+        elif roll == 1:
+            player.death_save_failures = min(3, player.death_save_failures + 2)
+            player.stable = False
+            message.append("Critical failure—two death save failures recorded.")
+        elif roll >= 10:
+            player.death_save_successes = min(3, player.death_save_successes + 1)
+            message.append("Success!")
+        else:
+            player.death_save_failures = min(3, player.death_save_failures + 1)
+            player.stable = False
+            message.append("Failure.")
+        if player.death_save_failures >= 3:
+            player.conditions.add("Dead")
+            player.conditions.discard("Unconscious")
+            message.append(f"{player.name} succumbs to their wounds.")
+        elif roll != 20 and player.death_save_successes >= 3:
+            player.stable = True
+            message.append(f"{player.name} stabilises but remains unconscious.")
+        self._sync_combatant_state(player)
+        return " ".join(message)
+
+    def _handle_player_zero_hp_turn(self, state: CombatState, player: CombatantState) -> bool:
+        if player.current_hp > 0:
+            return False
+        state.waiting_for = None
+        if player.is_dead or player.stable:
+            return True
+        message = self._resolve_player_death_save(player)
+        state.log.append(message)
+        self._trim_combat_log(state)
+        return True
 
     @staticmethod
     def _resolve_selection_index(selection: Optional[str], prefix: str, default: int = 0) -> int:
@@ -1222,33 +1315,482 @@ class DungeonCog(commands.Cog):
         elif not self._any_players_alive(state):
             self._finish_combat(session, state, victory=False)
 
-    def _resolve_monster_action(self, state: CombatState, monster: CombatantState) -> None:
-        targets = [combatant for combatant in state.order if combatant.is_player and not combatant.defeated]
-        if not targets:
-            return
-        target = random.choice(targets)
-        attack_bonus = int(monster.metadata.get("attack_bonus", 4))
-        target_ac = int(target.metadata.get("armor_class", DEFAULT_PLAYER_ARMOR_CLASS))
-        result = attack_roll(attack_bonus, target_ac)
-        if result.hits:
-            damage_expr = str(monster.metadata.get("damage", "1d6+1"))
-            damage = self._roll_damage(damage_expr, critical=result.is_critical_hit)
-            dealt = self._apply_damage_to_combatant(target, damage)
-            message = (
-                f"{monster.name} hits {target.name} for {dealt} damage. "
-                f"(Attack {result.total} vs AC {target_ac})"
-            )
-            if result.is_critical_hit:
-                message += " Critical hit!"
-            if target.defeated:
-                message += f" {target.name} is defeated!"
+    @staticmethod
+    def _normalise_damage_traits(value: object) -> Set[str]:
+        traits: Set[str] = set()
+        if not value:
+            return traits
+        if isinstance(value, str):
+            cleaned = value.strip().lower()
+            if cleaned:
+                traits.add(cleaned)
+            return traits
+        if isinstance(value, Mapping):
+            iterable = value.values()
+        elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+            iterable = value
         else:
-            message = (
-                f"{monster.name} misses {target.name}. "
-                f"(Attack {result.total} vs AC {target_ac})"
+            return traits
+        for entry in iterable:
+            if not entry:
+                continue
+            cleaned = str(entry).strip().lower()
+            if cleaned:
+                traits.add(cleaned)
+        return traits
+
+    @staticmethod
+    def _monster_action_key(action: Mapping[str, object]) -> str:
+        key = action.get("key") or action.get("name")
+        return str(key).lower() if key is not None else ""
+
+    def _monster_actions(self, monster: CombatantState) -> List[Mapping[str, object]]:
+        actions_raw = monster.metadata.get("actions")
+        actions: List[Mapping[str, object]] = []
+        if isinstance(actions_raw, Sequence) and not isinstance(actions_raw, (str, bytes)):
+            for entry in actions_raw:
+                if isinstance(entry, Mapping):
+                    actions.append(entry)
+        return actions
+
+    def _find_monster_action(
+        self, actions: Sequence[Mapping[str, object]], reference: object
+    ) -> Optional[Mapping[str, object]]:
+        if reference is None:
+            return None
+        key = str(reference).lower()
+        for action in actions:
+            if self._monster_action_key(action) == key:
+                return action
+        return None
+
+    def _expand_multiattack_actions(
+        self, monster: CombatantState, actions: Sequence[Mapping[str, object]]
+    ) -> List[Mapping[str, object]]:
+        multiattack_raw = monster.metadata.get("multiattack")
+        if not multiattack_raw:
+            return []
+        if isinstance(multiattack_raw, Mapping):
+            payload = multiattack_raw.get("attacks") or multiattack_raw.get("actions")
+        else:
+            payload = multiattack_raw
+        if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes)):
+            return []
+        expanded: List[Mapping[str, object]] = []
+        for entry in payload:
+            if isinstance(entry, Mapping):
+                count = entry.get("count", 1)
+                try:
+                    repeats = max(1, int(count))
+                except (TypeError, ValueError):
+                    repeats = 1
+                if "ref" in entry:
+                    ref = self._find_monster_action(actions, entry.get("ref"))
+                    if ref is None:
+                        continue
+                    for _ in range(repeats):
+                        expanded.append(ref)
+                else:
+                    for _ in range(repeats):
+                        expanded.append(entry)
+            elif isinstance(entry, str):
+                ref = self._find_monster_action(actions, entry)
+                if ref is not None:
+                    expanded.append(ref)
+        return expanded
+
+    def _create_monster_attack(
+        self,
+        monster: CombatantState,
+        action: Optional[Mapping[str, object]],
+    ) -> tuple[Attack, Tuple[str, ...]]:
+        metadata = monster.metadata
+        action_data: Mapping[str, object] = action or {}
+        name = str(
+            action_data.get(
+                "name",
+                metadata.get("attack_name")
+                or metadata.get("weapon_name")
+                or f"{monster.name} Attack",
             )
+        )
+        try:
+            attack_bonus = int(action_data.get("attack_bonus", metadata.get("attack_bonus", 0)))
+        except (TypeError, ValueError):
+            attack_bonus = int(metadata.get("attack_bonus", 0))
+        damage_expr = str(action_data.get("damage", metadata.get("damage", "1d6+1")))
+        damage_type_raw = action_data.get("damage_type", metadata.get("damage_type"))
+        damage_type = str(damage_type_raw).lower() if damage_type_raw else None
+        base_damage = self._roll_damage(damage_expr)
+        packet = DamagePacket(amount=base_damage, damage_type=damage_type)
+        advantage_sources = ()
+        disadvantage_sources = ()
+        advantage_raw = action_data.get("advantage")
+        if isinstance(advantage_raw, Sequence) and not isinstance(advantage_raw, (str, bytes)):
+            advantage_sources = tuple(str(value) for value in advantage_raw)
+        disadvantage_raw = action_data.get("disadvantage")
+        if isinstance(disadvantage_raw, Sequence) and not isinstance(disadvantage_raw, (str, bytes)):
+            disadvantage_sources = tuple(str(value) for value in disadvantage_raw)
+        critical_double = bool(action_data.get("critical_double", True))
+        extra_raw = action_data.get("critical_extra_dice")
+        if isinstance(extra_raw, Sequence) and not isinstance(extra_raw, (str, bytes)):
+            extra_dice = tuple(str(value) for value in extra_raw)
+        else:
+            extra_dice = ()
+        attack = Attack(
+            name=name,
+            attack_bonus=attack_bonus,
+            damage_packets=(packet,),
+            advantage_sources=advantage_sources,
+            disadvantage_sources=disadvantage_sources,
+            critical_double=critical_double,
+        )
+        return attack, extra_dice
+
+    def _apply_conditions_to_target(
+        self, target: CombatantState, conditions: object
+    ) -> Optional[str]:
+        if not conditions:
+            return None
+        applied: List[str] = []
+        if isinstance(conditions, str):
+            cleaned = conditions.strip()
+            if cleaned:
+                target.conditions.add(cleaned)
+                applied.append(cleaned)
+        elif isinstance(conditions, Iterable) and not isinstance(conditions, (str, bytes)):
+            for condition in conditions:
+                if not condition:
+                    continue
+                cleaned = str(condition).strip()
+                if cleaned:
+                    target.conditions.add(cleaned)
+                    applied.append(cleaned)
+        if applied:
+            self._sync_combatant_state(target)
+            return ", ".join(applied)
+        return None
+
+    @staticmethod
+    def _choose_monster_action(
+        actions: Sequence[Mapping[str, object]]
+    ) -> Optional[Mapping[str, object]]:
+        if not actions:
+            return None
+        priority = {"melee": 0, "attack": 0, "ranged": 1, "spell": 2, "save": 3, "auto": 4}
+        return min(
+            actions,
+            key=lambda action: priority.get(str(action.get("type", "attack")).lower(), 5),
+        )
+
+    def _resolve_monster_action(self, state: CombatState, monster: CombatantState) -> None:
+        potential_targets = [
+            combatant
+            for combatant in state.order
+            if combatant.is_player and not combatant.is_dead
+        ]
+        if not potential_targets:
+            return
+        conscious_targets = [target for target in potential_targets if target.current_hp > 0]
+        if conscious_targets:
+            target = random.choice(conscious_targets)
+        else:
+            target = random.choice(potential_targets)
+        actions = self._monster_actions(monster)
+        multiattack = self._expand_multiattack_actions(monster, actions)
+        target_ac = int(target.metadata.get("armor_class", DEFAULT_PLAYER_ARMOR_CLASS))
+        resistances = self._normalise_damage_traits(target.metadata.get("resistances"))
+        vulnerabilities = self._normalise_damage_traits(target.metadata.get("vulnerabilities"))
+        immunities = self._normalise_damage_traits(target.metadata.get("immunities"))
+        message: Optional[str]
+        if multiattack:
+            message = self._execute_monster_multiattack(
+                monster,
+                target,
+                multiattack,
+                target_ac=target_ac,
+                resistances=resistances,
+                vulnerabilities=vulnerabilities,
+                immunities=immunities,
+            )
+        else:
+            action = self._choose_monster_action(actions)
+            action_type = str(action.get("type", "attack")).lower() if action else "attack"
+            if action_type == "save":
+                message = self._execute_monster_save_action(
+                    monster,
+                    target,
+                    action,
+                    resistances=resistances,
+                    vulnerabilities=vulnerabilities,
+                    immunities=immunities,
+                )
+            elif action_type == "auto":
+                message = self._execute_monster_auto_action(
+                    monster,
+                    target,
+                    action,
+                    resistances=resistances,
+                    vulnerabilities=vulnerabilities,
+                    immunities=immunities,
+                )
+            else:
+                message = self._execute_monster_attack_action(
+                    monster,
+                    target,
+                    action,
+                    target_ac=target_ac,
+                    resistances=resistances,
+                    vulnerabilities=vulnerabilities,
+                    immunities=immunities,
+                )
+        if not message:
+            message = f"{monster.name} hesitates, accomplishing nothing."
         state.log.append(message)
         self._trim_combat_log(state)
+
+    def _execute_monster_multiattack(
+        self,
+        monster: CombatantState,
+        target: CombatantState,
+        actions: Sequence[Mapping[str, object]],
+        *,
+        target_ac: int,
+        resistances: Iterable[str],
+        vulnerabilities: Iterable[str],
+        immunities: Iterable[str],
+    ) -> str:
+        parts: List[str] = []
+        for action in actions:
+            attack, extra_dice = self._create_monster_attack(monster, action)
+            outcome = resolve_attack(
+                attack,
+                target_ac,
+                resistances=resistances,
+                vulnerabilities=vulnerabilities,
+                immunities=immunities,
+            )
+            pending_damage = outcome.damage
+            if outcome.roll_result.hits and extra_dice:
+                damage_type = attack.damage_packets[0].damage_type
+                extra_packets = [
+                    DamagePacket(
+                        amount=self._roll_damage(str(dice)),
+                        damage_type=damage_type,
+                    )
+                    for dice in extra_dice
+                ]
+                if extra_packets:
+                    pending_damage += apply_damage(
+                        extra_packets,
+                        resistances=resistances,
+                        vulnerabilities=vulnerabilities,
+                        immunities=immunities,
+                    )
+            dealt = 0
+            if outcome.roll_result.hits and pending_damage > 0:
+                was_unconscious = target.current_hp <= 0
+                dealt = self._apply_damage_to_combatant(
+                    target,
+                    pending_damage,
+                    critical=outcome.roll_result.is_critical_hit or was_unconscious,
+                )
+            if outcome.roll_result.hits:
+                text = (
+                    f"{attack.name} hits {target.name} for {dealt} damage "
+                    f"(Attack {outcome.roll_result.total} vs AC {target_ac})."
+                )
+                if outcome.roll_result.is_critical_hit:
+                    text += " Critical hit!"
+            else:
+                text = (
+                    f"{attack.name} misses {target.name} "
+                    f"(Attack {outcome.roll_result.total} vs AC {target_ac})."
+                )
+            parts.append(text)
+            if target.is_dead:
+                break
+        if not parts:
+            summary = f"{monster.name} struggles to land a blow on {target.name}."
+        else:
+            summary = f"{monster.name} unleashes a flurry on {target.name}: " + " ".join(parts)
+            if target.defeated:
+                summary += f" {target.name} is defeated!"
+        return summary
+
+    def _execute_monster_attack_action(
+        self,
+        monster: CombatantState,
+        target: CombatantState,
+        action: Optional[Mapping[str, object]],
+        *,
+        target_ac: int,
+        resistances: Iterable[str],
+        vulnerabilities: Iterable[str],
+        immunities: Iterable[str],
+    ) -> str:
+        attack, extra_dice = self._create_monster_attack(monster, action)
+        outcome = resolve_attack(
+            attack,
+            target_ac,
+            resistances=resistances,
+            vulnerabilities=vulnerabilities,
+            immunities=immunities,
+        )
+        pending_damage = outcome.damage
+        if outcome.roll_result.hits and extra_dice:
+            damage_type = attack.damage_packets[0].damage_type
+            extra_packets = [
+                DamagePacket(
+                    amount=self._roll_damage(str(dice)),
+                    damage_type=damage_type,
+                )
+                for dice in extra_dice
+            ]
+            if extra_packets:
+                pending_damage += apply_damage(
+                    extra_packets,
+                    resistances=resistances,
+                    vulnerabilities=vulnerabilities,
+                    immunities=immunities,
+                )
+        dealt = 0
+        if outcome.roll_result.hits and pending_damage > 0:
+            was_unconscious = target.current_hp <= 0
+            dealt = self._apply_damage_to_combatant(
+                target,
+                pending_damage,
+                critical=outcome.roll_result.is_critical_hit or was_unconscious,
+            )
+        if outcome.roll_result.hits:
+            message = (
+                f"{monster.name} uses {attack.name}, hitting {target.name} for {dealt} damage "
+                f"(Attack {outcome.roll_result.total} vs AC {target_ac})."
+            )
+            if outcome.roll_result.is_critical_hit:
+                message += " Critical hit!"
+        else:
+            message = (
+                f"{monster.name} uses {attack.name}, missing {target.name} "
+                f"(Attack {outcome.roll_result.total} vs AC {target_ac})."
+            )
+        if target.defeated:
+            message += f" {target.name} is defeated!"
+        return message
+
+    def _execute_monster_auto_action(
+        self,
+        monster: CombatantState,
+        target: CombatantState,
+        action: Optional[Mapping[str, object]],
+        *,
+        resistances: Iterable[str],
+        vulnerabilities: Iterable[str],
+        immunities: Iterable[str],
+    ) -> str:
+        action_data: Mapping[str, object] = action or {}
+        name = str(action_data.get("name", f"{monster.name}'s assault"))
+        damage_expr = str(action_data.get("damage", monster.metadata.get("damage", "1d6+1")))
+        damage_type_raw = action_data.get("damage_type", monster.metadata.get("damage_type"))
+        damage_type = str(damage_type_raw).lower() if damage_type_raw else None
+        base_damage = self._roll_damage(damage_expr)
+        packets = (DamagePacket(amount=base_damage, damage_type=damage_type),)
+        damage = apply_damage(
+            packets,
+            resistances=resistances,
+            vulnerabilities=vulnerabilities,
+            immunities=immunities,
+        )
+        dealt = 0
+        if damage > 0:
+            dealt = self._apply_damage_to_combatant(
+                target,
+                damage,
+                critical=target.current_hp <= 0,
+            )
+        condition_text = self._apply_conditions_to_target(target, action_data.get("conditions"))
+        if dealt:
+            message = (
+                f"{monster.name} unleashes {name}, dealing {dealt} damage to {target.name}."
+            )
+        else:
+            message = f"{monster.name} unleashes {name}, but it has no effect on {target.name}."
+        if condition_text:
+            message += f" {target.name} gains {condition_text}."
+        if target.defeated:
+            message += f" {target.name} is defeated!"
+        return message
+
+    def _execute_monster_save_action(
+        self,
+        monster: CombatantState,
+        target: CombatantState,
+        action: Optional[Mapping[str, object]],
+        *,
+        resistances: Iterable[str],
+        vulnerabilities: Iterable[str],
+        immunities: Iterable[str],
+    ) -> str:
+        action_data: Mapping[str, object] = action or {}
+        name = str(action_data.get("name", f"{monster.name}'s spell"))
+        dc = int(action_data.get("save_dc", monster.metadata.get("save_dc", 10)))
+        ability = str(action_data.get("save_ability", monster.metadata.get("save_ability", "DEX"))).upper()
+        saving_throws = target.metadata.get("saving_throws")
+        if isinstance(saving_throws, Mapping):
+            try:
+                save_bonus = int(saving_throws.get(ability, 0))
+            except (TypeError, ValueError):
+                save_bonus = 0
+        else:
+            save_bonus = 0
+        save_result = saving_throw(save_bonus, dc)
+        damage_expr = str(action_data.get("damage", monster.metadata.get("damage", "1d6+1")))
+        damage_type_raw = action_data.get("damage_type", monster.metadata.get("damage_type"))
+        damage_type = str(damage_type_raw).lower() if damage_type_raw else None
+        damage_amount = self._roll_damage(damage_expr)
+        if save_result.success:
+            if action_data.get("half_on_success"):
+                damage_amount //= 2
+            else:
+                damage_amount = 0
+        packets = (DamagePacket(amount=damage_amount, damage_type=damage_type),)
+        damage = apply_damage(
+            packets,
+            resistances=resistances,
+            vulnerabilities=vulnerabilities,
+            immunities=immunities,
+        )
+        dealt = 0
+        if damage > 0:
+            dealt = self._apply_damage_to_combatant(
+                target,
+                damage,
+                critical=target.current_hp <= 0,
+            )
+        if save_result.success:
+            message = (
+                f"{monster.name} uses {name}; {target.name} succeeds on a DC {dc} {ability} save."
+            )
+            if dealt:
+                message += f" {target.name} still takes {dealt} damage."
+            condition_text = self._apply_conditions_to_target(
+                target, action_data.get("success_conditions")
+            )
+        else:
+            message = (
+                f"{monster.name} uses {name}; {target.name} fails the DC {dc} {ability} save and takes {dealt} damage."
+            )
+            fail_conditions = (
+                action_data.get("fail_conditions")
+                or action_data.get("conditions_on_fail")
+                or action_data.get("conditions")
+            )
+            condition_text = self._apply_conditions_to_target(target, fail_conditions)
+        if condition_text:
+            message += f" {target.name} gains {condition_text}."
+        if target.defeated:
+            message += f" {target.name} is defeated!"
+        return message
 
     @staticmethod
     def _format_damage_expression(damage_die: str, ability_mod: int) -> str:
@@ -1544,6 +2086,16 @@ class DungeonCog(commands.Cog):
             current = state.current_combatant()
             if current is None:
                 break
+            if current.is_player and current.current_hp <= 0:
+                handled = self._handle_player_zero_hp_turn(state, current)
+                if handled:
+                    self._evaluate_combat_state(session, state)
+                    if not state.active:
+                        break
+                    next_combatant = state.advance_turn()
+                    if next_combatant is None:
+                        break
+                    continue
             if current.defeated:
                 next_combatant = self._ensure_current_combatant(state)
                 if next_combatant is None:
@@ -1607,7 +2159,9 @@ class DungeonCog(commands.Cog):
                 critical=result.is_critical_hit,
                 extra_dice=extra_dice_values,
             )
-            dealt = self._apply_damage_to_combatant(target, damage)
+            dealt = self._apply_damage_to_combatant(
+                target, damage, critical=result.is_critical_hit
+            )
             weapon_text = "" if weapon_label.lower() == "weapon" else f" with your {weapon_label}"
             summary = (
                 f"You hit {target.name}{weapon_text} for {dealt} damage! "
@@ -1688,7 +2242,9 @@ class DungeonCog(commands.Cog):
                     critical=result.is_critical_hit,
                     extra_dice=critical_dice,
                 )
-                dealt = self._apply_damage_to_combatant(target, damage)
+                dealt = self._apply_damage_to_combatant(
+                    target, damage, critical=result.is_critical_hit
+                )
                 type_text = f" {str(damage_type).title()}" if damage_type else ""
                 summary = (
                     f"You cast {spell_name}, striking {target.name} for {dealt}{type_text} damage. "
