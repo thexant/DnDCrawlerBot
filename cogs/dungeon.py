@@ -31,6 +31,7 @@ from discord.ext import commands
 from dnd.combat import (
     Attack,
     DamagePacket,
+    SavingThrowResult,
     ability_modifier,
     apply_damage,
     attack_roll,
@@ -40,9 +41,17 @@ from dnd.combat import (
 )
 from dnd.characters import EQUIPMENT, Character
 from dnd.repository import CharacterRepository
-from dnd.content import ContentLibrary, ContentLoadError
+from dnd.content import ContentLibrary, ContentLoadError, Item, Trap
 from dnd.dungeon import Dungeon, DungeonGenerator, Room, Theme, ThemeRegistry
 from dnd.dungeon.state import DungeonMetadataStore, StoredDungeon
+from dnd.dungeon.rewards import (
+    RewardShare,
+    allocate_loot,
+    eligible_order,
+    format_item_label,
+    split_gold,
+    trap_reward_value,
+)
 from dnd.sessions import SessionKey, SessionManager
 
 
@@ -193,6 +202,7 @@ class DungeonSession:
     last_exit_taken: Optional[str] = None
     last_travel_description: Optional[str] = None
     last_travel_note: Optional[str] = None
+    loot_cursor: int = 0
 
     @property
     def room(self) -> Room:
@@ -932,6 +942,69 @@ class DungeonCog(commands.Cog):
     ) -> None:
         await self._update_tavern_access(guild_id)
         await self._sync_party_channel_access(session)
+
+    async def _load_party_characters(
+        self, guild_id: int, party_ids: Iterable[int]
+    ) -> Dict[int, Character]:
+        characters: Dict[int, Character] = {}
+        for user_id in party_ids:
+            try:
+                character = await self.characters.get(guild_id, user_id)
+            except Exception as exc:
+                log.warning(
+                    "Failed to load character for user %s in guild %s: %s",
+                    user_id,
+                    guild_id,
+                    exc,
+                )
+                continue
+            if character is not None:
+                characters[user_id] = character
+        return characters
+
+    async def _apply_reward_shares(
+        self,
+        guild_id: int,
+        characters: MutableMapping[int, Character],
+        shares: Sequence[RewardShare],
+    ) -> tuple[list[str], list[str]]:
+        item_lines: list[str] = []
+        gold_lines: list[str] = []
+        for share in shares:
+            character = characters.get(share.user_id)
+            if character is None:
+                continue
+            new_inventory = list(character.inventory)
+            new_items: list[str] = []
+            for item in share.items:
+                label = format_item_label(item)
+                new_inventory.append(label)
+                new_items.append(label)
+            updated_character = replace(
+                character,
+                inventory=tuple(new_inventory),
+                gold_coins=character.gold_coins + share.gold,
+            )
+            try:
+                await self.characters.save(updated_character)
+            except Exception as exc:
+                log.warning(
+                    "Failed to persist rewards for user %s in guild %s: %s",
+                    share.user_id,
+                    guild_id,
+                    exc,
+                )
+                continue
+            characters[share.user_id] = updated_character
+            if new_items:
+                item_lines.append(
+                    f"• <@{share.user_id}> gains {', '.join(new_items)}"
+                )
+            if share.gold:
+                gold_lines.append(
+                    f"• <@{share.user_id}> gains {share.gold} gold coins"
+                )
+        return item_lines, gold_lines
 
     def _get_tavern_cog(self) -> Optional["Tavern"]:
         cog = self.bot.get_cog("Tavern")
@@ -3307,12 +3380,21 @@ class DungeonCog(commands.Cog):
             if not await self._ensure_character_available(interaction):
                 return
         added_member = False
+        collected_loot: tuple[Item, ...] = ()
+        party_snapshot: tuple[int, ...] = ()
+        loot_cursor = 0
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal added_member
+            nonlocal added_member, collected_loot, party_snapshot, loot_cursor
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
+            party_snapshot = tuple(sorted(run.party_ids))
+            if not run.room.encounter.loot:
+                return
+            collected_loot = tuple(run.room.encounter.loot)
+            loot_cursor = run.loot_cursor if party_snapshot else 0
+            run.room.encounter = replace(run.room.encounter, loot=())
 
         session = await self.sessions.update(key, mutate)
         if session is None:
@@ -3320,22 +3402,77 @@ class DungeonCog(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True)
-        await self._refresh_session_message(interaction, session)
         if added_member and interaction.guild_id is not None:
             await self._handle_party_membership_change(interaction.guild_id, session)
-        loot = session.room.encounter.loot
-        if not loot:
+        if not collected_loot:
+            await self._refresh_session_message(interaction, session)
             await interaction.followup.send(
                 "You find nothing of value after a thorough search.",
                 ephemeral=True,
             )
             return
 
-        lines = [f"• {item.name} ({item.rarity})" for item in loot]
-        await interaction.followup.send(
-            "You uncover hidden items:\n" + "\n".join(lines),
-            ephemeral=True,
+        def restore_loot(run: DungeonSession) -> None:
+            if collected_loot:
+                run.room.encounter = replace(
+                    run.room.encounter, loot=tuple(collected_loot)
+                )
+
+        if session.guild_id is None:
+            await self.sessions.update(key, restore_loot)
+            await self._refresh_session_message(interaction, session)
+            await interaction.followup.send(
+                "Without a guild roster I can't assign the treasure to anyone.",
+                ephemeral=True,
+            )
+            return
+
+        characters = await self._load_party_characters(session.guild_id, party_snapshot)
+        if not characters:
+            await self.sessions.update(key, restore_loot)
+            await self._refresh_session_message(interaction, session)
+            await interaction.followup.send(
+                "No one in the party has a ready character to claim the spoils just yet.",
+                ephemeral=True,
+            )
+            return
+
+        shares = allocate_loot(collected_loot, party_snapshot, loot_cursor, characters.keys())
+        if not shares:
+            await self.sessions.update(key, restore_loot)
+            await self._refresh_session_message(interaction, session)
+            await interaction.followup.send(
+                "The treasure slips through your fingers—try again once everyone is ready.",
+                ephemeral=True,
+            )
+            return
+
+        item_lines, gold_lines = await self._apply_reward_shares(
+            session.guild_id, characters, shares
         )
+
+        next_cursor = loot_cursor
+        if party_snapshot:
+            next_cursor = (loot_cursor + len(collected_loot)) % len(party_snapshot)
+            await self.sessions.update(
+                key, lambda run: setattr(run, "loot_cursor", next_cursor)
+            )
+            session.loot_cursor = next_cursor
+
+        await self._refresh_session_message(interaction, session)
+
+        message_lines: list[str] = ["You uncover hidden treasure!"]
+        if item_lines:
+            message_lines.append("Loot distributed:")
+            message_lines.extend(item_lines)
+        else:
+            message_lines.append("The finds are safely packed for the expedition.")
+        if gold_lines:
+            message_lines.append("")
+            message_lines.append("Coin shares:")
+            message_lines.extend(gold_lines)
+
+        await interaction.followup.send("\n".join(message_lines), ephemeral=True)
 
     async def handle_disarm(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
@@ -3347,12 +3484,39 @@ class DungeonCog(commands.Cog):
             if not await self._ensure_character_available(interaction):
                 return
         added_member = False
+        party_snapshot: tuple[int, ...] = ()
+        attempted_trap: Optional[Trap] = None
+        result: Optional[SavingThrowResult] = None
+        dc = 15
+        ability = "DEX"
+        loot_cursor = 0
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal added_member
+            nonlocal added_member, party_snapshot, attempted_trap, result, dc, ability, loot_cursor
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
+            party_snapshot = tuple(sorted(run.party_ids))
+            traps = list(run.room.encounter.traps)
+            if not traps:
+                return
+            trap_local = traps[0]
+            attempted_trap = trap_local
+            saving_throw_data = trap_local.saving_throw or {}
+            ability_value = saving_throw_data.get("ability", "DEX")
+            dc_raw = saving_throw_data.get("dc", 15)
+            try:
+                dc_value = int(dc_raw)
+            except (TypeError, ValueError):
+                dc_value = 15
+            dc = dc_value
+            ability = str(ability_value).upper()
+            loot_cursor = run.loot_cursor if party_snapshot else 0
+            roll_result = saving_throw(save_bonus=5, dc=dc_value)
+            result = roll_result
+            if roll_result.success:
+                traps.pop(0)
+                run.room.encounter = replace(run.room.encounter, traps=tuple(traps))
 
         session = await self.sessions.update(key, mutate)
         if session is None:
@@ -3360,33 +3524,55 @@ class DungeonCog(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True)
-        await self._refresh_session_message(interaction, session)
         if added_member and interaction.guild_id is not None:
             await self._handle_party_membership_change(interaction.guild_id, session)
-        traps = session.room.encounter.traps
-        if not traps:
+        if attempted_trap is None or result is None:
+            await self._refresh_session_message(interaction, session)
             await interaction.followup.send(
                 "There are no traps present in this room.",
                 ephemeral=True,
             )
             return
 
-        trap = traps[0]
-        dc = int(trap.saving_throw.get("dc", 15)) if trap.saving_throw else 15
-        ability = str(trap.saving_throw.get("ability", "DEX")) if trap.saving_throw else "DEX"
+        summary = f"(Roll {result.total}, DC {dc} {ability} save)"
 
-        result = saving_throw(save_bonus=5, dc=dc)
         if result.success:
-            message = (
-                f"You expertly disarm the {trap.name}! "
-                f"(Roll {result.total}, DC {dc} {ability} save)"
-            )
+            reward_lines: list[str] = []
+            if session.guild_id is not None and party_snapshot:
+                characters = await self._load_party_characters(session.guild_id, party_snapshot)
+                if characters:
+                    order = eligible_order(party_snapshot, loot_cursor, characters.keys())
+                    reward_amount = trap_reward_value(attempted_trap, dc)
+                    shares = split_gold(reward_amount, order)
+                    if shares:
+                        _, gold_lines = await self._apply_reward_shares(
+                            session.guild_id, characters, shares
+                        )
+                        reward_lines.extend(gold_lines)
+                        if order and party_snapshot:
+                            remainder = reward_amount % len(order)
+                            if remainder:
+                                next_cursor = (loot_cursor + remainder) % len(party_snapshot)
+                                await self.sessions.update(
+                                    key, lambda run: setattr(run, "loot_cursor", next_cursor)
+                                )
+                                session.loot_cursor = next_cursor
+            await self._refresh_session_message(interaction, session)
+            message_lines = [f"You expertly disarm the {attempted_trap.name}! {summary}"]
+            if reward_lines:
+                message_lines.append("")
+                message_lines.append("Coin shares:")
+                message_lines.extend(reward_lines)
+            await interaction.followup.send("\n".join(message_lines), ephemeral=True)
         else:
-            message = (
-                f"The {trap.name} resists your efforts (Roll {result.total}, DC {dc} {ability} save). "
-                "Perhaps try another approach."
+            await self._refresh_session_message(interaction, session)
+            await interaction.followup.send(
+                (
+                    f"The {attempted_trap.name} resists your efforts {summary}. "
+                    "Perhaps try another approach."
+                ),
+                ephemeral=True,
             )
-        await interaction.followup.send(message, ephemeral=True)
 
     async def handle_engage(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
