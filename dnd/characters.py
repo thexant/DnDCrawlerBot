@@ -212,7 +212,8 @@ class Character:
     ability_scores: AbilityScores
     racial_bonuses: Dict[str, int]
     proficiencies: tuple[str, ...]
-    equipment: tuple[str, ...]
+    inventory: tuple[str, ...]
+    gold_coins: int = 0
     name: str = "Unnamed Adventurer"
 
     @property
@@ -241,7 +242,9 @@ class Character:
             "ability_scores": self.ability_scores.to_dict(),
             "racial_bonuses": dict(self.racial_bonuses),
             "proficiencies": list(self.proficiencies),
-            "equipment": list(self.equipment),
+            "equipment": list(self.inventory),
+            "inventory": list(self.inventory),
+            "gold_coins": int(self.gold_coins),
             "name": self.name,
         }
 
@@ -261,7 +264,15 @@ class Character:
         )
         racial_bonuses = {k.upper(): int(v) for k, v in dict(data.get("racial_bonuses", {})).items()}
         proficiencies = tuple(str(value) for value in data.get("proficiencies", []))
-        equipment = tuple(str(value) for value in data.get("equipment", []))
+        inventory_source = data.get("inventory")
+        if inventory_source is None:
+            inventory_source = data.get("equipment", [])
+        inventory = tuple(str(value) for value in inventory_source or [])
+        gold_value = data.get("gold_coins", 0)
+        try:
+            gold_coins = int(gold_value)
+        except (TypeError, ValueError):
+            gold_coins = 0
         return cls(
             guild_id=int(data["guild_id"]),
             user_id=int(data["user_id"]),
@@ -273,9 +284,16 @@ class Character:
             ability_scores=ability_scores,
             racial_bonuses=racial_bonuses,
             proficiencies=proficiencies,
-            equipment=equipment,
+            inventory=inventory,
+            gold_coins=gold_coins,
             name=str(data.get("name", "Unnamed Adventurer")),
         )
+
+    @property
+    def equipment(self) -> tuple[str, ...]:
+        """Alias the legacy ``equipment`` attribute to the inventory."""
+
+        return self.inventory
 
 
 def _validate_assignment_keys(assignments: Mapping[str, int]) -> None:

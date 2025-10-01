@@ -10,11 +10,20 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from dnd import CharacterRepository, TavernConfig, TavernConfigStore
+from dnd import (
+    Character,
+    CharacterRepository,
+    InsufficientFunds,
+    ItemNotCarried,
+    TavernConfig,
+    TavernConfigStore,
+    TavernShop,
+)
 from dnd.dungeon.state import StoredDungeon
 
 if TYPE_CHECKING:  # pragma: no cover - typing helper
     from cogs.dungeon import DungeonCog
+    from discord import Message
 
 
 log = logging.getLogger(__name__)
@@ -95,6 +104,218 @@ class DungeonMapView(discord.ui.View):
         self.add_item(DungeonMapSelect(tavern, guild_id=guild_id, dungeons=dungeons))
 
 
+class ShopBuySelect(discord.ui.Select):
+    """Dropdown for selecting items to purchase."""
+
+    def __init__(self, view: "TavernShopView") -> None:
+        super().__init__(
+            placeholder="Buy an item",
+            min_values=1,
+            max_values=1,
+            options=[],
+            custom_id="tavern:shop_buy",
+        )
+        self.shop_view = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # noqa: D401
+        choice = self.values[0]
+        await self.shop_view.handle_purchase(interaction, choice)
+
+
+class ShopSellSelect(discord.ui.Select):
+    """Dropdown for selecting items to sell back to the trader."""
+
+    def __init__(self, view: "TavernShopView") -> None:
+        super().__init__(
+            placeholder="Sell an item",
+            min_values=1,
+            max_values=1,
+            options=[],
+            custom_id="tavern:shop_sell",
+        )
+        self.shop_view = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # noqa: D401
+        choice = self.values[0]
+        await self.shop_view.handle_sale(interaction, choice)
+
+
+class LeaveShopButton(discord.ui.Button):
+    """Button allowing the player to close the shop view."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Leave Shop",
+            style=discord.ButtonStyle.danger,
+            custom_id="tavern:shop_leave",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # noqa: D401
+        view = self.view
+        if not isinstance(view, TavernShopView):
+            await interaction.response.defer()
+            return
+        view.stop()
+        for child in view.children:
+            child.disabled = True
+        embed = view.build_embed()
+        await interaction.response.edit_message(
+            content="You leave the shop behind.",
+            embed=embed,
+            view=view,
+        )
+
+
+class TavernShopView(discord.ui.View):
+    """Interactive trading interface for the tavern shop."""
+
+    def __init__(
+        self,
+        cog: "Tavern",
+        *,
+        guild_id: int,
+        user_id: int,
+        character: Character,
+    ) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.character = character
+        self.message: Optional["Message"] = None
+        self.status: Optional[str] = None
+        self.buy_select = ShopBuySelect(self)
+        self.sell_select = ShopSellSelect(self)
+        self.add_item(self.buy_select)
+        self.add_item(self.sell_select)
+        self.add_item(LeaveShopButton())
+        self._refresh_controls()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # noqa: D401
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Only the hero who opened the shop may trade right now.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="Tavern Shop",
+            description=(
+                "The shopkeeper eyes you keenly, ready to barter goods for Gold Coins."
+            ),
+            color=discord.Color.gold(),
+        )
+        embed.add_field(
+            name="Your Purse",
+            value=f"{self.character.gold_coins} Gold Coins",
+            inline=False,
+        )
+        inventory_lines = [f"• {entry}" for entry in self.character.inventory]
+        embed.add_field(
+            name="Inventory",
+            value="\n".join(inventory_lines) if inventory_lines else "Empty",
+            inline=False,
+        )
+        stock_lines: list[str] = []
+        for item in self.cog.shop.list_items():
+            stock_lines.append(f"{item.name} — {item.price} Gold Coins")
+        display_stock = stock_lines[:25]
+        embed.add_field(
+            name="Available Goods",
+            value="\n".join(display_stock),
+            inline=False,
+        )
+        if self.status:
+            embed.add_field(name="Latest Transaction", value=self.status, inline=False)
+        embed.set_footer(text="Use the menus below to buy or sell items.")
+        return embed
+
+    def _refresh_controls(self) -> None:
+        buy_options: list[discord.SelectOption] = []
+        for item in self.cog.shop.list_items()[:25]:
+            buy_options.append(
+                discord.SelectOption(
+                    label=item.name[:100],
+                    value=item.key,
+                    description=f"{item.price} Gold Coins"[:100],
+                )
+            )
+        self.buy_select.options = buy_options
+        self.buy_select.disabled = not buy_options
+
+        sell_entries = self.cog.shop.items_from_inventory(self.character.inventory)
+        sell_options: list[discord.SelectOption] = []
+        for item, count in sell_entries[:25]:
+            label = item.name if count == 1 else f"{item.name} ({count})"
+            description = f"Sell for {item.resale_value} Gold Coins"
+            sell_options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=item.key,
+                    description=description[:100],
+                )
+            )
+        self.sell_select.options = sell_options
+        self.sell_select.disabled = not sell_options
+
+    async def handle_purchase(self, interaction: discord.Interaction, item_key: str) -> None:
+        item = self.cog.shop.get(item_key)
+        if item is None:
+            self.status = "That item is no longer available."
+            await self._edit(interaction)
+            return
+        try:
+            updated = self.cog.shop.purchase(self.character, item_key)
+        except InsufficientFunds:
+            self.status = f"You cannot afford {item.name}."
+            await self._edit(interaction)
+            return
+        except ItemNotCarried:
+            self.status = "The shopkeeper cannot locate that item."  # defensive
+            await self._edit(interaction)
+            return
+        self.character = updated
+        await self.cog.characters.save(updated)
+        self.status = f"Purchased {item.name} for {item.price} Gold Coins."
+        self._refresh_controls()
+        await self._edit(interaction)
+
+    async def handle_sale(self, interaction: discord.Interaction, item_key: str) -> None:
+        item = self.cog.shop.get(item_key)
+        if item is None:
+            self.status = "The shopkeeper isn't buying that right now."
+            await self._edit(interaction)
+            return
+        try:
+            updated = self.cog.shop.sell(self.character, item_key)
+        except ItemNotCarried:
+            self.status = f"You aren't carrying any {item.name}."
+            await self._edit(interaction)
+            return
+        self.character = updated
+        await self.cog.characters.save(updated)
+        self.status = f"Sold {item.name} for {item.resale_value} Gold Coins."
+        self._refresh_controls()
+        await self._edit(interaction)
+
+    async def _edit(self, interaction: discord.Interaction) -> None:
+        embed = self.build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self) -> None:  # noqa: D401
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        embed = self.build_embed()
+        try:
+            await self.message.edit(embed=embed, view=self)
+        except discord.HTTPException:
+            pass
+
 class TavernControlView(discord.ui.View):
     """Interactive controls for the tavern hub embed."""
 
@@ -108,10 +329,26 @@ class TavernControlView(discord.ui.View):
         custom_id="tavern:shop",
     )
     async def visit_shop(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
-        await interaction.response.send_message(
-            "The shopkeeper is still stocking the shelves. Check back soon!",
-            ephemeral=True,
-        )
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "The tavern shop is only available within a server.",
+                ephemeral=True,
+            )
+            return
+        character = await self.cog.characters.get(interaction.guild.id, interaction.user.id)
+        if character is None:
+            await interaction.response.send_message(
+                "You need to finish creating a character before trading in the tavern.",
+                ephemeral=True,
+            )
+            return
+        view = TavernShopView(self.cog, guild_id=interaction.guild.id, user_id=interaction.user.id, character=character)
+        embed = view.build_embed()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            view.message = None
 
     @discord.ui.button(
         label="View Dungeon Map",
@@ -139,6 +376,7 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         data_path = Path("data")
         self.config_store = TavernConfigStore(data_path / "taverns.json")
         self.characters = CharacterRepository(data_path / "characters.json")
+        self.shop = TavernShop.default_shop()
         self.refresh_views.start()
 
     def cog_unload(self) -> None:  # noqa: D401 - discord.py hook
