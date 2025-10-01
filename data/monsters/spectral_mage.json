@@ -1,0 +1,10 @@
+{
+  "name": "Spectral Mage",
+  "challenge": 4,
+  "armor_class": 12,
+  "hit_points": 40,
+  "attack_bonus": 6,
+  "damage": "2d8+4",
+  "ability_scores": {"INT": 18, "DEX": 14, "WIS": 12},
+  "tags": ["undead", "arcane"]
+}

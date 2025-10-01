@@ -1,0 +1,10 @@
+{
+  "name": "Ghast",
+  "challenge": 3,
+  "armor_class": 12,
+  "hit_points": 36,
+  "attack_bonus": 5,
+  "damage": "2d6+3",
+  "ability_scores": {"STR": 16, "DEX": 17, "CON": 13},
+  "tags": ["undead", "brute"]
+}

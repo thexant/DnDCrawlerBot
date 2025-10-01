@@ -1,19 +1,12 @@
 """Dungeon generation utilities."""
 
-from .generator import (
-    Corridor,
-    Dungeon,
-    DungeonGenerator,
-    EncounterResult,
-    EncounterTable,
-    LootDefinition,
-    MonsterDefinition,
-    Room,
-    RoomTemplate,
-    Theme,
-    ThemeRegistry,
-    TrapDefinition,
-)
+from dnd.content import EncounterTable, Item, Monster, RoomTemplate, Theme, ThemeRegistry, Trap
+
+from .generator import Corridor, Dungeon, DungeonGenerator, EncounterResult, Room
+
+LootDefinition = Item
+MonsterDefinition = Monster
+TrapDefinition = Trap
 
 __all__ = [
     "Corridor",
@@ -21,11 +14,14 @@ __all__ = [
     "DungeonGenerator",
     "EncounterResult",
     "EncounterTable",
+    "Item",
     "LootDefinition",
+    "Monster",
     "MonsterDefinition",
     "Room",
     "RoomTemplate",
     "Theme",
     "ThemeRegistry",
+    "Trap",
     "TrapDefinition",
 ]
