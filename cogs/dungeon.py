@@ -82,6 +82,17 @@ def _format_difficulty_label(value: str) -> str:
     return " ".join(part.capitalize() for part in value.split("_"))
 
 
+MAX_TRAP_DETECTION_ATTEMPTS = 2
+ABILITY_NAME_OVERRIDES = {
+    "STR": "Strength",
+    "DEX": "Dexterity",
+    "CON": "Constitution",
+    "INT": "Intelligence",
+    "WIS": "Wisdom",
+    "CHA": "Charisma",
+}
+
+
 DIFFICULTY_CHOICES = [
     app_commands.Choice(name=_format_difficulty_label(key), value=key)
     for key in DIFFICULTY_PROFILES.keys()
@@ -227,6 +238,7 @@ class DungeonSession:
     stealthed: bool = False
     trap_states: Dict[int, Dict[str, TrapStatus]] = field(default_factory=dict)
     trap_catalog: Dict[int, Dict[str, Trap]] = field(default_factory=dict)
+    trap_detection_attempts: Dict[int, Dict[int, int]] = field(default_factory=dict)
 
     @property
     def room(self) -> Room:
@@ -332,8 +344,19 @@ class DungeonNavigationView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self._session = session
+        self.cog._ensure_room_trap_state(session, session.room)
         self._add_status_indicator(session)
         self._add_exit_controls(session)
+        trap_label = (
+            "Disarm Trap"
+            if self.cog._room_has_discovered_traps(session, session.room)
+            else "Survey for Traps"
+        )
+        trap_style = (
+            discord.ButtonStyle.danger
+            if trap_label == "Disarm Trap"
+            else discord.ButtonStyle.secondary
+        )
         self._add_action_button(
             label="Search",
             style=discord.ButtonStyle.secondary,
@@ -342,8 +365,8 @@ class DungeonNavigationView(discord.ui.View):
             handler=self._handle_search,
         )
         self._add_action_button(
-            label="Disarm Trap",
-            style=discord.ButtonStyle.danger,
+            label=trap_label,
+            style=trap_style,
             custom_id="dungeon:disarm",
             disabled=disable_disarm,
             handler=self._handle_disarm,
@@ -1219,6 +1242,7 @@ class DungeonCog(commands.Cog):
     def _ensure_room_trap_state(self, session: DungeonSession, room: Room) -> None:
         catalog = session.trap_catalog.setdefault(room.id, {})
         states = session.trap_states.setdefault(room.id, {})
+        session.trap_detection_attempts.setdefault(room.id, {})
         for trap in room.encounter.traps:
             if trap.key not in catalog:
                 catalog[trap.key] = trap
@@ -1235,7 +1259,7 @@ class DungeonCog(commands.Cog):
         states = session.trap_states.setdefault(room_id, {})
         states[trap_key] = status
 
-    def _room_has_active_traps(
+    def _room_has_discovered_traps(
         self, session: DungeonSession, room: Optional[Room] = None
     ) -> bool:
         target = room or session.room
@@ -1243,20 +1267,9 @@ class DungeonCog(commands.Cog):
         states = session.trap_states.get(target.id, {})
         for trap in target.encounter.traps:
             status = states.get(trap.key, "hidden")
-            if status not in ("disarmed", "sprung"):
+            if status == "discovered":
                 return True
         return False
-
-    def _first_active_trap(
-        self, session: DungeonSession, room: Room
-    ) -> Optional[Trap]:
-        self._ensure_room_trap_state(session, room)
-        states = session.trap_states.get(room.id, {})
-        for trap in room.encounter.traps:
-            status = states.get(trap.key, "hidden")
-            if status not in ("disarmed", "sprung"):
-                return trap
-        return None
 
     def _parse_trap_damage(self, trap: Trap) -> tuple[str, Optional[str]]:
         damage = trap.damage
@@ -3065,8 +3078,10 @@ class DungeonCog(commands.Cog):
                 actions.append("Search the chamber for hidden exits or wait for rescue.")
             if room.encounter.monsters:
                 actions.append("Engage the monsters in combat.")
-            if self._room_has_active_traps(session, room):
-                actions.append("Attempt to disarm the traps.")
+            if self._room_has_discovered_traps(session, room):
+                actions.append("Attempt to disarm the exposed traps.")
+            else:
+                actions.append("Survey the chamber for hidden dangers.")
             if room.encounter.loot:
                 actions.append("Search the chamber for hidden loot.")
             if not actions:
@@ -3160,7 +3175,7 @@ class DungeonCog(commands.Cog):
             self,
             session,
             disable_search=not bool(room.encounter.loot),
-            disable_disarm=not self._room_has_active_traps(session, room),
+            disable_disarm=False,
             disable_engage=not bool(room.encounter.monsters),
         )
 
@@ -3691,30 +3706,59 @@ class DungeonCog(commands.Cog):
         destination_room: Optional[Room] = None
         party_snapshot: tuple[int, ...] = ()
         triggered_events: list[tuple[int, Trap, str]] = []
+        avoidance_messages: list[str] = []
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal moved, backtracked, added_member, exit_label, destination_room, party_snapshot, triggered_events
+            nonlocal moved, backtracked, added_member, exit_label, destination_room, party_snapshot, triggered_events, avoidance_messages
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
 
             current_room = run.room
             self._ensure_room_trap_state(run, current_room)
-            active_trap = self._first_active_trap(run, current_room)
-            if active_trap is not None:
-                triggered_events.append((current_room.id, active_trap, "ignored"))
-                self._set_trap_status(run, current_room.id, active_trap.key, "sprung")
-                catalog = run.trap_catalog.setdefault(current_room.id, {})
-                catalog.setdefault(active_trap.key, active_trap)
-                remaining = [
-                    trap
-                    for trap in current_room.encounter.traps
-                    if trap.key != active_trap.key
-                ]
-                if len(remaining) != len(current_room.encounter.traps):
-                    run.room.encounter = replace(
-                        current_room.encounter, traps=tuple(remaining)
-                    )
+            catalog = run.trap_catalog.setdefault(current_room.id, {})
+            states = run.trap_states.setdefault(current_room.id, {})
+            traps = list(current_room.encounter.traps)
+            traps_changed = False
+            for trap in list(traps):
+                status = states.get(trap.key, "hidden")
+                if status in ("disarmed", "sprung"):
+                    continue
+                saving_throw_data = trap.saving_throw or {}
+                ability_value = saving_throw_data.get("ability", "DEX")
+                ability = str(ability_value).upper()
+                dc_raw = saving_throw_data.get("dc", 15)
+                try:
+                    dc_value = int(dc_raw)
+                except (TypeError, ValueError):
+                    dc_value = 15
+                result = saving_throw(save_bonus=5, dc=dc_value)
+                catalog.setdefault(trap.key, trap)
+                if result.success:
+                    ability_name = ABILITY_NAME_OVERRIDES.get(ability, ability.title())
+                    if status == "hidden":
+                        avoidance_messages.append(
+                            (
+                                "A hidden hazard nearly springs, but the party slips past it "
+                                f"({ability_name} save {result.total} vs DC {dc_value})."
+                            )
+                        )
+                    else:
+                        avoidance_messages.append(
+                            (
+                                f"The party skirts the {trap.name} safely "
+                                f"({ability_name} save {result.total} vs DC {dc_value})."
+                            )
+                        )
+                    continue
+                triggered_events.append((current_room.id, trap, "ignored"))
+                self._set_trap_status(run, current_room.id, trap.key, "sprung")
+                traps.remove(trap)
+                traps_changed = True
+            if traps_changed:
+                run.room.encounter = replace(
+                    current_room.encounter, traps=tuple(traps)
+                )
             selected_exit = next((option for option in current_room.exits if option.key == exit_key), None)
             if selected_exit is None:
                 return
@@ -3844,6 +3888,8 @@ class DungeonCog(commands.Cog):
                 if reason == "ignored":
                     trap_lines = ["Ignoring the hazard proves costly!"] + trap_lines
                 triggered_messages.append("\n".join(trap_lines))
+        if avoidance_messages:
+            triggered_messages.extend(avoidance_messages)
 
         if destination_room is not None and exit_label is not None:
             target_text = f"Room {destination_room.id + 1}: {destination_room.name}"
@@ -3986,13 +4032,15 @@ class DungeonCog(commands.Cog):
         disarm_result: Optional[SavingThrowResult] = None
         dc = 15
         ability = "DEX"
+        room_id: Optional[int] = None
+        detection_limit_reached = False
         loot_cursor = 0
         trap_trigger: Optional[Trap] = None
         trigger_reason: Optional[str] = None
         phase: Optional[str] = None
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal added_member, party_snapshot, attempted_trap, detection_result, disarm_result, dc, ability, loot_cursor, trap_trigger, trigger_reason, phase
+            nonlocal added_member, party_snapshot, attempted_trap, detection_result, disarm_result, dc, ability, room_id, detection_limit_reached, loot_cursor, trap_trigger, trigger_reason, phase
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
@@ -4003,6 +4051,7 @@ class DungeonCog(commands.Cog):
                 return
             room_id = run.current_room
             states = run.trap_states.setdefault(room_id, {})
+            attempts_map = run.trap_detection_attempts.setdefault(room_id, {})
             trap_local: Optional[Trap] = None
             for trap in traps:
                 status = states.get(trap.key, "hidden")
@@ -4027,16 +4076,15 @@ class DungeonCog(commands.Cog):
             status = states.get(trap_local.key, "hidden")
             if status == "hidden":
                 phase = "detect"
+                attempts_used = attempts_map.get(interaction.user.id, 0)
+                if attempts_used >= MAX_TRAP_DETECTION_ATTEMPTS:
+                    detection_limit_reached = True
+                    return
+                attempts_map[interaction.user.id] = attempts_used + 1
                 detection_result = saving_throw(save_bonus=5, dc=dc_value)
                 if detection_result.success:
                     self._set_trap_status(run, room_id, trap_local.key, "discovered")
-                else:
-                    self._set_trap_status(run, room_id, trap_local.key, "sprung")
-                    trap_trigger = trap_local
-                    trigger_reason = "detection"
-                    remaining = [trap for trap in traps if trap.key != trap_local.key]
-                    if len(remaining) != len(traps):
-                        run.room.encounter = replace(run.room.encounter, traps=tuple(remaining))
+                return
             elif status == "discovered":
                 phase = "disarm"
                 disarm_result = saving_throw(save_bonus=5, dc=dc_value)
@@ -4082,21 +4130,47 @@ class DungeonCog(commands.Cog):
             elif trigger_reason == "disarm":
                 triggered_lines = ["Your attempt destabilises the mechanism!", *triggered_lines]
 
-        if phase == "detect" and detection_result is not None:
+        attempts_remaining = MAX_TRAP_DETECTION_ATTEMPTS
+        if room_id is not None:
+            attempts_remaining = max(
+                0,
+                MAX_TRAP_DETECTION_ATTEMPTS
+                - session.trap_detection_attempts.get(room_id, {}).get(
+                    interaction.user.id, 0
+                ),
+            )
+
+        if phase == "detect":
+            await self._refresh_session_message(interaction, session)
+            if detection_limit_reached:
+                await interaction.followup.send(
+                    "You've already scoured the chamber thoroughly—further searching turns up nothing new.",
+                    ephemeral=True,
+                )
+                return
+            if detection_result is None:
+                await interaction.followup.send(
+                    "You find no clues to any hidden dangers.", ephemeral=True
+                )
+                return
             check_summary = f"(Perception roll {detection_result.total} vs DC {dc})"
             if detection_result.success:
-                await self._refresh_session_message(interaction, session)
                 message = (
                     f"You carefully search the chamber and uncover the {attempted_trap.name}! "
                     f"{check_summary}"
                 )
                 await interaction.followup.send(message, ephemeral=True)
                 return
-            await self._refresh_session_message(interaction, session)
-            message_lines = [f"You fail to spot the hidden danger {check_summary}."]
-            if triggered_lines:
-                message_lines.append("")
-                message_lines.extend(triggered_lines)
+            message_lines = [
+                f"You fail to spot any hidden dangers {check_summary}."
+            ]
+            if attempts_remaining:
+                attempt_word = "attempts" if attempts_remaining > 1 else "attempt"
+                message_lines.append(
+                    f"You can try once more ({attempts_remaining} {attempt_word} remaining)."
+                )
+            else:
+                message_lines.append("Further searching seems futile.")
             await interaction.followup.send("\n".join(message_lines), ephemeral=True)
             return
 
