@@ -102,6 +102,17 @@ class DifficultyProfile:
 
 
 DIFFICULTY_PROFILES: Dict[str, DifficultyProfile] = {
+    "story": DifficultyProfile(
+        monster_count=(0, 0),
+        challenge_bias=0.2,
+        trap_count=(1, 1),
+        trap_danger_bias=0.3,
+        trap_min_dc=None,
+        trap_max_dc=11,
+        loot_combat=(0, 1),
+        loot_treasure=(0, 1),
+        loot_rarity_bias=0.2,
+    ),
     "easy": DifficultyProfile(
         monster_count=(1, 2),
         challenge_bias=0.6,
@@ -124,27 +135,38 @@ DIFFICULTY_PROFILES: Dict[str, DifficultyProfile] = {
         loot_treasure=(1, 3),
         loot_rarity_bias=1.0,
     ),
-    "hard": DifficultyProfile(
+    "challenging": DifficultyProfile(
         monster_count=(2, 4),
-        challenge_bias=1.4,
+        challenge_bias=1.3,
         trap_count=(1, 2),
-        trap_danger_bias=1.5,
-        trap_min_dc=14,
+        trap_danger_bias=1.3,
+        trap_min_dc=13,
         trap_max_dc=None,
         loot_combat=(1, 2),
         loot_treasure=(2, 4),
-        loot_rarity_bias=1.9,
+        loot_rarity_bias=1.5,
     ),
-    "deadly": DifficultyProfile(
+    "hard": DifficultyProfile(
         monster_count=(3, 5),
-        challenge_bias=1.9,
+        challenge_bias=1.7,
         trap_count=(2, 3),
-        trap_danger_bias=2.0,
+        trap_danger_bias=1.8,
         trap_min_dc=15,
         trap_max_dc=None,
         loot_combat=(1, 3),
         loot_treasure=(3, 5),
-        loot_rarity_bias=3.2,
+        loot_rarity_bias=2.4,
+    ),
+    "deadly": DifficultyProfile(
+        monster_count=(5, 7),
+        challenge_bias=2.6,
+        trap_count=(3, 4),
+        trap_danger_bias=2.6,
+        trap_min_dc=17,
+        trap_max_dc=None,
+        loot_combat=(2, 4),
+        loot_treasure=(4, 6),
+        loot_rarity_bias=3.4,
     ),
 }
 

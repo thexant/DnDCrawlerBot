@@ -43,7 +43,14 @@ from dnd.combat import (
 from dnd.characters import EQUIPMENT, Character
 from dnd.repository import CharacterRepository
 from dnd.content import ContentLibrary, ContentLoadError, Item, Trap
-from dnd.dungeon import Dungeon, DungeonGenerator, Room, Theme, ThemeRegistry
+from dnd.dungeon import (
+    DIFFICULTY_PROFILES,
+    Dungeon,
+    DungeonGenerator,
+    Room,
+    Theme,
+    ThemeRegistry,
+)
 from dnd.dungeon.state import DungeonMetadataStore, StoredDungeon
 from dnd.dungeon.rewards import (
     RewardShare,
@@ -67,6 +74,17 @@ PROFICIENCY_BONUS = 2
 SPELLCASTING_ABILITIES: Dict[str, str] = {
     "wizard": "INT",
 }
+
+
+def _format_difficulty_label(value: str) -> str:
+    return " ".join(part.capitalize() for part in value.split("_"))
+
+
+DIFFICULTY_CHOICES = [
+    app_commands.Choice(name=_format_difficulty_label(key), value=key)
+    for key in DIFFICULTY_PROFILES.keys()
+][:25]
+DEFAULT_DIFFICULTY = "standard"
 
 
 @dataclass(frozen=True)
@@ -3182,12 +3200,13 @@ class DungeonCog(commands.Cog):
         name="Custom name for the dungeon",
         seed="Optional RNG seed",
     )
+    @app_commands.choices(difficulty=DIFFICULTY_CHOICES)
     async def prepare(
         self,
         interaction: discord.Interaction,
         theme: Optional[str] = None,
         size: app_commands.Range[int, 1, 20] = 5,
-        difficulty: Literal["easy", "standard", "hard"] = "standard",
+        difficulty: str = DEFAULT_DIFFICULTY,
         name: Optional[str] = None,
         seed: Optional[int] = None,
     ) -> None:
@@ -3220,23 +3239,29 @@ class DungeonCog(commands.Cog):
 
         if seed is None:
             seed = random.randint(0, 999999)
-        generator = DungeonGenerator(theme_obj, seed=seed, difficulty=difficulty)
+        difficulty_key = (difficulty or DEFAULT_DIFFICULTY).lower()
+        if difficulty_key not in DIFFICULTY_PROFILES:
+            difficulty_key = DEFAULT_DIFFICULTY
+
+        generator = DungeonGenerator(theme_obj, seed=seed, difficulty=difficulty_key)
         dungeon = generator.generate(
-            room_count=int(size), name=name, difficulty=difficulty
+            room_count=int(size), name=name, difficulty=difficulty_key
         )
         await self.metadata_store.record_session(
             interaction.guild_id,
             theme=theme_obj.key,
             seed=seed,
-            difficulty=difficulty,
+            difficulty=difficulty_key,
             name=dungeon.name,
             room_count=int(size),
         )
 
         details = [f"Theme: {theme_obj.name}"]
         details.append(f"Rooms: {int(size)}")
-        if difficulty:
-            details.append(f"Difficulty: {difficulty.title()}")
+        if difficulty_key:
+            details.append(
+                f"Difficulty: {_format_difficulty_label(difficulty_key)}"
+            )
         details.append(f"Seed: {seed}")
         await interaction.response.send_message(
             (
