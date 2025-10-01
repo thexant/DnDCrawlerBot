@@ -203,6 +203,7 @@ class DungeonSession:
     last_travel_description: Optional[str] = None
     last_travel_note: Optional[str] = None
     loot_cursor: int = 0
+    stealthed: bool = False
 
     @property
     def room(self) -> Room:
@@ -308,6 +309,7 @@ class DungeonNavigationView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self._session = session
+        self._add_status_indicator(session)
         self._add_exit_controls(session)
         self._add_action_button(
             label="Search",
@@ -324,12 +326,22 @@ class DungeonNavigationView(discord.ui.View):
             handler=self._handle_disarm,
         )
         self._add_action_button(
-            label="Engage",
+            label="Ambush" if session.stealthed else "Engage",
             style=discord.ButtonStyle.success,
             custom_id="dungeon:engage",
             disabled=disable_engage,
             handler=self._handle_engage,
         )
+
+    def _add_status_indicator(self, session: DungeonSession) -> None:
+        status_label = "Hidden" if session.stealthed else "Spotted"
+        style = discord.ButtonStyle.success if session.stealthed else discord.ButtonStyle.secondary
+        button = discord.ui.Button(
+            label=f"Status: {status_label}",
+            style=style,
+            disabled=True,
+        )
+        self.add_item(button)
 
     def _add_exit_controls(self, session: DungeonSession) -> None:
         for exit_option in session.room.exits:
@@ -387,6 +399,7 @@ class CombatActionView(discord.ui.View):
         combat = session.combat_state
         current = combat.current_combatant() if combat else None
         self._combat_active = bool(combat and combat.active)
+        self._add_status_indicator(session)
         self._configure_controls(combat, current)
         if not self._combat_active:
             self._disable_children()
@@ -412,6 +425,16 @@ class CombatActionView(discord.ui.View):
             await interaction.response.send_message("It isn't your turn yet!", ephemeral=True)
             return False
         return True
+
+    def _add_status_indicator(self, session: DungeonSession) -> None:
+        status_label = "Hidden" if session.stealthed else "Spotted"
+        style = discord.ButtonStyle.success if session.stealthed else discord.ButtonStyle.secondary
+        button = discord.ui.Button(
+            label=f"Status: {status_label}",
+            style=style,
+            disabled=True,
+        )
+        self.add_item(button)
 
     def _configure_controls(
         self, combat: Optional[CombatState], current: Optional[CombatantState]
@@ -1050,6 +1073,79 @@ class DungeonCog(commands.Cog):
             raise RuntimeError("No dungeon themes are available")
         return theme
 
+    async def _attempt_room_stealth(
+        self,
+        interaction: discord.Interaction,
+        session: DungeonSession,
+        party_snapshot: Sequence[int],
+    ) -> tuple[bool, str]:
+        if not party_snapshot:
+            return False, "No adventurers are present to attempt a stealth approach."
+
+        characters: Dict[int, Character] = {}
+        if session.guild_id is not None:
+            characters = await self._load_party_characters(session.guild_id, party_snapshot)
+
+        rolls: list[tuple[int, int, int, int]] = []
+        for user_id in party_snapshot:
+            dex_mod = 0
+            character = characters.get(user_id)
+            if character is not None:
+                ability_scores = getattr(character, "ability_scores", None)
+                values = getattr(ability_scores, "values", None)
+                if isinstance(values, Mapping):
+                    dex_value = None
+                    for ability_key, score in values.items():
+                        key_upper = str(ability_key).upper()
+                        if key_upper in {"DEX", "DEXTERITY"}:
+                            dex_value = score
+                            break
+                    if dex_value is not None:
+                        try:
+                            dex_mod = ability_modifier(int(dex_value))
+                        except (TypeError, ValueError):
+                            dex_mod = 0
+            roll = random.randint(1, 20)
+            total = roll + dex_mod
+            rolls.append((user_id, roll, dex_mod, total))
+
+        if not rolls:
+            return False, "No adventurers are present to attempt a stealth approach."
+
+        _, best_roll, best_mod, best_total = max(rolls, key=lambda entry: entry[3])
+
+        passive_entries: list[tuple[str, int]] = []
+        for monster in session.room.encounter.monsters:
+            ability_scores = monster.ability_scores or {}
+            wisdom_value: Optional[int] = None
+            for ability_key, score in ability_scores.items():
+                key_upper = str(ability_key).upper()
+                if key_upper in {"WIS", "WISDOM"}:
+                    wisdom_value = int(score)
+                    break
+            if wisdom_value is None:
+                wisdom_value = 10
+            passive = 10 + ability_modifier(wisdom_value)
+            passive_entries.append((monster.name, passive))
+
+        if not passive_entries:
+            return True, "No creatures are present to oppose the party's approach."
+
+        success = all(best_total >= passive for _, passive in passive_entries)
+        roll_text = f"{best_roll}{best_mod:+d}" if best_mod else str(best_roll)
+        passive_text = ", ".join(f"{name} {value}" for name, value in passive_entries)
+        if success:
+            summary = (
+                f"The party remains hidden (Stealth {best_total} "
+                f"— roll {roll_text} vs passive {passive_text})."
+            )
+        else:
+            summary = (
+                f"The monsters spot the party (Stealth {best_total} "
+                f"— roll {roll_text} vs passive {passive_text})."
+            )
+        return success, summary
+
     def _party_display(self, interaction: discord.Interaction, session: DungeonSession) -> str:
         if not session.party_ids:
             return "No adventurers yet."
@@ -1369,6 +1465,7 @@ class DungeonCog(commands.Cog):
     def _finish_combat(self, session: DungeonSession, state: CombatState, *, victory: bool) -> None:
         state.active = False
         state.waiting_for = None
+        session.stealthed = False
         if victory:
             state.log.append("The party is victorious!")
             encounter = session.room.encounter
@@ -2676,6 +2773,15 @@ class DungeonCog(commands.Cog):
         embed.add_field(name="Party", value=self._party_display(interaction, session), inline=False)
 
         combat = session.combat_state
+        if room.encounter.monsters or session.stealthed:
+            if combat and combat.active:
+                status_text = "Spotted — combat is underway."
+            elif session.stealthed:
+                status_text = "Hidden — the party has not been noticed."
+            else:
+                status_text = "Spotted — nearby creatures are aware of the party."
+            embed.add_field(name="Stealth Status", value=status_text, inline=False)
+
         if combat is not None:
             initiative_lines: list[str] = []
             for index, combatant in enumerate(combat.order):
@@ -3286,9 +3392,10 @@ class DungeonCog(commands.Cog):
         added_member = False
         exit_label: Optional[str] = None
         destination_room: Optional[Room] = None
+        party_snapshot: tuple[int, ...] = ()
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal moved, backtracked, added_member, exit_label, destination_room
+            nonlocal moved, backtracked, added_member, exit_label, destination_room, party_snapshot
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
@@ -3338,6 +3445,8 @@ class DungeonCog(commands.Cog):
                 run.last_travel_note = f"The party backtracks through the {lower_label}."
             else:
                 run.last_travel_note = f"The party takes the {lower_label}."
+            run.stealthed = False
+            party_snapshot = tuple(sorted(run.party_ids))
             destination_room = destination_room_local
             moved = True
 
@@ -3356,6 +3465,50 @@ class DungeonCog(commands.Cog):
             )
             return
 
+        stealth_summary: Optional[str] = None
+        started_combat = False
+        monsters_present = bool(destination_room and destination_room.encounter.monsters)
+        combat_active = bool(session.combat_state and session.combat_state.active)
+        if (
+            monsters_present
+            and not combat_active
+            and party_snapshot
+        ):
+            success, summary = await self._attempt_room_stealth(
+                interaction, session, party_snapshot
+            )
+            stealth_summary = summary
+            if success:
+
+                def apply_stealth(run: DungeonSession) -> None:
+                    if run.current_room == session.current_room:
+                        run.stealthed = True
+
+                session = await self.sessions.update(key, apply_stealth)
+                if session is None:
+                    await interaction.followup.send(
+                        "No active dungeon for this party.", ephemeral=True
+                    )
+                    return
+            else:
+                combat = await self._build_combat_state(interaction, session, party_snapshot)
+
+                def engage_combat(run: DungeonSession) -> None:
+                    if run.current_room != session.current_room:
+                        return
+                    run.stealthed = False
+                    run.combat_state = combat
+                    if combat is not None:
+                        self._run_automatic_turns(run, combat)
+
+                session = await self.sessions.update(key, engage_combat)
+                if session is None:
+                    await interaction.followup.send(
+                        "No active dungeon for this party.", ephemeral=True
+                    )
+                    return
+                started_combat = combat is not None
+
         await self._refresh_session_message(interaction, session)
 
         if destination_room is not None and exit_label is not None:
@@ -3367,6 +3520,11 @@ class DungeonCog(commands.Cog):
                 message = f"You take the {lower_label} toward {target_text}."
         else:
             message = "You make your way through the chosen passage."
+
+        if stealth_summary:
+            message = f"{message}\n\n{stealth_summary}"
+            if started_combat:
+                message = f"{message} Initiative is rolled as combat erupts!"
 
         await interaction.followup.send(message, ephemeral=True)
 
@@ -3604,6 +3762,7 @@ class DungeonCog(commands.Cog):
                 no_targets = True
                 return
             party_snapshot = tuple(sorted(run.party_ids))
+            run.stealthed = False
             should_start_combat = True
 
         session = await self.sessions.update(key, mutate)
