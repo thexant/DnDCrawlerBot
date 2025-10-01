@@ -77,3 +77,21 @@ class CharacterRepository:
                 if not guild_bucket:
                     del self._cache[str(guild_id)]
                 await self._persist()
+
+    async def list_guild_characters(self, guild_id: int) -> Dict[int, Character]:
+        """Return all characters stored for ``guild_id`` keyed by user id."""
+
+        async with self._lock:
+            await self._ensure_loaded()
+            guild_bucket = self._cache.get(str(guild_id), {})
+            characters: Dict[int, Character] = {}
+            for user_id, payload in guild_bucket.items():
+                try:
+                    numeric_id = int(user_id)
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    characters[numeric_id] = Character.from_dict(payload)
+                except (KeyError, ValueError):
+                    continue
+            return characters

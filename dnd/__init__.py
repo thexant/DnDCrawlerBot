@@ -38,6 +38,7 @@ from .dungeon import (
     TrapDefinition,
 )
 from .repository import CharacterRepository
+from .tavern import TavernConfig, TavernConfigStore
 
 __all__ = [
     "ABILITY_NAMES",
@@ -72,4 +73,6 @@ __all__ = [
     "roll_initiative",
     "saving_throw",
     "TrapDefinition",
+    "TavernConfig",
+    "TavernConfigStore",
 ]

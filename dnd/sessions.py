@@ -84,6 +84,12 @@ class SessionManager(Generic[T]):
         async with self._lock:
             return tuple(self._sessions.keys())
 
+    async def values(self) -> Tuple[T, ...]:
+        """Return a snapshot of the active session objects."""
+
+        async with self._lock:
+            return tuple(self._sessions.values())
+
     @property
     def lock(self) -> asyncio.Lock:
         """Expose the internal lock for complex compound operations."""
