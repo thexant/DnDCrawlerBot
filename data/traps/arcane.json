@@ -1,0 +1,25 @@
+[
+  {
+    "key": "glyph_of_detonation",
+    "name": "Glyph of Detonation",
+    "description": "A hidden rune unleashes a burst of force when stepped upon.",
+    "saving_throw": {"ability": "DEX", "dc": 15},
+    "damage": "4d6 force",
+    "tags": ["arcane", "explosive"]
+  },
+  {
+    "key": "necrotic_miasma",
+    "name": "Necrotic Miasma",
+    "description": "A swirling cloud of necrotic energy drains warmth and hope.",
+    "saving_throw": {"ability": "CON", "dc": 14},
+    "damage": "3d6 necrotic",
+    "tags": ["necrotic", "hazard"]
+  },
+  {
+    "key": "temporal_snare",
+    "name": "Temporal Snare",
+    "description": "An amber field freezes victims in a loop of slow time.",
+    "saving_throw": {"ability": "WIS", "dc": 14},
+    "tags": ["arcane", "control"]
+  }
+]

@@ -1,0 +1,24 @@
+[
+  {
+    "key": "animated_armor",
+    "name": "Animated Armor",
+    "challenge": 3,
+    "armor_class": 18,
+    "hit_points": 33,
+    "attack_bonus": 5,
+    "damage": "1d8+3",
+    "ability_scores": {"STR": 14, "DEX": 11, "CON": 13},
+    "tags": ["construct", "arcane"]
+  },
+  {
+    "key": "helmed_horror",
+    "name": "Helmed Horror",
+    "challenge": 4,
+    "armor_class": 20,
+    "hit_points": 60,
+    "attack_bonus": 6,
+    "damage": "1d8+4",
+    "ability_scores": {"STR": 18, "DEX": 13, "CON": 16},
+    "tags": ["construct", "arcane"]
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {
+    "key": "falling_sarcophagus_lid",
+    "name": "Falling Sarcophagus Lid",
+    "description": "A hidden trigger drops a heavy stone lid from the ceiling.",
+    "saving_throw": {"ability": "DEX", "dc": 13},
+    "damage": "3d10 bludgeoning",
+    "tags": ["mechanical", "burial"]
+  }
+]
