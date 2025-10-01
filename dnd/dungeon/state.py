@@ -19,6 +19,8 @@ class GuildSessionMetadata:
     default_theme: str | None = None
     last_theme: str | None = None
     last_seed: int | None = None
+    last_difficulty: str | None = None
+    last_name: str | None = None
 
     def to_dict(self) -> Dict[str, object]:
         data: Dict[str, object] = {}
@@ -28,6 +30,10 @@ class GuildSessionMetadata:
             data["last_theme"] = self.last_theme
         if self.last_seed is not None:
             data["last_seed"] = self.last_seed
+        if self.last_difficulty is not None:
+            data["last_difficulty"] = self.last_difficulty
+        if self.last_name is not None:
+            data["last_name"] = self.last_name
         return data
 
     @classmethod
@@ -35,11 +41,15 @@ class GuildSessionMetadata:
         default_theme = raw.get("default_theme")
         last_theme = raw.get("last_theme")
         last_seed = raw.get("last_seed")
+        last_difficulty = raw.get("last_difficulty")
+        last_name = raw.get("last_name")
         return cls(
             guild_id=guild_id,
             default_theme=str(default_theme) if isinstance(default_theme, str) else None,
             last_theme=str(last_theme) if isinstance(last_theme, str) else None,
             last_seed=int(last_seed) if isinstance(last_seed, int) else None,
+            last_difficulty=str(last_difficulty) if isinstance(last_difficulty, str) else None,
+            last_name=str(last_name) if isinstance(last_name, str) else None,
         )
 
 
@@ -103,12 +113,26 @@ class DungeonMetadataStore:
                 metadata = GuildSessionMetadata(guild_id=guild_id)
                 self._cache[key] = metadata
             metadata.default_theme = theme
-            if metadata.default_theme is None and metadata.last_theme is None and metadata.last_seed is None:
+            if (
+                metadata.default_theme is None
+                and metadata.last_theme is None
+                and metadata.last_seed is None
+                and metadata.last_difficulty is None
+                and metadata.last_name is None
+            ):
                 del self._cache[key]
             await self._persist()
             return metadata
 
-    async def record_session(self, guild_id: int, *, theme: str, seed: Optional[int]) -> GuildSessionMetadata:
+    async def record_session(
+        self,
+        guild_id: int,
+        *,
+        theme: str,
+        seed: Optional[int],
+        difficulty: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> GuildSessionMetadata:
         async with self._lock:
             await self._ensure_loaded()
             key = str(guild_id)
@@ -118,6 +142,8 @@ class DungeonMetadataStore:
                 self._cache[key] = metadata
             metadata.last_theme = theme
             metadata.last_seed = seed if seed is None else int(seed)
+            metadata.last_difficulty = difficulty
+            metadata.last_name = name
             await self._persist()
             return metadata
 
@@ -131,5 +157,7 @@ class DungeonMetadataStore:
             metadata.default_theme = None
             metadata.last_theme = None
             metadata.last_seed = None
+            metadata.last_difficulty = None
+            metadata.last_name = None
             del self._cache[key]
             await self._persist()
