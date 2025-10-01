@@ -1,0 +1,16 @@
+How this should work is that players within a Discord guild should first create a character; it should use a simple form of D&D rules to create characters such as choosing their race, class, and stats. There would be a "Tavern" channel, where players can interact with eachother as their characters.
+
+It should generate a dungeon consisting of various "rooms" and "corridors" in a traditional Multi-User-Dungeon format with randomly spawning enemies, traps and such based also on D&D rules.
+
+Players can then choose to form parties of up to four or continue solo and "enter the dungeon". The dungeon generated should be random but consistent within the guild (so players can meet eachother in the dungeon even if they enter seperately).
+
+Players would progress through the dungeon, slaying monsters, disarming traps, finding items and more, eventually making their way to a sort of "boss" and then leaving the dungeon back to the tavern if successful.
+
+The items, gold and such players find in the Dungeon could then be used for future dungeon runs, sold to a "trader" npc at the tavern (market) for gold (which can be used to buy things) or traded with / gifted to other players.
+
+Essentialy; it works as a sort of "extraction shooter" but using D&D rules (or at least, a basic D20 fantasy roleplaying setting) in a text based MUD format over Discord.
+
+The Discord bot would work primarily through embeds, buttons and dropdowns wherever possible besides commands for admin configuration.
+
+It should be "expandable" too, so while it only starts with one dungeon "theme" (descriptions of rooms, monster types, etc) it can be added to with new themes, as well as having new items/monsters/etc added to easily in the future.
+
