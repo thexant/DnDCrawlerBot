@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import random
 import re
 import secrets
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Sequence
+from typing import (
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import discord
 from discord import app_commands
@@ -119,6 +133,35 @@ WEAPON_DEFINITIONS: Dict[str, WeaponDefinition] = {
 MAX_COMBAT_LOG_ENTRIES = 12
 _DAMAGE_ROLL_PATTERN = re.compile(r"(?i)(?P<count>\d+)d(?P<sides>\d+)(?P<modifier>[+-]\d+)?")
 
+# Basic spell data used when character sheets do not provide richer metadata.
+DEFAULT_SPELL_OPTIONS: Dict[str, List[Dict[str, object]]] = {
+    "wizard": [
+        {
+            "name": "Fire Bolt",
+            "level": 0,
+            "type": "attack",
+            "damage": "1d10",
+            "damage_type": "fire",
+            "critical_extra_dice": [],
+            "description": "A mote of flame streaks toward a creature you can see within range.",
+        },
+        {
+            "name": "Magic Missile",
+            "level": 1,
+            "type": "auto",
+            "damage": "3d4+3",
+            "damage_type": "force",
+            "consumes": {"type": "spell_slot", "level": 1, "amount": 1},
+            "description": "Three glowing darts strike creatures of your choice that you can see within range.",
+        },
+    ],
+}
+
+DEFAULT_SPELL_SLOTS: Dict[str, Dict[int, int]] = {
+    "wizard": {1: 2},
+}
+
+
 
 def _default_data_path() -> Path:
     return Path(__file__).resolve().parent.parent / "data"
@@ -171,6 +214,11 @@ class CombatantState:
     is_player: bool
     user_id: Optional[int] = None
     metadata: Dict[str, object] = field(default_factory=dict)
+    conditions: Set[str] = field(default_factory=set)
+    concentration: Optional[str] = None
+    death_save_successes: int = 0
+    death_save_failures: int = 0
+    resources: Dict[str, object] = field(default_factory=dict)
 
     @property
     def defeated(self) -> bool:
@@ -306,10 +354,12 @@ class CombatActionView(discord.ui.View):
     def __init__(self, cog: "DungeonCog", session: DungeonSession) -> None:
         super().__init__(timeout=None)
         self.cog = cog
-        self._combat_active = bool(session.combat_state and session.combat_state.active)
-        for child in self.children:
-            if isinstance(child, discord.ui.Button) and not self._combat_active:
-                child.disabled = True
+        combat = session.combat_state
+        current = combat.current_combatant() if combat else None
+        self._combat_active = bool(combat and combat.active)
+        self._configure_controls(combat, current)
+        if not self._combat_active:
+            self._disable_children()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:  # noqa: D401
         key = self.cog._session_key(interaction.guild_id, interaction.channel_id)
@@ -333,17 +383,243 @@ class CombatActionView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Attack", style=discord.ButtonStyle.danger, custom_id="dungeon:combat:attack")
-    async def attack(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
-        await self.cog.handle_combat_action(interaction, "attack")
+    def _configure_controls(
+        self, combat: Optional[CombatState], current: Optional[CombatantState]
+    ) -> None:
+        if not combat or current is None or not current.is_player or current.defeated:
+            self._add_weapon_select(None)
+            self._add_spell_select(None)
+            self._add_feature_select(None)
+            self._add_common_buttons(disabled=not self._combat_active)
+            return
+        self._add_weapon_select(current)
+        self._add_spell_select(current)
+        self._add_feature_select(current)
+        self._add_common_buttons(disabled=not self._combat_active)
 
-    @discord.ui.button(label="Defend", style=discord.ButtonStyle.secondary, custom_id="dungeon:combat:defend")
-    async def defend(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
-        await self.cog.handle_combat_action(interaction, "defend")
+    def _disable_children(self) -> None:
+        for child in self.children:
+            if hasattr(child, "disabled"):
+                child.disabled = True
 
-    @discord.ui.button(label="End Turn", style=discord.ButtonStyle.primary, custom_id="dungeon:combat:end")
-    async def end_turn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
-        await self.cog.handle_combat_action(interaction, "end")
+    class _ActionSelect(discord.ui.Select):
+        def __init__(
+            self,
+            cog: "DungeonCog",
+            *,
+            action: str,
+            placeholder: str,
+            options: List[discord.SelectOption],
+            disabled: bool,
+            custom_id: str,
+        ) -> None:
+            super().__init__(
+                custom_id=custom_id,
+                placeholder=placeholder,
+                min_values=1,
+                max_values=1,
+                options=options,
+                disabled=disabled,
+            )
+            self._cog = cog
+            self._action = action
+
+        async def callback(self, interaction: discord.Interaction) -> None:  # noqa: D401
+            value = self.values[0] if self.values else None
+            await self._cog.handle_combat_action(interaction, self._action, value)
+
+    def _weapon_options(self, combatant: Optional[CombatantState]) -> List[discord.SelectOption]:
+        if combatant is None:
+            return [
+                discord.SelectOption(
+                    label="No weapons available",
+                    value="weapon:0",
+                    description="No weapon attacks are configured.",
+                )
+            ]
+        combat_options = combatant.metadata.get("combat_options", {})
+        weapons = combat_options.get("weapons") if isinstance(combat_options, Mapping) else None
+        if not isinstance(weapons, list) or not weapons:
+            return [
+                discord.SelectOption(
+                    label="No weapons available",
+                    value="weapon:0",
+                    description="No weapon attacks are configured.",
+                )
+            ]
+        options: List[discord.SelectOption] = []
+        for index, weapon in enumerate(weapons):
+            name = str(weapon.get("name", f"Weapon {index + 1}"))
+            attack_bonus = weapon.get("attack_bonus")
+            damage_expr = weapon.get("damage")
+            desc_parts: List[str] = []
+            if attack_bonus is not None:
+                desc_parts.append(f"+{attack_bonus} to hit")
+            if damage_expr:
+                desc_parts.append(str(damage_expr))
+            description = ", ".join(desc_parts)[:100] or "Standard attack option"
+            options.append(
+                discord.SelectOption(
+                    label=name[:100],
+                    value=f"weapon:{index}",
+                    description=description,
+                )
+            )
+        return options
+
+    def _spell_options(
+        self, combatant: Optional[CombatantState]
+    ) -> Tuple[List[discord.SelectOption], bool]:
+        if combatant is None:
+            return ([
+                discord.SelectOption(
+                    label="No spells prepared",
+                    value="spell:0",
+                    description="You have no prepared spells.",
+                )
+            ], True)
+        combat_options = combatant.metadata.get("combat_options", {})
+        spells = combat_options.get("spells") if isinstance(combat_options, Mapping) else None
+        if not isinstance(spells, list) or not spells:
+            return ([
+                discord.SelectOption(
+                    label="No spells prepared",
+                    value="spell:0",
+                    description="You have no prepared spells.",
+                )
+            ], True)
+        options: List[discord.SelectOption] = []
+        for index, spell in enumerate(spells):
+            name = str(spell.get("name", f"Spell {index + 1}"))
+            level = spell.get("level")
+            level_text = f" (Lvl {level})" if level is not None else ""
+            effect_type = str(spell.get("type", "Attack")).title()
+            damage_expr = spell.get("damage")
+            damage_type = spell.get("damage_type")
+            desc_parts: List[str] = [effect_type]
+            if damage_expr:
+                damage_text = str(damage_expr)
+                if damage_type:
+                    damage_text += f" {str(damage_type).title()}"
+                desc_parts.append(damage_text)
+            requirement = spell.get("consumes")
+            if isinstance(requirement, Mapping):
+                requirement_type = str(requirement.get("type", "")).lower()
+                if requirement_type == "spell_slot":
+                    level_value = requirement.get("level", 1)
+                    desc_parts.append(f"Uses slot lvl {level_value}")
+            description = ", ".join(desc_parts)[:100]
+            options.append(
+                discord.SelectOption(
+                    label=f"{name}{level_text}"[:100],
+                    value=f"spell:{index}",
+                    description=description or "Spell action",
+                )
+            )
+        return options, False
+
+    def _feature_options(
+        self, combatant: Optional[CombatantState]
+    ) -> Tuple[List[discord.SelectOption], bool]:
+        if combatant is None:
+            return ([
+                discord.SelectOption(
+                    label="No features available",
+                    value="feature:0",
+                    description="No combat features are ready.",
+                )
+            ], True)
+        combat_options = combatant.metadata.get("combat_options", {})
+        features = combat_options.get("features") if isinstance(combat_options, Mapping) else None
+        if not isinstance(features, list) or not features:
+            return ([
+                discord.SelectOption(
+                    label="No features available",
+                    value="feature:0",
+                    description="No combat features are ready.",
+                )
+            ], True)
+        options: List[discord.SelectOption] = []
+        for index, feature in enumerate(features):
+            name = str(feature.get("name", f"Feature {index + 1}"))
+            effects = feature.get("effects") if isinstance(feature, Mapping) else None
+            effect_desc = "Feature action"
+            if isinstance(effects, Mapping):
+                effect_type = str(effects.get("type", "")).title()
+                detail = effects.get("dice") or effects.get("condition")
+                if detail:
+                    effect_desc = f"{effect_type}: {detail}"
+                else:
+                    effect_desc = effect_type or effect_desc
+            options.append(
+                discord.SelectOption(
+                    label=name[:100],
+                    value=f"feature:{index}",
+                    description=str(effect_desc)[:100],
+                )
+            )
+        return options, False
+
+    def _add_weapon_select(self, combatant: Optional[CombatantState]) -> None:
+        options = self._weapon_options(combatant)
+        disabled = combatant is None or not combatant.metadata.get("combat_options", {}).get("weapons")
+        select = self._ActionSelect(
+            self.cog,
+            action="weapon",
+            placeholder="Choose a weapon attack",
+            options=options,
+            disabled=disabled,
+            custom_id="dungeon:combat:weapon",
+        )
+        self.add_item(select)
+
+    def _add_spell_select(self, combatant: Optional[CombatantState]) -> None:
+        options, disabled = self._spell_options(combatant)
+        select = self._ActionSelect(
+            self.cog,
+            action="spell",
+            placeholder="Cast a spell",
+            options=options,
+            disabled=disabled,
+            custom_id="dungeon:combat:spell",
+        )
+        self.add_item(select)
+
+    def _add_feature_select(self, combatant: Optional[CombatantState]) -> None:
+        options, disabled = self._feature_options(combatant)
+        select = self._ActionSelect(
+            self.cog,
+            action="feature",
+            placeholder="Use a feature",
+            options=options,
+            disabled=disabled,
+            custom_id="dungeon:combat:feature",
+        )
+        self.add_item(select)
+
+    def _add_common_buttons(self, *, disabled: bool) -> None:
+        defend_button = discord.ui.Button(
+            label="Defend",
+            style=discord.ButtonStyle.secondary,
+            custom_id="dungeon:combat:defend",
+            disabled=disabled,
+        )
+        defend_button.callback = self._make_action_callback("defend")
+        end_button = discord.ui.Button(
+            label="End Turn",
+            style=discord.ButtonStyle.primary,
+            custom_id="dungeon:combat:end",
+            disabled=disabled,
+        )
+        end_button.callback = self._make_action_callback("end")
+        self.add_item(defend_button)
+        self.add_item(end_button)
+
+    def _make_action_callback(self, action: str) -> Callable[[discord.Interaction], Awaitable[None]]:
+        async def _callback(interaction: discord.Interaction) -> None:
+            await self.cog.handle_combat_action(interaction, action)
+
+        return _callback
 
 
 class DungeonDeleteConfirmation(discord.ui.View):
@@ -706,20 +982,209 @@ class DungeonCog(commands.Cog):
             name = f"<@{user_id}>"
         return name
 
-    def _roll_damage(self, expression: str) -> int:
+    def _roll_damage(
+        self,
+        expression: str,
+        *,
+        critical: bool = False,
+        extra_dice: Optional[Sequence[str]] = None,
+    ) -> int:
         match = _DAMAGE_ROLL_PATTERN.fullmatch(expression.strip())
-        if not match:
-            return random.randint(1, 8)
-        count = max(1, int(match.group("count")))
-        sides = max(1, int(match.group("sides")))
-        modifier = int(match.group("modifier") or 0)
-        total = sum(random.randint(1, sides) for _ in range(count)) + modifier
+        if match:
+            count = max(1, int(match.group("count")))
+            sides = max(1, int(match.group("sides")))
+            modifier = int(match.group("modifier") or 0)
+            rolls = [
+                random.randint(1, sides)
+                for _ in range(count * (2 if critical else 1))
+            ]
+            total = sum(rolls) + modifier
+        else:
+            total = random.randint(1, 8)
+        if extra_dice:
+            for dice_expression in extra_dice:
+                text = str(dice_expression)
+                extra_match = _DAMAGE_ROLL_PATTERN.fullmatch(text.strip())
+                if not extra_match:
+                    continue
+                extra_count = max(1, int(extra_match.group("count")))
+                extra_sides = max(1, int(extra_match.group("sides")))
+                extra_modifier = int(extra_match.group("modifier") or 0)
+                extra_rolls = [
+                    random.randint(1, extra_sides)
+                    for _ in range(extra_count * (2 if critical else 1))
+                ]
+                total += sum(extra_rolls) + extra_modifier
         return max(0, total)
 
     def _trim_combat_log(self, state: CombatState) -> None:
         excess = len(state.log) - MAX_COMBAT_LOG_ENTRIES
         if excess > 0:
             del state.log[0:excess]
+
+    @staticmethod
+    def _sync_combatant_state(combatant: CombatantState) -> None:
+        metadata = combatant.metadata
+        metadata["current_hp"] = combatant.current_hp
+        metadata["max_hp"] = combatant.max_hp
+        metadata["conditions"] = sorted(combatant.conditions)
+        metadata["concentration"] = combatant.concentration
+        metadata["resources"] = combatant.resources
+        metadata["death_saves"] = {
+            "successes": combatant.death_save_successes,
+            "failures": combatant.death_save_failures,
+        }
+
+    def _apply_damage_to_combatant(self, combatant: CombatantState, amount: int) -> int:
+        if amount <= 0:
+            return 0
+        previous = combatant.current_hp
+        combatant.current_hp = max(0, combatant.current_hp - amount)
+        if combatant.current_hp <= 0:
+            combatant.conditions.add("Unconscious")
+            combatant.concentration = None
+        dealt = previous - combatant.current_hp
+        self._sync_combatant_state(combatant)
+        return dealt
+
+    def _apply_healing_to_combatant(self, combatant: CombatantState, amount: int) -> int:
+        if amount <= 0:
+            return 0
+        previous = combatant.current_hp
+        combatant.current_hp = min(combatant.max_hp, combatant.current_hp + amount)
+        if combatant.current_hp > 0:
+            combatant.conditions.discard("Unconscious")
+        healed = combatant.current_hp - previous
+        self._sync_combatant_state(combatant)
+        return healed
+
+    @staticmethod
+    def _resolve_selection_index(selection: Optional[str], prefix: str, default: int = 0) -> int:
+        if selection is None:
+            return default
+        value = str(selection)
+        if value.startswith(f"{prefix}:"):
+            value = value.split(":", 1)[1]
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _consume_resource(
+        self, player: CombatantState, requirement: Optional[Mapping[str, object]]
+    ) -> Tuple[bool, Optional[str]]:
+        if not requirement:
+            return True, None
+        if not isinstance(requirement, Mapping):
+            return False, "Invalid resource requirement provided."
+        requirement_type = str(requirement.get("type", "")).lower()
+        if requirement_type == "spell_slot":
+            level_value = requirement.get("level", 1)
+            level_key = str(level_value)
+            try:
+                amount = max(1, int(requirement.get("amount", 1)))
+            except (TypeError, ValueError):
+                amount = 1
+            slots = player.resources.setdefault("spell_slots", {})
+            slot_entry = slots.get(level_key)
+            if slot_entry is None and level_key.isdigit():
+                slot_entry = slots.get(int(level_key))
+            if not isinstance(slot_entry, MutableMapping):
+                return False, f"You have no level {level_value} spell slots remaining."
+            available = int(slot_entry.get("available", slot_entry.get("remaining", 0)))
+            if available < amount:
+                return False, f"You have no level {level_value} spell slots remaining."
+            available -= amount
+            slot_entry["available"] = available
+            if "remaining" in slot_entry:
+                slot_entry["remaining"] = available
+            return True, None
+        if requirement_type == "pool":
+            pool_name = str(requirement.get("pool", "feature_uses"))
+            key = str(requirement.get("key", ""))
+            if not key:
+                return False, "This ability is not linked to a usable resource."
+            try:
+                amount = max(1, int(requirement.get("amount", 1)))
+            except (TypeError, ValueError):
+                amount = 1
+            pools = player.resources.setdefault(pool_name, {})
+            entry = pools.get(key)
+            if not isinstance(entry, MutableMapping):
+                max_uses = int(requirement.get("max", requirement.get("amount", amount)))
+                entry = {"max": max_uses, "available": max_uses}
+                pools[key] = entry
+            available = int(entry.get("available", entry.get("remaining", entry.get("max", 0))))
+            if available < amount:
+                return False, f"You have no uses of {key} remaining."
+            available -= amount
+            entry["available"] = available
+            if "remaining" in entry:
+                entry["remaining"] = available
+            return True, None
+        return False, "This action cannot be resolved because its resource type is unknown."
+
+    def _resource_status_text(
+        self, player: CombatantState, requirement: Optional[Mapping[str, object]]
+    ) -> Optional[str]:
+        if not requirement or not isinstance(requirement, Mapping):
+            return None
+        requirement_type = str(requirement.get("type", "")).lower()
+        if requirement_type == "spell_slot":
+            level_value = requirement.get("level", 1)
+            slots = player.resources.get("spell_slots", {})
+            slot_entry = slots.get(str(level_value))
+            if slot_entry is None and str(level_value).isdigit():
+                slot_entry = slots.get(int(level_value))
+            if isinstance(slot_entry, Mapping):
+                available = slot_entry.get("available")
+                max_uses = slot_entry.get("max")
+                if available is not None:
+                    if max_uses is not None:
+                        return f"Level {level_value} slots remaining: {available}/{max_uses}."
+                    return f"Level {level_value} slots remaining: {available}."
+        if requirement_type == "pool":
+            pool_name = str(requirement.get("pool", "feature_uses"))
+            key = str(requirement.get("key", ""))
+            pools = player.resources.get(pool_name, {})
+            entry = pools.get(key)
+            if isinstance(entry, Mapping):
+                available = entry.get("available")
+                max_uses = entry.get("max")
+                if available is not None and max_uses is not None:
+                    return f"{key}: {available}/{max_uses} uses remaining."
+                if available is not None:
+                    return f"{key}: {available} uses remaining."
+        return None
+
+    def _summarise_combatant_resources(self, combatant: CombatantState) -> Optional[str]:
+        if not combatant.resources:
+            return None
+        parts: List[str] = []
+        spell_slots = combatant.resources.get("spell_slots")
+        if isinstance(spell_slots, Mapping):
+            slot_parts: List[str] = []
+            for level_key, payload in sorted(spell_slots.items(), key=lambda item: str(item[0])):
+                if not isinstance(payload, Mapping):
+                    continue
+                available = payload.get("available")
+                max_uses = payload.get("max")
+                if available is None or max_uses is None:
+                    continue
+                slot_parts.append(f"L{level_key}:{available}/{max_uses}")
+            if slot_parts:
+                parts.append("Slots " + ", ".join(slot_parts))
+        feature_uses = combatant.resources.get("feature_uses")
+        if isinstance(feature_uses, Mapping):
+            for name, payload in feature_uses.items():
+                if not isinstance(payload, Mapping):
+                    continue
+                available = payload.get("available")
+                max_uses = payload.get("max")
+                if available is None or max_uses is None:
+                    continue
+                parts.append(f"{name}: {available}/{max_uses}")
+        return " | ".join(parts) if parts else None
 
     def _any_players_alive(self, state: CombatState) -> bool:
         return any(combatant.is_player and not combatant.defeated for combatant in state.order)
@@ -767,12 +1232,14 @@ class DungeonCog(commands.Cog):
         result = attack_roll(attack_bonus, target_ac)
         if result.hits:
             damage_expr = str(monster.metadata.get("damage", "1d6+1"))
-            damage = self._roll_damage(damage_expr)
-            target.current_hp = max(0, target.current_hp - damage)
+            damage = self._roll_damage(damage_expr, critical=result.is_critical_hit)
+            dealt = self._apply_damage_to_combatant(target, damage)
             message = (
-                f"{monster.name} hits {target.name} for {damage} damage. "
+                f"{monster.name} hits {target.name} for {dealt} damage. "
                 f"(Attack {result.total} vs AC {target_ac})"
             )
+            if result.is_critical_hit:
+                message += " Critical hit!"
             if target.defeated:
                 message += f" {target.name} is defeated!"
         else:
@@ -929,6 +1396,53 @@ class DungeonCog(commands.Cog):
         }
         return profile, warnings
 
+    def _spell_options_for_character(
+        self,
+        character: Character,
+        ability_scores: Mapping[str, int],
+        spellcasting_profile: Optional[Mapping[str, object]],
+    ) -> List[Dict[str, object]]:
+        if not spellcasting_profile:
+            return []
+        ability = str(spellcasting_profile.get("ability", "")).upper()
+        ability_mod = ability_modifier(int(ability_scores.get(ability, 10))) if ability else 0
+        defaults = DEFAULT_SPELL_OPTIONS.get(character.character_class.key, [])
+        options: List[Dict[str, object]] = []
+        for entry in defaults:
+            option = copy.deepcopy(entry)
+            option["level"] = int(option.get("level", 0))
+            option.setdefault("attack_bonus", spellcasting_profile.get("attack_bonus", ability_mod))
+            option.setdefault("save_dc", spellcasting_profile.get("save_dc", 8 + ability_mod))
+            option.setdefault("ability_modifier", ability_mod)
+            option.setdefault("ability", ability)
+            options.append(option)
+        return options
+
+    def _feature_action_options(
+        self, character: Character, ability_scores: Mapping[str, int]
+    ) -> List[Dict[str, object]]:
+        options: List[Dict[str, object]] = []
+        for feature in character.character_class.features:
+            if feature.level > 1:
+                continue
+            entry: Dict[str, object] = {
+                "name": feature.name,
+                "description": feature.description,
+                "key": feature.name.lower().replace(" ", "_") if feature.name else "feature",
+            }
+            if "Second Wind" in feature.name:
+                entry["effects"] = {"type": "heal", "dice": "1d10+1"}
+                entry["resource"] = {
+                    "type": "pool",
+                    "pool": "feature_uses",
+                    "key": feature.name,
+                    "amount": 1,
+                    "max": 1,
+                    "refresh": "short_rest",
+                }
+            options.append(entry)
+        return options
+
     def _build_character_combat_profile(self, character: Character) -> tuple[Dict[str, object], List[str]]:
         warnings: List[str] = []
         ability_scores = {key: int(value) for key, value in character.ability_scores.values.items()}
@@ -944,11 +1458,34 @@ class DungeonCog(commands.Cog):
         warnings.extend(weapon_warnings)
         spellcasting_profile, spell_warnings = self._spellcasting_profile(character, ability_scores)
         warnings.extend(spell_warnings)
-        features = [feature.name for feature in character.character_class.features if feature.level <= 1]
+        spell_options = self._spell_options_for_character(
+            character, ability_scores, spellcasting_profile
+        )
+        feature_options = self._feature_action_options(character, ability_scores)
         equipment_summary = []
         for key in equipment_keys:
             item = EQUIPMENT.get(key)
             equipment_summary.append(item.name if item else key.replace("_", " ").title())
+        resources: Dict[str, object] = {}
+        if spellcasting_profile:
+            slot_defaults = DEFAULT_SPELL_SLOTS.get(character.character_class.key, {1: 2})
+            resources["spell_slots"] = {
+                str(level): {"max": amount, "available": amount}
+                for level, amount in slot_defaults.items()
+            }
+        if feature_options:
+            feature_pool: Dict[str, Dict[str, int]] = {}
+            for option in feature_options:
+                resource = option.get("resource")
+                if isinstance(resource, Mapping):
+                    pool_name = str(resource.get("pool", "feature_uses"))
+                    pool = feature_pool.setdefault(pool_name, {})
+                    key = str(resource.get("key", option.get("name", "Feature")))
+                    max_uses = int(resource.get("max", resource.get("amount", 1) or 1))
+                    available = int(resource.get("available", resource.get("amount", max_uses)))
+                    pool[key] = {"max": max_uses, "available": available}
+            for pool_name, pool in feature_pool.items():
+                resources[pool_name] = pool
         metadata: Dict[str, object] = {
             "armor_class": armor_class,
             "initiative_bonus": initiative_bonus,
@@ -956,12 +1493,12 @@ class DungeonCog(commands.Cog):
             "default_attack_index": 0,
             "combat_options": {
                 "weapons": weapon_options,
-                "spellcasting": spellcasting_profile or {},
-                "features": features,
+                "spells": spell_options,
+                "features": feature_options,
             },
             "equipment": equipment_summary,
             "proficiency_bonus": PROFICIENCY_BONUS,
-            "features": features,
+            "features": [option.get("name", "Feature") for option in feature_options],
             "character_name": character.name,
             "character_class": character.character_class.name,
             "race": character.race.name,
@@ -979,6 +1516,7 @@ class DungeonCog(commands.Cog):
             metadata["spellcasting"] = spellcasting_profile
             metadata["spell_attack_bonus"] = spellcasting_profile["attack_bonus"]
             metadata["spell_save_dc"] = spellcasting_profile["save_dc"]
+        metadata["resources"] = resources
         if armor_key:
             armor_item = EQUIPMENT.get(armor_key)
             metadata["armor"] = {
@@ -1025,11 +1563,12 @@ class DungeonCog(commands.Cog):
         if not state.active:
             state.waiting_for = None
 
-    def _player_attack(
+    def _player_weapon_attack(
         self,
         session: DungeonSession,
         state: CombatState,
         player: CombatantState,
+        selection: Optional[str],
     ) -> str:
         targets = [combatant for combatant in state.order if not combatant.is_player and not combatant.defeated]
         if not targets:
@@ -1038,33 +1577,50 @@ class DungeonCog(commands.Cog):
         attack_bonus = int(player.metadata.get("attack_bonus", DEFAULT_PLAYER_ATTACK_BONUS))
         damage_expr = str(player.metadata.get("damage", DEFAULT_PLAYER_DAMAGE))
         weapon_label = str(player.metadata.get("weapon_name", "weapon"))
-        options = player.metadata.get("attack_options")
+        combat_options = player.metadata.get("combat_options", {})
+        options = combat_options.get("weapons") if isinstance(combat_options, Mapping) else None
+        option: Optional[Mapping[str, object]] = None
+        if not options:
+            options = player.metadata.get("attack_options")
         if isinstance(options, list) and options:
-            index_raw = player.metadata.get("default_attack_index", 0)
-            try:
-                option_index = int(index_raw)
-            except (TypeError, ValueError):
-                option_index = 0
+            default_index = self._resolve_selection_index(
+                player.metadata.get("default_attack_index", 0), "weapon", 0
+            )
+            option_index = self._resolve_selection_index(selection, "weapon", default_index)
             if option_index < 0 or option_index >= len(options):
                 option_index = 0
             option = options[option_index]
+            player.metadata["default_attack_index"] = option_index
             attack_bonus = int(option.get("attack_bonus", attack_bonus))
             damage_expr = str(option.get("damage", damage_expr))
             weapon_label = str(option.get("name", weapon_label))
         target_ac = int(target.metadata.get("armor_class", 10))
         result = attack_roll(attack_bonus, target_ac)
         if result.hits:
-            damage = self._roll_damage(damage_expr)
-            target.current_hp = max(0, target.current_hp - damage)
+            extra_dice = option.get("critical_extra_dice") if isinstance(option, Mapping) else None
+            if isinstance(extra_dice, Sequence):
+                extra_dice_values: Optional[Sequence[str]] = [str(value) for value in extra_dice]
+            else:
+                extra_dice_values = None
+            damage = self._roll_damage(
+                damage_expr,
+                critical=result.is_critical_hit,
+                extra_dice=extra_dice_values,
+            )
+            dealt = self._apply_damage_to_combatant(target, damage)
             weapon_text = "" if weapon_label.lower() == "weapon" else f" with your {weapon_label}"
             summary = (
-                f"You hit {target.name}{weapon_text} for {damage} damage! "
+                f"You hit {target.name}{weapon_text} for {dealt} damage! "
                 f"(Attack {result.total} vs AC {target_ac})"
             )
+            if result.is_critical_hit:
+                summary += " Critical hit!"
             log_entry = (
-                f"{player.name} hits {target.name}{weapon_text} for {damage} damage. "
+                f"{player.name} hits {target.name}{weapon_text} for {dealt} damage. "
                 f"(Attack {result.total} vs AC {target_ac})"
             )
+            if result.is_critical_hit:
+                log_entry += " Critical hit!"
             if target.defeated:
                 log_entry += f" {target.name} is defeated!"
         else:
@@ -1080,6 +1636,196 @@ class DungeonCog(commands.Cog):
         state.log.append(log_entry)
         self._trim_combat_log(state)
         self._evaluate_combat_state(session, state)
+        return summary
+
+    def _player_cast_spell(
+        self,
+        session: DungeonSession,
+        state: CombatState,
+        player: CombatantState,
+        selection: Optional[str],
+    ) -> str:
+        combat_options = player.metadata.get("combat_options", {})
+        spells = combat_options.get("spells") if isinstance(combat_options, Mapping) else None
+        if not isinstance(spells, list) or not spells:
+            return "You have no spells prepared."
+        spell_index = self._resolve_selection_index(selection, "spell", 0)
+        if spell_index < 0 or spell_index >= len(spells):
+            return "That spell isn't available right now."
+        spell = spells[spell_index]
+        spell_name = str(spell.get("name", "Spell"))
+        targets = [combatant for combatant in state.order if not combatant.is_player and not combatant.defeated]
+        effect_type = str(spell.get("type", "attack")).lower()
+        target_required = effect_type in {"attack", "auto", "save", "damage"}
+        target = targets[0] if targets else None
+        if target_required and target is None:
+            return "There are no valid targets for that spell."
+        requirement = spell.get("consumes")
+        can_use, failure_reason = self._consume_resource(player, requirement)
+        if not can_use:
+            return failure_reason or f"You cannot cast {spell_name} right now."
+        attack_bonus = int(
+            spell.get(
+                "attack_bonus",
+                player.metadata.get("spell_attack_bonus", player.metadata.get("attack_bonus", 0)),
+            )
+        )
+        damage_expr = str(spell.get("damage", DEFAULT_PLAYER_DAMAGE))
+        damage_type = spell.get("damage_type")
+        extra_dice = spell.get("critical_extra_dice") if isinstance(spell, Mapping) else None
+        if isinstance(extra_dice, Sequence):
+            critical_dice: Optional[Sequence[str]] = [str(value) for value in extra_dice]
+        else:
+            critical_dice = None
+        log_entry: str
+        summary: str
+        if effect_type == "attack" and target is not None:
+            target_ac = int(target.metadata.get("armor_class", DEFAULT_PLAYER_ARMOR_CLASS))
+            result = attack_roll(attack_bonus, target_ac)
+            if result.hits:
+                damage = self._roll_damage(
+                    damage_expr,
+                    critical=result.is_critical_hit,
+                    extra_dice=critical_dice,
+                )
+                dealt = self._apply_damage_to_combatant(target, damage)
+                type_text = f" {str(damage_type).title()}" if damage_type else ""
+                summary = (
+                    f"You cast {spell_name}, striking {target.name} for {dealt}{type_text} damage. "
+                    f"(Attack {result.total} vs AC {target_ac})"
+                )
+                log_entry = (
+                    f"{player.name} casts {spell_name}, hitting {target.name} for {dealt}{type_text} damage. "
+                    f"(Attack {result.total} vs AC {target_ac})"
+                )
+                if result.is_critical_hit:
+                    summary += " Critical hit!"
+                    log_entry += " Critical hit!"
+                if target.defeated:
+                    log_entry += f" {target.name} is defeated!"
+            else:
+                summary = (
+                    f"Your {spell_name} misses {target.name}. "
+                    f"(Attack {result.total} vs AC {target_ac})"
+                )
+                log_entry = (
+                    f"{player.name}'s {spell_name} misses {target.name}. "
+                    f"(Attack {result.total} vs AC {target_ac})"
+                )
+        elif effect_type == "auto" and target is not None:
+            damage = self._roll_damage(damage_expr, extra_dice=critical_dice)
+            dealt = self._apply_damage_to_combatant(target, damage)
+            type_text = f" {str(damage_type).title()}" if damage_type else ""
+            summary = f"You unleash {spell_name}, automatically dealing {dealt}{type_text} damage to {target.name}."
+            log_entry = (
+                f"{player.name} casts {spell_name}, dealing {dealt}{type_text} damage to {target.name}."
+            )
+            if target.defeated:
+                log_entry += f" {target.name} is defeated!"
+        elif effect_type == "save" and target is not None:
+            dc = int(spell.get("save_dc", player.metadata.get("spell_save_dc", 10)))
+            ability = str(spell.get("save_ability", "DEX")).upper()
+            saving_throws = target.metadata.get("saving_throws")
+            if isinstance(saving_throws, Mapping):
+                try:
+                    save_bonus = int(saving_throws.get(ability, 0))
+                except (TypeError, ValueError):
+                    save_bonus = 0
+            else:
+                save_bonus = 0
+            save_result = saving_throw(save_bonus, dc)
+            damage = self._roll_damage(damage_expr, extra_dice=critical_dice)
+            if save_result.success:
+                if spell.get("half_on_success"):
+                    damage //= 2
+                    dealt = self._apply_damage_to_combatant(target, damage)
+                    summary = (
+                        f"{target.name} resists some of your {spell_name}, taking {dealt} damage after succeeding "
+                        f"the save (DC {dc})."
+                    )
+                    log_entry = (
+                        f"{player.name} casts {spell_name}; {target.name} succeeds on the save (DC {dc}) and takes {dealt} damage."
+                    )
+                else:
+                    summary = (
+                        f"{target.name} shrugs off your {spell_name}, succeeding on the saving throw (DC {dc})."
+                    )
+                    log_entry = (
+                        f"{player.name} casts {spell_name}, but {target.name} succeeds on the save (DC {dc})."
+                    )
+                    damage = 0
+            else:
+                dealt = self._apply_damage_to_combatant(target, damage)
+                summary = (
+                    f"{target.name} fails the save (DC {dc}) against your {spell_name}, taking {dealt} damage."
+                )
+                log_entry = (
+                    f"{player.name}'s {spell_name} forces {target.name} to fail the save (DC {dc}), taking {dealt} damage."
+                )
+                if target.defeated:
+                    log_entry += f" {target.name} is defeated!"
+        else:
+            summary = f"You focus your energies with {spell_name}, but nothing notable happens."
+            log_entry = f"{player.name} casts {spell_name}, but it has no immediate effect."
+        if spell.get("concentration"):
+            player.concentration = spell_name
+            self._sync_combatant_state(player)
+            summary += " You begin concentrating on the spell."
+            log_entry += f" {player.name} begins concentrating on {spell_name}."
+        status_text = self._resource_status_text(player, requirement)
+        if status_text:
+            summary += f" {status_text}"
+        self._sync_combatant_state(player)
+        state.log.append(log_entry)
+        self._trim_combat_log(state)
+        self._evaluate_combat_state(session, state)
+        return summary
+
+    def _player_use_feature(
+        self,
+        state: CombatState,
+        player: CombatantState,
+        selection: Optional[str],
+    ) -> str:
+        combat_options = player.metadata.get("combat_options", {})
+        features = combat_options.get("features") if isinstance(combat_options, Mapping) else None
+        if not isinstance(features, list) or not features:
+            return "You have no combat features to use."
+        feature_index = self._resolve_selection_index(selection, "feature", 0)
+        if feature_index < 0 or feature_index >= len(features):
+            return "That feature is not available right now."
+        feature = features[feature_index]
+        feature_name = str(feature.get("name", "Feature"))
+        requirement = feature.get("resource") if isinstance(feature, Mapping) else None
+        can_use, failure_reason = self._consume_resource(player, requirement if isinstance(requirement, Mapping) else None)
+        if not can_use:
+            return failure_reason or f"You cannot use {feature_name} right now."
+        effect = feature.get("effects") if isinstance(feature, Mapping) else None
+        log_entry = f"{player.name} uses {feature_name}."
+        summary = f"You activate {feature_name}."
+        if isinstance(effect, Mapping):
+            effect_type = str(effect.get("type", "")).lower()
+            if effect_type == "heal":
+                heal_expr = str(effect.get("dice", "1d6"))
+                healed = self._roll_damage(heal_expr)
+                restored = self._apply_healing_to_combatant(player, healed)
+                summary = f"You use {feature_name}, regaining {restored} HP."
+                log_entry = f"{player.name} uses {feature_name}, regaining {restored} HP."
+            elif effect_type == "condition":
+                condition = str(effect.get("condition", "")).strip()
+                target_scope = str(effect.get("target", "self")).lower()
+                if condition:
+                    if target_scope == "self":
+                        player.conditions.add(condition)
+                        self._sync_combatant_state(player)
+                        summary = f"{feature_name} grants you {condition}."
+                        log_entry = f"{player.name} uses {feature_name}, gaining {condition}."
+        status_text = self._resource_status_text(player, requirement if isinstance(requirement, Mapping) else None)
+        if status_text:
+            summary += f" {status_text}"
+        self._sync_combatant_state(player)
+        state.log.append(log_entry)
+        self._trim_combat_log(state)
         return summary
 
     def _player_defend(self, state: CombatState, player: CombatantState) -> str:
@@ -1150,7 +1896,7 @@ class DungeonCog(commands.Cog):
                     "default_attack_index": 0,
                     "combat_options": {
                         "weapons": [],
-                        "spellcasting": {},
+                        "spells": [],
                         "features": [],
                     },
                     "proficiency_bonus": PROFICIENCY_BONUS,
@@ -1160,6 +1906,7 @@ class DungeonCog(commands.Cog):
                     "damage": DEFAULT_PLAYER_DAMAGE,
                     "character_name": name,
                     "max_hp": DEFAULT_PLAYER_HP,
+                    "resources": {},
                 }
                 metadata["combat_options"]["weapons"] = metadata["attack_options"]
                 warnings.append("Using default combat profile.")
@@ -1172,9 +1919,10 @@ class DungeonCog(commands.Cog):
             metadata.setdefault("damage", DEFAULT_PLAYER_DAMAGE)
             metadata.setdefault("combat_options", {
                 "weapons": metadata.get("attack_options", []),
-                "spellcasting": {},
+                "spells": metadata.get("combat_options", {}).get("spells", []),
                 "features": metadata.get("features", []),
             })
+            metadata.setdefault("resources", {})
             existing_warnings = list(metadata.get("warnings", []))
             existing_warnings.extend(warnings)
             metadata["warnings"] = list(dict.fromkeys(existing_warnings))
@@ -1191,41 +1939,59 @@ class DungeonCog(commands.Cog):
                 for warning in metadata["warnings"]:
                     warnings_log.append(f"{name}: {warning}")
             initiative_total = roll + int(metadata.get("initiative_bonus", 0))
-            combatants.append(
-                CombatantState(
-                    identifier=f"player:{user_id}",
-                    name=name,
-                    initiative_roll=roll,
-                    initiative_total=initiative_total,
-                    max_hp=max_hp,
-                    current_hp=max_hp,
-                    is_player=True,
-                    user_id=user_id,
-                    metadata=metadata,
-                )
+            conditions_raw = metadata.get("conditions") or []
+            if isinstance(conditions_raw, (list, tuple, set)):
+                conditions = {str(value) for value in conditions_raw if str(value).strip()}
+            else:
+                conditions = set()
+            concentration_raw = metadata.get("concentration")
+            concentration = str(concentration_raw) if concentration_raw else None
+            resources_payload = metadata.get("resources")
+            if isinstance(resources_payload, MutableMapping):
+                shared_resources = copy.deepcopy(resources_payload)
+            else:
+                shared_resources = {}
+            metadata["resources"] = shared_resources
+            combatant = CombatantState(
+                identifier=f"player:{user_id}",
+                name=name,
+                initiative_roll=roll,
+                initiative_total=initiative_total,
+                max_hp=max_hp,
+                current_hp=max_hp,
+                is_player=True,
+                user_id=user_id,
+                metadata=metadata,
+                conditions=conditions,
+                concentration=concentration,
+                resources=shared_resources,
             )
+            self._sync_combatant_state(combatant)
+            combatants.append(combatant)
         for index, monster in enumerate(session.room.encounter.monsters):
             roll = random.randint(1, 20)
             initiative_total = roll
             dex_score = monster.ability_scores.get("DEX") if monster.ability_scores else None
             if dex_score is not None:
                 initiative_total += (int(dex_score) - 10) // 2
-            combatants.append(
-                CombatantState(
-                    identifier=f"monster:{index}",
-                    name=monster.name,
-                    initiative_roll=roll,
-                    initiative_total=initiative_total,
-                    max_hp=monster.hit_points,
-                    current_hp=monster.hit_points,
-                    is_player=False,
-                    metadata={
-                        "armor_class": monster.armor_class,
-                        "attack_bonus": monster.attack_bonus,
-                        "damage": monster.damage,
-                    },
-                )
+            monster_resources: Dict[str, object] = {}
+            monster_combatant = CombatantState(
+                identifier=f"monster:{index}",
+                name=monster.name,
+                initiative_roll=roll,
+                initiative_total=initiative_total,
+                max_hp=monster.hit_points,
+                current_hp=monster.hit_points,
+                is_player=False,
+                metadata={
+                    "armor_class": monster.armor_class,
+                    "attack_bonus": monster.attack_bonus,
+                    "damage": monster.damage,
+                },
+                resources=monster_resources,
             )
+            self._sync_combatant_state(monster_combatant)
+            combatants.append(monster_combatant)
         combatants.sort(key=lambda combatant: (combatant.initiative_total, combatant.initiative_roll), reverse=True)
         state = CombatState(order=combatants)
         if warnings_log:
@@ -1284,11 +2050,25 @@ class DungeonCog(commands.Cog):
         if combat is not None:
             initiative_lines: list[str] = []
             for index, combatant in enumerate(combat.order):
-                status = (
-                    f"{combatant.current_hp}/{combatant.max_hp} HP"
-                    if not combatant.defeated
-                    else "Defeated"
-                )
+                if combatant.defeated:
+                    status = "Defeated"
+                else:
+                    status_parts: List[str] = [f"{combatant.current_hp}/{combatant.max_hp} HP"]
+                    if combatant.conditions:
+                        status_parts.append(
+                            "Conditions: " + ", ".join(sorted(combatant.conditions))
+                        )
+                    if combatant.concentration:
+                        status_parts.append(f"Concentration: {combatant.concentration}")
+                    if combatant.death_save_successes or combatant.death_save_failures:
+                        status_parts.append(
+                            "Death Saves "
+                            f"S{combatant.death_save_successes}/F{combatant.death_save_failures}"
+                        )
+                    resource_text = self._summarise_combatant_resources(combatant)
+                    if resource_text:
+                        status_parts.append(resource_text)
+                    status = " | ".join(status_parts)
                 turn_marker = "➡️ " if combat.active and index == combat.turn_index and not combatant.defeated else ""
                 initiative_lines.append(
                     f"{turn_marker}{combatant.name} — Init {combatant.initiative_total} "
@@ -2157,7 +2937,10 @@ class DungeonCog(commands.Cog):
         await self._refresh_session_message(interaction, session)
 
     async def handle_combat_action(
-        self, interaction: discord.Interaction, action: Literal["attack", "defend", "end"]
+        self,
+        interaction: discord.Interaction,
+        action: Literal["weapon", "spell", "feature", "defend", "end", "attack"],
+        selection: Optional[str] = None,
     ) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
         current_session = await self.sessions.get(key)
@@ -2194,8 +2977,12 @@ class DungeonCog(commands.Cog):
                 error = "It isn't your turn to act."
                 return
 
-            if action == "attack":
-                summary = self._player_attack(run, combat, current)
+            if action == "weapon" or action == "attack":
+                summary = self._player_weapon_attack(run, combat, current, selection)
+            elif action == "spell":
+                summary = self._player_cast_spell(run, combat, current, selection)
+            elif action == "feature":
+                summary = self._player_use_feature(combat, current, selection)
             elif action == "defend":
                 summary = self._player_defend(combat, current)
             elif action == "end":
