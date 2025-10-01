@@ -10,7 +10,7 @@ The bot loads encounter content from structured files under the top level `data/
 | `data/traps/` | Trap descriptions grouped by style (for example `arcane.json`). |
 | `data/items/` | Lootable items and treasures. |
 | `data/themes/` | Dungeon theme definitions that reference the other registries. |
-| `data/sessions/metadata.json` | Automatically managed guild session metadata (default theme, most recent run). |
+| `data/sessions/metadata.json` | Automatically managed guild session metadata (default theme, stored dungeons, recent run). |
 
 ## Schemas
 
@@ -92,4 +92,4 @@ Content files are read at startup. To pick up changes without restarting, an adm
 
 ## Guild configuration
 
-The bot stores each guild's preferred theme and last session details in `data/sessions/metadata.json`. The file is managed automatically when `/dungeon start` or `/dungeon configure theme:<name>` are used.
+The bot stores each guild's preferred theme, catalogue of stored dungeons, and last session details in `data/sessions/metadata.json`. The file is managed automatically when `/dungeon start`, `/dungeon delete`, or `/dungeon configure theme:<name>` are used.

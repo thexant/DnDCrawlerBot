@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Mapping, Optional
 
-__all__ = ["DungeonMetadataStore", "GuildSessionMetadata"]
+__all__ = ["DungeonMetadataStore", "GuildSessionMetadata", "StoredDungeon"]
 
 
 @dataclass
@@ -21,6 +21,33 @@ class GuildSessionMetadata:
     last_seed: int | None = None
     last_difficulty: str | None = None
     last_name: str | None = None
+    dungeons: Dict[str, "StoredDungeon"] = field(default_factory=dict)
+
+    def _resolve_dungeon_key(self, name: str) -> Optional[str]:
+        lowered = name.casefold()
+        for existing in self.dungeons:
+            if existing.casefold() == lowered:
+                return existing
+        return None
+
+    def get_dungeon(self, name: str) -> Optional["StoredDungeon"]:
+        key = self._resolve_dungeon_key(name)
+        if key is None:
+            return None
+        return self.dungeons.get(key)
+
+    def upsert_dungeon(self, dungeon: "StoredDungeon") -> None:
+        key = self._resolve_dungeon_key(dungeon.name)
+        if key is not None and key != dungeon.name:
+            del self.dungeons[key]
+        self.dungeons[dungeon.name] = dungeon
+
+    def remove_dungeon(self, name: str) -> bool:
+        key = self._resolve_dungeon_key(name)
+        if key is None:
+            return False
+        del self.dungeons[key]
+        return True
 
     def to_dict(self) -> Dict[str, object]:
         data: Dict[str, object] = {}
@@ -34,6 +61,10 @@ class GuildSessionMetadata:
             data["last_difficulty"] = self.last_difficulty
         if self.last_name is not None:
             data["last_name"] = self.last_name
+        if self.dungeons:
+            data["dungeons"] = {
+                name: dungeon.to_dict() for name, dungeon in self.dungeons.items()
+            }
         return data
 
     @classmethod
@@ -43,6 +74,19 @@ class GuildSessionMetadata:
         last_seed = raw.get("last_seed")
         last_difficulty = raw.get("last_difficulty")
         last_name = raw.get("last_name")
+        dungeons: Dict[str, StoredDungeon] = {}
+        raw_dungeons = raw.get("dungeons")
+        if isinstance(raw_dungeons, Mapping):
+            for dungeon_name, dungeon_payload in raw_dungeons.items():
+                if not isinstance(dungeon_name, str) or not isinstance(
+                    dungeon_payload, Mapping
+                ):
+                    continue
+                try:
+                    dungeon = StoredDungeon.from_dict(dungeon_name, dungeon_payload)
+                except ValueError:
+                    continue
+                dungeons[dungeon.name] = dungeon
         return cls(
             guild_id=guild_id,
             default_theme=str(default_theme) if isinstance(default_theme, str) else None,
@@ -50,6 +94,39 @@ class GuildSessionMetadata:
             last_seed=int(last_seed) if isinstance(last_seed, int) else None,
             last_difficulty=str(last_difficulty) if isinstance(last_difficulty, str) else None,
             last_name=str(last_name) if isinstance(last_name, str) else None,
+            dungeons=dungeons,
+        )
+
+
+@dataclass
+class StoredDungeon:
+    """Persisted information about a generated dungeon."""
+
+    name: str
+    theme: str
+    seed: int | None = None
+    difficulty: str | None = None
+
+    def to_dict(self) -> Dict[str, object]:
+        data: Dict[str, object] = {"theme": self.theme}
+        if self.seed is not None:
+            data["seed"] = self.seed
+        if self.difficulty is not None:
+            data["difficulty"] = self.difficulty
+        return data
+
+    @classmethod
+    def from_dict(cls, name: str, raw: Mapping[str, object]) -> "StoredDungeon":
+        theme = raw.get("theme")
+        if not isinstance(theme, str):
+            raise ValueError("Dungeon entries must include a theme")
+        seed = raw.get("seed")
+        difficulty = raw.get("difficulty")
+        return cls(
+            name=name,
+            theme=theme,
+            seed=int(seed) if isinstance(seed, int) else None,
+            difficulty=str(difficulty) if isinstance(difficulty, str) else None,
         )
 
 
@@ -119,6 +196,7 @@ class DungeonMetadataStore:
                 and metadata.last_seed is None
                 and metadata.last_difficulty is None
                 and metadata.last_name is None
+                and not metadata.dungeons
             ):
                 del self._cache[key]
             await self._persist()
@@ -144,6 +222,14 @@ class DungeonMetadataStore:
             metadata.last_seed = seed if seed is None else int(seed)
             metadata.last_difficulty = difficulty
             metadata.last_name = name
+            if name:
+                dungeon = StoredDungeon(
+                    name=name,
+                    theme=theme,
+                    seed=metadata.last_seed,
+                    difficulty=difficulty,
+                )
+                metadata.upsert_dungeon(dungeon)
             await self._persist()
             return metadata
 
@@ -159,5 +245,46 @@ class DungeonMetadataStore:
             metadata.last_seed = None
             metadata.last_difficulty = None
             metadata.last_name = None
+            metadata.dungeons.clear()
             del self._cache[key]
             await self._persist()
+
+    async def list_dungeon_names(self, guild_id: int) -> tuple[str, ...]:
+        async with self._lock:
+            await self._ensure_loaded()
+            metadata = self._cache.get(str(guild_id))
+            if metadata is None:
+                return ()
+            return tuple(sorted(metadata.dungeons))
+
+    async def get_dungeon(self, guild_id: int, name: str) -> Optional[StoredDungeon]:
+        async with self._lock:
+            await self._ensure_loaded()
+            metadata = self._cache.get(str(guild_id))
+            if metadata is None:
+                return None
+            return metadata.get_dungeon(name)
+
+    async def delete_dungeon(self, guild_id: int, name: str) -> bool:
+        async with self._lock:
+            await self._ensure_loaded()
+            key = str(guild_id)
+            metadata = self._cache.get(key)
+            if metadata is None:
+                return False
+            removed = metadata.remove_dungeon(name)
+            if not removed:
+                return False
+            if metadata.last_name and metadata.last_name.casefold() == name.casefold():
+                metadata.last_name = None
+            if (
+                metadata.default_theme is None
+                and metadata.last_theme is None
+                and metadata.last_seed is None
+                and metadata.last_difficulty is None
+                and metadata.last_name is None
+                and not metadata.dungeons
+            ):
+                del self._cache[key]
+            await self._persist()
+            return True

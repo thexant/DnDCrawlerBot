@@ -14,7 +14,7 @@ from discord.ext import commands
 from dnd.combat import saving_throw
 from dnd.content import ContentLibrary, ContentLoadError
 from dnd.dungeon import Dungeon, DungeonGenerator, Room, Theme, ThemeRegistry
-from dnd.dungeon.state import DungeonMetadataStore
+from dnd.dungeon.state import DungeonMetadataStore, StoredDungeon
 from dnd.sessions import SessionKey, SessionManager
 
 
@@ -90,6 +90,54 @@ class DungeonNavigationView(discord.ui.View):
     @discord.ui.button(label="Engage", style=discord.ButtonStyle.success, custom_id="dungeon:engage")
     async def engage(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
         await self.cog.handle_engage(interaction)
+
+
+class DungeonDeleteConfirmation(discord.ui.View):
+    """Confirmation dialog for deleting stored dungeons."""
+
+    def __init__(
+        self,
+        cog: "DungeonCog",
+        *,
+        requester_id: int,
+        guild_id: int,
+        dungeon: StoredDungeon,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.requester_id = requester_id
+        self.guild_id = guild_id
+        self.dungeon = dungeon
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # noqa: D401
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the administrator who requested this deletion can respond.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+        deleted = await self.cog.metadata_store.delete_dungeon(
+            self.guild_id, self.dungeon.name
+        )
+        if deleted:
+            message = f"Deleted stored dungeon **{self.dungeon.name}**."
+        else:
+            message = (
+                f"Stored dungeon **{self.dungeon.name}** was already removed."
+            )
+        await interaction.response.edit_message(content=message, view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+        await interaction.response.edit_message(
+            content="Deletion cancelled.", view=None
+        )
+        self.stop()
 
 
 class DungeonCog(commands.Cog):
@@ -362,6 +410,61 @@ class DungeonCog(commands.Cog):
             except discord.HTTPException:
                 pass
         await interaction.followup.send("The dungeon session has been reset.", ephemeral=True)
+
+    @dungeon_group.command(name="delete", description="Delete a stored dungeon by name.")
+    @app_commands.describe(name="Name of the stored dungeon to delete")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def delete_dungeon(self, interaction: discord.Interaction, name: str) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Stored dungeons can only be managed within a guild.",
+                ephemeral=True,
+            )
+            return
+
+        stored = await self.metadata_store.get_dungeon(interaction.guild_id, name)
+        if stored is None:
+            names = await self.metadata_store.list_dungeon_names(interaction.guild_id)
+            if not names:
+                message = "There are no stored dungeons for this guild."
+            else:
+                available = ", ".join(names)
+                message = (
+                    f"No stored dungeon named '{name}'. Available dungeons: {available}."
+                )
+            await interaction.response.send_message(message, ephemeral=True)
+            return
+
+        summary_lines = [
+            f"Are you sure you want to delete the stored dungeon **{stored.name}**?",
+            f"Theme: {stored.theme}",
+        ]
+        if stored.difficulty:
+            summary_lines.append(f"Difficulty: {stored.difficulty.title()}")
+        if stored.seed is not None:
+            summary_lines.append(f"Seed: {stored.seed}")
+
+        view = DungeonDeleteConfirmation(
+            self,
+            requester_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            dungeon=stored,
+        )
+        await interaction.response.send_message(
+            "\n".join(summary_lines),
+            view=view,
+            ephemeral=True,
+        )
+
+    @delete_dungeon.autocomplete("name")
+    async def delete_dungeon_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> Iterable[app_commands.Choice[str]]:
+        if interaction.guild_id is None:
+            return []
+        names = await self.metadata_store.list_dungeon_names(interaction.guild_id)
+        filtered = [candidate for candidate in names if current.lower() in candidate.lower()][:25]
+        return [app_commands.Choice(name=candidate, value=candidate) for candidate in filtered]
 
     @dungeon_group.command(name="reload", description="Reload dungeon content from disk.")
     @app_commands.checks.has_permissions(manage_guild=True)
