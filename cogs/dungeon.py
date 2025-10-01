@@ -5,15 +5,15 @@ from __future__ import annotations
 import logging
 import random
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, Iterable, Literal, Optional
+from typing import Dict, Iterable, List, Literal, Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from dnd.combat import saving_throw
+from dnd.combat import attack_roll, saving_throw
 from dnd.content import ContentLibrary, ContentLoadError
 from dnd.dungeon import Dungeon, DungeonGenerator, Room, Theme, ThemeRegistry
 from dnd.dungeon.state import DungeonMetadataStore, StoredDungeon
@@ -21,6 +21,14 @@ from dnd.sessions import SessionKey, SessionManager
 
 
 log = logging.getLogger(__name__)
+
+
+DEFAULT_PLAYER_HP = 20
+DEFAULT_PLAYER_ARMOR_CLASS = 13
+DEFAULT_PLAYER_ATTACK_BONUS = 5
+DEFAULT_PLAYER_DAMAGE = "1d8+3"
+MAX_COMBAT_LOG_ENTRIES = 12
+_DAMAGE_ROLL_PATTERN = re.compile(r"(?i)(?P<count>\d+)d(?P<sides>\d+)(?P<modifier>[+-]\d+)?")
 
 
 def _default_data_path() -> Path:
@@ -38,6 +46,7 @@ class DungeonSession:
     seed: Optional[int] = None
     party_ids: set[int] = field(default_factory=set)
     message_id: Optional[int] = None
+    combat_state: Optional["CombatState"] = None
 
     @property
     def room(self) -> Room:
@@ -54,6 +63,63 @@ class DungeonSession:
             if corridor.to_room == self.current_room:
                 return corridor.description
         return None
+
+
+@dataclass
+class CombatantState:
+    """Mutable state tracked for each combatant during combat."""
+
+    identifier: str
+    name: str
+    initiative_roll: int
+    initiative_total: int
+    max_hp: int
+    current_hp: int
+    is_player: bool
+    user_id: Optional[int] = None
+    metadata: Dict[str, object] = field(default_factory=dict)
+
+    @property
+    def defeated(self) -> bool:
+        return self.current_hp <= 0
+
+
+@dataclass
+class CombatState:
+    """Encapsulates the turn order and ongoing combat flow."""
+
+    order: List[CombatantState] = field(default_factory=list)
+    turn_index: int = 0
+    waiting_for: Optional[int] = None
+    active: bool = True
+    round_number: int = 1
+    log: List[str] = field(default_factory=list)
+
+    def current_combatant(self) -> Optional[CombatantState]:
+        if not self.order:
+            return None
+        return self.order[self.turn_index]
+
+    def advance_turn(self) -> Optional[CombatantState]:
+        if not self.order:
+            return None
+        for _ in range(len(self.order)):
+            self.turn_index = (self.turn_index + 1) % len(self.order)
+            if self.turn_index == 0:
+                self.round_number += 1
+            combatant = self.order[self.turn_index]
+            if not combatant.defeated:
+                return combatant
+        return None
+
+    def living_combatants(self, *, players: Optional[bool] = None) -> List[CombatantState]:
+        results: List[CombatantState] = []
+        for combatant in self.order:
+            if combatant.defeated:
+                continue
+            if players is None or combatant.is_player is players:
+                results.append(combatant)
+        return results
 
 
 class DungeonNavigationView(discord.ui.View):
@@ -95,6 +161,52 @@ class DungeonNavigationView(discord.ui.View):
     @discord.ui.button(label="Engage", style=discord.ButtonStyle.success, custom_id="dungeon:engage")
     async def engage(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
         await self.cog.handle_engage(interaction)
+
+
+class CombatActionView(discord.ui.View):
+    """Interaction controls shown while combat is active."""
+
+    def __init__(self, cog: "DungeonCog", session: DungeonSession) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self._combat_active = bool(session.combat_state and session.combat_state.active)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and not self._combat_active:
+                child.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # noqa: D401
+        key = self.cog._session_key(interaction.guild_id, interaction.channel_id)
+        session = await self.cog.sessions.get(key)
+        if session is None:
+            await interaction.response.send_message("No active combat encounter here.", ephemeral=True)
+            return False
+        combat = session.combat_state
+        if combat is None or not combat.active:
+            await interaction.response.send_message("Combat has already ended.", ephemeral=True)
+            return False
+        current = combat.current_combatant()
+        if current is None:
+            await interaction.response.send_message("No combatants are ready to act.", ephemeral=True)
+            return False
+        if not current.is_player:
+            await interaction.response.send_message("Please wait for the monsters to finish their turn.", ephemeral=True)
+            return False
+        if current.user_id != interaction.user.id:
+            await interaction.response.send_message("It isn't your turn yet!", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Attack", style=discord.ButtonStyle.danger, custom_id="dungeon:combat:attack")
+    async def attack(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+        await self.cog.handle_combat_action(interaction, "attack")
+
+    @discord.ui.button(label="Defend", style=discord.ButtonStyle.secondary, custom_id="dungeon:combat:defend")
+    async def defend(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+        await self.cog.handle_combat_action(interaction, "defend")
+
+    @discord.ui.button(label="End Turn", style=discord.ButtonStyle.primary, custom_id="dungeon:combat:end")
+    async def end_turn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+        await self.cog.handle_combat_action(interaction, "end")
 
 
 class DungeonDeleteConfirmation(discord.ui.View):
@@ -295,19 +407,232 @@ class DungeonCog(commands.Cog):
 
         names: list[str] = []
         for user_id in sorted(session.party_ids):
-            name: Optional[str] = None
-            if interaction.guild:
-                member = interaction.guild.get_member(user_id)
-                if member is not None:
-                    name = member.display_name
-            if name is None:
-                user = self.bot.get_user(user_id)
-                if user is not None:
-                    name = user.display_name
-            if name is None:
-                name = f"<@{user_id}>"
-            names.append(name)
+            names.append(self._display_name_for_user(interaction, user_id))
         return "\n".join(f"• {name}" for name in names)
+
+    def _display_name_for_user(
+        self, interaction: discord.Interaction, user_id: int
+    ) -> str:
+        name: Optional[str] = None
+        if interaction.guild:
+            member = interaction.guild.get_member(user_id)
+            if member is not None:
+                name = member.display_name
+        if name is None:
+            user = self.bot.get_user(user_id)
+            if user is not None:
+                name = user.display_name
+        if name is None:
+            name = f"<@{user_id}>"
+        return name
+
+    def _roll_damage(self, expression: str) -> int:
+        match = _DAMAGE_ROLL_PATTERN.fullmatch(expression.strip())
+        if not match:
+            return random.randint(1, 8)
+        count = max(1, int(match.group("count")))
+        sides = max(1, int(match.group("sides")))
+        modifier = int(match.group("modifier") or 0)
+        total = sum(random.randint(1, sides) for _ in range(count)) + modifier
+        return max(0, total)
+
+    def _trim_combat_log(self, state: CombatState) -> None:
+        excess = len(state.log) - MAX_COMBAT_LOG_ENTRIES
+        if excess > 0:
+            del state.log[0:excess]
+
+    def _any_players_alive(self, state: CombatState) -> bool:
+        return any(combatant.is_player and not combatant.defeated for combatant in state.order)
+
+    def _any_monsters_alive(self, state: CombatState) -> bool:
+        return any((not combatant.is_player) and not combatant.defeated for combatant in state.order)
+
+    def _ensure_current_combatant(self, state: CombatState) -> Optional[CombatantState]:
+        current = state.current_combatant()
+        if current is None:
+            return None
+        if current.defeated:
+            return state.advance_turn()
+        return current
+
+    def _finish_combat(self, session: DungeonSession, state: CombatState, *, victory: bool) -> None:
+        state.active = False
+        state.waiting_for = None
+        if victory:
+            state.log.append("The party is victorious!")
+            encounter = session.room.encounter
+            session.room.encounter = replace(
+                encounter,
+                monsters=tuple(),
+            )
+        else:
+            state.log.append("The party has fallen...")
+        self._trim_combat_log(state)
+
+    def _evaluate_combat_state(self, session: DungeonSession, state: CombatState) -> None:
+        if not state.active:
+            return
+        if not self._any_monsters_alive(state):
+            self._finish_combat(session, state, victory=True)
+        elif not self._any_players_alive(state):
+            self._finish_combat(session, state, victory=False)
+
+    def _resolve_monster_action(self, state: CombatState, monster: CombatantState) -> None:
+        targets = [combatant for combatant in state.order if combatant.is_player and not combatant.defeated]
+        if not targets:
+            return
+        target = random.choice(targets)
+        attack_bonus = int(monster.metadata.get("attack_bonus", 4))
+        target_ac = int(target.metadata.get("armor_class", DEFAULT_PLAYER_ARMOR_CLASS))
+        result = attack_roll(attack_bonus, target_ac)
+        if result.hits:
+            damage_expr = str(monster.metadata.get("damage", "1d6+1"))
+            damage = self._roll_damage(damage_expr)
+            target.current_hp = max(0, target.current_hp - damage)
+            message = (
+                f"{monster.name} hits {target.name} for {damage} damage. "
+                f"(Attack {result.total} vs AC {target_ac})"
+            )
+            if target.defeated:
+                message += f" {target.name} is defeated!"
+        else:
+            message = (
+                f"{monster.name} misses {target.name}. "
+                f"(Attack {result.total} vs AC {target_ac})"
+            )
+        state.log.append(message)
+        self._trim_combat_log(state)
+
+    def _run_automatic_turns(self, session: DungeonSession, state: CombatState) -> None:
+        if not state.active:
+            return
+        current = self._ensure_current_combatant(state)
+        if current is None:
+            self._finish_combat(session, state, victory=False)
+            return
+        while state.active:
+            current = state.current_combatant()
+            if current is None:
+                break
+            if current.defeated:
+                next_combatant = self._ensure_current_combatant(state)
+                if next_combatant is None:
+                    break
+                continue
+            if current.is_player:
+                state.waiting_for = current.user_id
+                break
+            state.waiting_for = None
+            self._resolve_monster_action(state, current)
+            self._evaluate_combat_state(session, state)
+            if not state.active:
+                break
+            next_combatant = state.advance_turn()
+            if next_combatant is None:
+                break
+        if not state.active:
+            state.waiting_for = None
+
+    def _player_attack(
+        self,
+        session: DungeonSession,
+        state: CombatState,
+        player: CombatantState,
+    ) -> str:
+        targets = [combatant for combatant in state.order if not combatant.is_player and not combatant.defeated]
+        if not targets:
+            return "There are no foes left to strike."
+        target = targets[0]
+        attack_bonus = int(player.metadata.get("attack_bonus", DEFAULT_PLAYER_ATTACK_BONUS))
+        target_ac = int(target.metadata.get("armor_class", 10))
+        result = attack_roll(attack_bonus, target_ac)
+        if result.hits:
+            damage_expr = str(player.metadata.get("damage", DEFAULT_PLAYER_DAMAGE))
+            damage = self._roll_damage(damage_expr)
+            target.current_hp = max(0, target.current_hp - damage)
+            summary = (
+                f"You hit {target.name} for {damage} damage! "
+                f"(Attack {result.total} vs AC {target_ac})"
+            )
+            log_entry = (
+                f"{player.name} hits {target.name} for {damage} damage. "
+                f"(Attack {result.total} vs AC {target_ac})"
+            )
+            if target.defeated:
+                log_entry += f" {target.name} is defeated!"
+        else:
+            summary = f"Your attack misses {target.name}. (Attack {result.total} vs AC {target_ac})"
+            log_entry = (
+                f"{player.name}'s attack misses {target.name}. "
+                f"(Attack {result.total} vs AC {target_ac})"
+            )
+        state.log.append(log_entry)
+        self._trim_combat_log(state)
+        self._evaluate_combat_state(session, state)
+        return summary
+
+    def _player_defend(self, state: CombatState, player: CombatantState) -> str:
+        message = f"{player.name} takes a defensive stance, ready for the next assault."
+        state.log.append(message)
+        self._trim_combat_log(state)
+        return "You brace yourself, gaining no additional effects but readying for the next turn."
+
+    def _build_combat_state(
+        self, interaction: discord.Interaction, session: DungeonSession
+    ) -> CombatState:
+        combatants: List[CombatantState] = []
+        for user_id in sorted(session.party_ids):
+            roll = random.randint(1, 20)
+            name = self._display_name_for_user(interaction, user_id)
+            combatants.append(
+                CombatantState(
+                    identifier=f"player:{user_id}",
+                    name=name,
+                    initiative_roll=roll,
+                    initiative_total=roll,
+                    max_hp=DEFAULT_PLAYER_HP,
+                    current_hp=DEFAULT_PLAYER_HP,
+                    is_player=True,
+                    user_id=user_id,
+                    metadata={
+                        "armor_class": DEFAULT_PLAYER_ARMOR_CLASS,
+                        "attack_bonus": DEFAULT_PLAYER_ATTACK_BONUS,
+                        "damage": DEFAULT_PLAYER_DAMAGE,
+                    },
+                )
+            )
+        for index, monster in enumerate(session.room.encounter.monsters):
+            roll = random.randint(1, 20)
+            initiative_total = roll
+            dex_score = monster.ability_scores.get("DEX") if monster.ability_scores else None
+            if dex_score is not None:
+                initiative_total += (int(dex_score) - 10) // 2
+            combatants.append(
+                CombatantState(
+                    identifier=f"monster:{index}",
+                    name=monster.name,
+                    initiative_roll=roll,
+                    initiative_total=initiative_total,
+                    max_hp=monster.hit_points,
+                    current_hp=monster.hit_points,
+                    is_player=False,
+                    metadata={
+                        "armor_class": monster.armor_class,
+                        "attack_bonus": monster.attack_bonus,
+                        "damage": monster.damage,
+                    },
+                )
+            )
+        combatants.sort(key=lambda combatant: (combatant.initiative_total, combatant.initiative_roll), reverse=True)
+        state = CombatState(order=combatants)
+        if combatants:
+            order_summary = ", ".join(
+                f"{combatant.name} ({combatant.initiative_total})" for combatant in combatants
+            )
+            state.log.append(f"Initiative order: {order_summary}")
+            self._trim_combat_log(state)
+        self._ensure_current_combatant(state)
+        return state
 
     def _build_room_embed(self, interaction: discord.Interaction, session: DungeonSession) -> discord.Embed:
         room = session.room
@@ -345,17 +670,52 @@ class DungeonCog(commands.Cog):
 
         embed.add_field(name="Party", value=self._party_display(interaction, session), inline=False)
 
-        actions: list[str] = []
-        if not session.at_final_room:
-            actions.append("Proceed deeper into the dungeon.")
-        if room.encounter.monsters:
-            actions.append("Engage the monsters in combat.")
-        if room.encounter.traps:
-            actions.append("Attempt to disarm the traps.")
-        if room.encounter.loot:
-            actions.append("Search the chamber for hidden loot.")
-        if not actions:
-            actions.append("Take a moment to catch your breath.")
+        combat = session.combat_state
+        if combat is not None:
+            initiative_lines: list[str] = []
+            for index, combatant in enumerate(combat.order):
+                status = (
+                    f"{combatant.current_hp}/{combatant.max_hp} HP"
+                    if not combatant.defeated
+                    else "Defeated"
+                )
+                turn_marker = "➡️ " if combat.active and index == combat.turn_index and not combatant.defeated else ""
+                initiative_lines.append(
+                    f"{turn_marker}{combatant.name} — Init {combatant.initiative_total} "
+                    f"(Roll {combatant.initiative_roll}) — {status}"
+                )
+            if initiative_lines:
+                embed.add_field(name="Initiative Order", value="\n".join(initiative_lines), inline=False)
+            current = combat.current_combatant()
+            if combat.active and current is not None and not current.defeated:
+                turn_text = f"Round {combat.round_number}: {current.name} is acting."
+            elif combat.active:
+                turn_text = f"Round {combat.round_number}: resolving initiative..."
+            else:
+                turn_text = "Combat has concluded."
+            embed.add_field(name="Current Turn", value=turn_text, inline=False)
+            if combat.log:
+                log_entries = combat.log[-MAX_COMBAT_LOG_ENTRIES:]
+                while log_entries and len("\n".join(log_entries)) > 1024:
+                    log_entries = log_entries[1:]
+                log_text = "\n".join(log_entries) if log_entries else "(log truncated)"
+                embed.add_field(name="Combat Log", value=log_text or "No events yet.", inline=False)
+
+        actions: list[str]
+        if combat and combat.active:
+            actions = ["Stand your ground and resolve the battle using the combat controls."]
+        else:
+            actions = []
+            if not session.at_final_room:
+                actions.append("Proceed deeper into the dungeon.")
+            if room.encounter.monsters:
+                actions.append("Engage the monsters in combat.")
+            if room.encounter.traps:
+                actions.append("Attempt to disarm the traps.")
+            if room.encounter.loot:
+                actions.append("Search the chamber for hidden loot.")
+            if not actions:
+                actions.append("Take a moment to catch your breath.")
         embed.add_field(name="Available Actions", value="\n".join(f"• {line}" for line in actions), inline=False)
 
         footer_parts = [f"Theme: {dungeon.theme.name}"]
@@ -367,7 +727,10 @@ class DungeonCog(commands.Cog):
         embed.set_footer(text=" • ".join(footer_parts))
         return embed
 
-    def _build_navigation_view(self, session: DungeonSession) -> DungeonNavigationView:
+    def _build_navigation_view(self, session: DungeonSession) -> discord.ui.View:
+        combat = session.combat_state
+        if combat and combat.active:
+            return CombatActionView(self, session)
         room = session.room
         return DungeonNavigationView(
             self,
@@ -773,6 +1136,13 @@ class DungeonCog(commands.Cog):
             await interaction.response.send_message("No active dungeon for this party.", ephemeral=True)
             return
 
+        if session.combat_state and session.combat_state.active:
+            await interaction.response.send_message(
+                "Combat is raging—you can't leave the room until it ends!",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer()
         advanced = False
         reached_final = session.at_final_room
@@ -893,37 +1263,148 @@ class DungeonCog(commands.Cog):
     async def handle_engage(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
         added_member = False
+        started_combat = False
+        combat_in_progress = False
+        no_targets = False
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal added_member
+            nonlocal added_member, started_combat, combat_in_progress, no_targets
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
+            combat = run.combat_state
+            if combat and combat.active:
+                combat_in_progress = True
+                return
+            if not run.room.encounter.monsters:
+                no_targets = True
+                return
+            combat = self._build_combat_state(interaction, run)
+            run.combat_state = combat
+            started_combat = True
+            self._run_automatic_turns(run, combat)
 
         session = await self.sessions.update(key, mutate)
         if session is None:
             await interaction.response.send_message("No foes stand before the party right now.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
-        await self._refresh_session_message(interaction, session)
         if added_member and interaction.guild_id is not None:
             await self._update_tavern_access(interaction.guild_id)
-        monsters = session.room.encounter.monsters
-        if not monsters:
-            await interaction.followup.send(
+
+        if no_targets:
+            await self._send_ephemeral_message(
+                interaction,
                 "The room is eerily quiet—there is nothing to fight here.",
-                ephemeral=True,
             )
             return
 
-        foe = random.choice(monsters)
-        attack_roll = random.randint(1, 20) + 5
-        if attack_roll >= foe.armor_class:
-            message = f"Your strike hits {foe.name}! (Attack {attack_roll} vs AC {foe.armor_class})"
+        combat = session.combat_state
+        if combat_in_progress and combat is not None:
+            current = combat.current_combatant()
+            if current and combat.active and current.is_player and not current.defeated:
+                if current.user_id == interaction.user.id:
+                    message = "It's already your turn—use the combat controls to act!"
+                else:
+                    message = f"Combat is underway! {current.name} is taking their turn."
+            elif combat.active:
+                message = "Combat is underway—stand by while the monsters act."
+            else:
+                message = "Combat has already concluded in this room."
+            await self._send_ephemeral_message(interaction, message)
+            await self._refresh_session_message(interaction, session)
+            return
+
+        if not started_combat or combat is None:
+            await self._send_ephemeral_message(
+                interaction,
+                "Unable to begin combat at this time.",
+            )
+            await self._refresh_session_message(interaction, session)
+            return
+
+        if combat.active:
+            current = combat.current_combatant()
+            if current and current.is_player and not current.defeated:
+                if current.user_id == interaction.user.id:
+                    message = "You surge forward and act first! Choose your move from the combat controls."
+                else:
+                    message = f"Combat begins! {current.name} takes the first turn."
+            else:
+                message = "Combat begins!"
         else:
-            message = f"Your blow glances off {foe.name}'s defenses. (Attack {attack_roll} vs AC {foe.armor_class})"
-        await interaction.followup.send(message, ephemeral=True)
+            message = "The battle is over before it truly begins."
+
+        await self._send_ephemeral_message(interaction, message)
+        await self._refresh_session_message(interaction, session)
+
+    async def handle_combat_action(
+        self, interaction: discord.Interaction, action: Literal["attack", "defend", "end"]
+    ) -> None:
+        key = self._session_key(interaction.guild_id, interaction.channel_id)
+        added_member = False
+        error: Optional[str] = None
+        summary: Optional[str] = None
+
+        def mutate(run: DungeonSession) -> None:
+            nonlocal added_member, error, summary
+            if interaction.user.id not in run.party_ids:
+                run.party_ids.add(interaction.user.id)
+                added_member = True
+            combat = run.combat_state
+            if combat is None or not combat.active:
+                error = "Combat isn't currently active."
+                return
+            current = combat.current_combatant()
+            if (
+                current is None
+                or not current.is_player
+                or current.user_id != interaction.user.id
+                or current.defeated
+            ):
+                error = "It isn't your turn to act."
+                return
+
+            if action == "attack":
+                summary = self._player_attack(run, combat, current)
+            elif action == "defend":
+                summary = self._player_defend(combat, current)
+            elif action == "end":
+                combat.log.append(f"{current.name} ends their turn without further action.")
+                self._trim_combat_log(combat)
+                summary = "You end your turn."
+            else:  # pragma: no cover - defensive
+                error = "Unknown combat action."
+                return
+
+            self._evaluate_combat_state(run, combat)
+            if combat.active:
+                next_combatant = combat.advance_turn()
+                if next_combatant is None:
+                    self._finish_combat(run, combat, victory=False)
+                else:
+                    self._run_automatic_turns(run, combat)
+
+        session = await self.sessions.update(key, mutate)
+        if session is None:
+            await self._send_ephemeral_message(
+                interaction,
+                "No active dungeon for this party.",
+            )
+            return
+
+        if added_member and interaction.guild_id is not None:
+            await self._update_tavern_access(interaction.guild_id)
+
+        if error is not None:
+            await self._send_ephemeral_message(interaction, error)
+            return
+
+        if summary is None:
+            summary = "Your action resolves."  # fallback message
+
+        await self._send_ephemeral_message(interaction, summary)
+        await self._refresh_session_message(interaction, session)
 
 
 async def setup(bot: commands.Bot) -> None:
