@@ -113,7 +113,7 @@ class DungeonCog(commands.Cog):
         try:
             self.bot.tree.remove_command(
                 self.dungeon_group.name,
-                type=app_commands.CommandType.chat_input,
+                type=discord.AppCommandType.chat_input,
             )
         except (app_commands.CommandTreeException, KeyError):
             pass
@@ -539,11 +539,11 @@ async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(cog)
     existing = bot.tree.get_command(
         cog.dungeon_group.name,
-        type=app_commands.CommandType.chat_input,
+        type=discord.AppCommandType.chat_input,
     )
     if existing is not None:
         bot.tree.remove_command(
             cog.dungeon_group.name,
-            type=app_commands.CommandType.chat_input,
+            type=discord.AppCommandType.chat_input,
         )
     bot.tree.add_command(cog.dungeon_group)
