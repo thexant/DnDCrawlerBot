@@ -8,7 +8,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Mapping, Optional
 
+from dnd.dungeon.generator import DIFFICULTY_PROFILES
+
 __all__ = ["DungeonMetadataStore", "GuildSessionMetadata", "StoredDungeon"]
+
+
+
+
+def _normalise_difficulty(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    return lowered if lowered in DIFFICULTY_PROFILES else None
 
 
 @dataclass
@@ -100,7 +111,9 @@ class GuildSessionMetadata:
             default_theme=str(default_theme) if isinstance(default_theme, str) else None,
             last_theme=str(last_theme) if isinstance(last_theme, str) else None,
             last_seed=int(last_seed) if isinstance(last_seed, int) else None,
-            last_difficulty=str(last_difficulty) if isinstance(last_difficulty, str) else None,
+            last_difficulty=_normalise_difficulty(last_difficulty)
+            if isinstance(last_difficulty, str)
+            else None,
             last_name=str(last_name) if isinstance(last_name, str) else None,
             last_room_count=int(last_room_count)
             if isinstance(last_room_count, int)
@@ -144,7 +157,9 @@ class StoredDungeon:
             name=name,
             theme=theme,
             seed=int(seed) if isinstance(seed, int) else None,
-            difficulty=str(difficulty) if isinstance(difficulty, str) else None,
+            difficulty=_normalise_difficulty(difficulty)
+            if isinstance(difficulty, str)
+            else None,
             room_count=int(room_count) if isinstance(room_count, int) else None,
         )
 
@@ -274,7 +289,7 @@ class DungeonMetadataStore:
                 self._cache[key] = metadata
             metadata.last_theme = theme
             metadata.last_seed = seed if seed is None else int(seed)
-            metadata.last_difficulty = difficulty
+            metadata.last_difficulty = _normalise_difficulty(difficulty)
             metadata.last_name = name
             metadata.last_room_count = room_count if room_count is None else int(room_count)
             if name:
@@ -282,7 +297,7 @@ class DungeonMetadataStore:
                     name=name,
                     theme=theme,
                     seed=metadata.last_seed,
-                    difficulty=difficulty,
+                    difficulty=metadata.last_difficulty,
                     room_count=metadata.last_room_count,
                 )
                 metadata.upsert_dungeon(dungeon)

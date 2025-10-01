@@ -50,12 +50,13 @@ def test_dungeon_records_difficulty(arcane_theme: Theme) -> None:
     dungeon = generator.generate(room_count=2)
     assert dungeon.difficulty == "hard"
 
-    override = generator.generate(room_count=1, difficulty="easy")
-    assert override.difficulty == "easy"
+    for difficulty in DIFFICULTY_PROFILES:
+        override = generator.generate(room_count=1, difficulty=difficulty)
+        assert override.difficulty == difficulty
 
 
 def test_combat_scaling_by_difficulty(arcane_theme: Theme) -> None:
-    difficulties = ["easy", "standard", "hard", "deadly"]
+    difficulties = list(DIFFICULTY_PROFILES.keys())
     challenge_avgs: list[float] = []
 
     for diff in difficulties:
@@ -82,7 +83,7 @@ def test_combat_scaling_by_difficulty(arcane_theme: Theme) -> None:
 
 
 def test_trap_scaling_by_difficulty(arcane_theme: Theme) -> None:
-    difficulties = ["easy", "standard", "hard", "deadly"]
+    difficulties = list(DIFFICULTY_PROFILES.keys())
     average_counts: list[float] = []
     average_dcs: list[float] = []
 
@@ -109,7 +110,7 @@ def test_trap_scaling_by_difficulty(arcane_theme: Theme) -> None:
 
 
 def test_treasure_scaling_by_difficulty(arcane_theme: Theme) -> None:
-    difficulties = ["easy", "standard", "hard", "deadly"]
+    difficulties = list(DIFFICULTY_PROFILES.keys())
     average_counts: list[float] = []
     average_rarities: list[float] = []
 
