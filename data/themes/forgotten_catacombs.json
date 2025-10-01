@@ -25,9 +25,9 @@
     }
   ],
   "monsters": [
-    "skeletal_guardian",
+    "skeleton",
     "ghast",
-    "wight_captain"
+    "wight"
   ],
   "traps": [
     "falling_sarcophagus_lid",

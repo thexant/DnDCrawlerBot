@@ -1,0 +1,10 @@
+{
+  "name": "Wight",
+  "challenge": 3,
+  "armor_class": 14,
+  "hit_points": 45,
+  "attack_bonus": 4,
+  "damage": "1d8+2 + 2d6",
+  "ability_scores": {"STR": 15, "DEX": 14, "CON": 16},
+  "tags": ["undead", "martial"]
+}
