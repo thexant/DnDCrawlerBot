@@ -22,6 +22,7 @@ class GuildSessionMetadata:
     last_difficulty: str | None = None
     last_name: str | None = None
     last_room_count: int | None = None
+    delve_category_id: int | None = None
     dungeons: Dict[str, "StoredDungeon"] = field(default_factory=dict)
 
     def _resolve_dungeon_key(self, name: str) -> Optional[str]:
@@ -64,6 +65,8 @@ class GuildSessionMetadata:
             data["last_name"] = self.last_name
         if self.last_room_count is not None:
             data["last_room_count"] = self.last_room_count
+        if self.delve_category_id is not None:
+            data["delve_category_id"] = self.delve_category_id
         if self.dungeons:
             data["dungeons"] = {
                 name: dungeon.to_dict() for name, dungeon in self.dungeons.items()
@@ -78,6 +81,7 @@ class GuildSessionMetadata:
         last_difficulty = raw.get("last_difficulty")
         last_name = raw.get("last_name")
         last_room_count = raw.get("last_room_count")
+        delve_category_id = raw.get("delve_category_id")
         dungeons: Dict[str, StoredDungeon] = {}
         raw_dungeons = raw.get("dungeons")
         if isinstance(raw_dungeons, Mapping):
@@ -100,6 +104,9 @@ class GuildSessionMetadata:
             last_name=str(last_name) if isinstance(last_name, str) else None,
             last_room_count=int(last_room_count)
             if isinstance(last_room_count, int)
+            else None,
+            delve_category_id=int(delve_category_id)
+            if isinstance(delve_category_id, int)
             else None,
             dungeons=dungeons,
         )
@@ -209,6 +216,40 @@ class DungeonMetadataStore:
                 and metadata.last_difficulty is None
                 and metadata.last_name is None
                 and not metadata.dungeons
+                and metadata.delve_category_id is None
+            ):
+                del self._cache[key]
+            await self._persist()
+            return metadata
+
+    async def get_delve_category(self, guild_id: int) -> Optional[int]:
+        async with self._lock:
+            await self._ensure_loaded()
+            metadata = self._cache.get(str(guild_id))
+            return metadata.delve_category_id if metadata else None
+
+    async def set_delve_category(
+        self, guild_id: int, category_id: Optional[int]
+    ) -> GuildSessionMetadata:
+        async with self._lock:
+            await self._ensure_loaded()
+            key = str(guild_id)
+            metadata = self._cache.get(key)
+            if metadata is None:
+                metadata = GuildSessionMetadata(guild_id=guild_id)
+                self._cache[key] = metadata
+            metadata.delve_category_id = (
+                int(category_id) if category_id is not None else None
+            )
+            if (
+                metadata.default_theme is None
+                and metadata.last_theme is None
+                and metadata.last_seed is None
+                and metadata.last_difficulty is None
+                and metadata.last_name is None
+                and metadata.last_room_count is None
+                and not metadata.dungeons
+                and metadata.delve_category_id is None
             ):
                 del self._cache[key]
             await self._persist()
@@ -261,6 +302,7 @@ class DungeonMetadataStore:
             metadata.last_difficulty = None
             metadata.last_name = None
             metadata.last_room_count = None
+            metadata.delve_category_id = None
             metadata.dungeons.clear()
             del self._cache[key]
             await self._persist()
@@ -302,6 +344,7 @@ class DungeonMetadataStore:
                 and metadata.last_name is None
                 and metadata.last_room_count is None
                 and not metadata.dungeons
+                and metadata.delve_category_id is None
             ):
                 del self._cache[key]
             await self._persist()

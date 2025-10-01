@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+import secrets
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, Iterable, List, Literal, Optional
@@ -14,6 +15,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from dnd.combat import attack_roll, saving_throw
+from dnd.repository import CharacterRepository
 from dnd.content import ContentLibrary, ContentLoadError
 from dnd.dungeon import Dungeon, DungeonGenerator, Room, Theme, ThemeRegistry
 from dnd.dungeon.state import DungeonMetadataStore, StoredDungeon
@@ -320,6 +322,7 @@ class DungeonCog(commands.Cog):
         self._guild_theme_cache: Dict[int, Optional[str]] = {}
         metadata_path = self.data_path / "sessions" / "metadata.json"
         self.metadata_store = DungeonMetadataStore(metadata_path)
+        self.characters = CharacterRepository(Path("data") / "characters.json")
         self._load_content(silent=True)
 
     def cog_unload(self) -> None:  # noqa: D401 - discord.py hook
@@ -356,6 +359,33 @@ class DungeonCog(commands.Cog):
         base = f"delve-{slug}"
         return base[:95]
 
+    def _compose_party_channel_name(self, base_name: str, suffix: str) -> str:
+        suffix = suffix.lower()
+        if not suffix:
+            return base_name[:95]
+        max_length = 95
+        trimmed_base = base_name
+        extra_length = len(suffix) + 1
+        if len(trimmed_base) + extra_length > max_length:
+            allowed = max_length - extra_length
+            if allowed <= 0:
+                trimmed_base = "delve"
+            else:
+                trimmed_base = trimmed_base[:allowed].rstrip("-") or "delve"
+        return f"{trimmed_base}-{suffix}"
+
+    async def _preferred_delve_category(
+        self, guild: discord.Guild
+    ) -> Optional[discord.CategoryChannel]:
+        category_id = await self.metadata_store.get_delve_category(guild.id)
+        if category_id is None:
+            return None
+        category = guild.get_channel(category_id)
+        if isinstance(category, discord.CategoryChannel):
+            return category
+        await self.metadata_store.set_delve_category(guild.id, None)
+        return None
+
     async def _ensure_party_channel(
         self, guild: discord.Guild, *, dungeon_name: str
     ) -> discord.TextChannel:
@@ -375,35 +405,150 @@ class DungeonCog(commands.Cog):
             channel_id for guild_id, channel_id in active_keys if guild_id == guild.id
         }
 
-        candidates = [base_name]
-        for index in range(2, 11):
-            candidates.append(f"{base_name}-{index}")
-
-        for name in candidates:
-            channel = discord.utils.get(guild.text_channels, name=name)
-            if channel and channel.id not in active_channels:
+        prefix = base_name
+        for channel in guild.text_channels:
+            if channel.id in active_channels:
+                continue
+            if channel.name == prefix or channel.name.startswith(f"{prefix}-"):
                 if isinstance(channel, discord.TextChannel):
                     return channel
 
         topic = f"Dungeon party channel for {dungeon_name}"[:1024]
-        for name in candidates:
-            if discord.utils.get(guild.text_channels, name=name):
+        existing_names = {channel.name for channel in guild.text_channels}
+        category = await self._preferred_delve_category(guild)
+        for _ in range(20):
+            suffix = secrets.token_hex(2)
+            name = self._compose_party_channel_name(prefix, suffix)
+            if name in existing_names:
                 continue
             try:
                 channel = await guild.create_text_channel(
                     name,
                     topic=topic,
+                    category=category,
                     reason="Dungeon party channel created for a delve",
                 )
             except discord.Forbidden:
                 raise
             except discord.HTTPException as exc:
-                log.warning("Failed to create party channel %s in %s: %s", name, guild, exc)
+                log.warning(
+                    "Failed to create party channel %s in %s: %s", name, guild, exc
+                )
                 continue
             else:
+                existing_names.add(name)
                 return channel
 
         raise RuntimeError("Unable to provision a party channel")
+
+    async def _sync_party_channel_access(self, session: DungeonSession) -> None:
+        if session.guild_id is None:
+            return
+        guild = self.bot.get_guild(session.guild_id)
+        if guild is None:
+            return
+        channel = guild.get_channel(session.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        default_role = guild.default_role
+        overwrites = channel.overwrites_for(default_role)
+        if overwrites.view_channel is not False:
+            try:
+                await channel.set_permissions(default_role, view_channel=False)
+            except (discord.HTTPException, discord.Forbidden):
+                log.debug("Failed to restrict default role access in %s", channel)
+
+        allowed_ids = set(session.party_ids)
+        for member_id in allowed_ids:
+            member = guild.get_member(member_id)
+            if member is None:
+                continue
+            overwrite = channel.overwrites.get(member)
+            if (
+                overwrite is not None
+                and overwrite.view_channel is True
+                and overwrite.send_messages is True
+                and overwrite.read_message_history is True
+            ):
+                continue
+            permission = discord.PermissionOverwrite()
+            permission.view_channel = True
+            permission.send_messages = True
+            permission.read_message_history = True
+            try:
+                await channel.set_permissions(member, overwrite=permission)
+            except (discord.HTTPException, discord.Forbidden):
+                log.debug("Failed to grant party access to %s in %s", member, channel)
+
+        for target, _ in list(channel.overwrites.items()):
+            if not isinstance(target, discord.Member):
+                continue
+            if target.id in allowed_ids:
+                continue
+            if target.guild_permissions.manage_channels:
+                continue
+            try:
+                await channel.set_permissions(target, overwrite=None)
+            except (discord.HTTPException, discord.Forbidden):
+                log.debug("Failed to revoke party access from %s in %s", target, channel)
+
+    async def _clear_party_channel_access(self, session: DungeonSession) -> None:
+        if session.guild_id is None:
+            return
+        guild = self.bot.get_guild(session.guild_id)
+        if guild is None:
+            return
+        channel = guild.get_channel(session.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        default_role = guild.default_role
+        overwrites = channel.overwrites_for(default_role)
+        if overwrites.view_channel is not False:
+            try:
+                await channel.set_permissions(default_role, view_channel=False)
+            except (discord.HTTPException, discord.Forbidden):
+                log.debug("Failed to restrict default role access in %s", channel)
+
+        for target in list(channel.overwrites):
+            if not isinstance(target, discord.Member):
+                continue
+            if target.guild_permissions.manage_channels:
+                continue
+            try:
+                await channel.set_permissions(target, overwrite=None)
+            except (discord.HTTPException, discord.Forbidden):
+                log.debug("Failed to clear party access for %s in %s", target, channel)
+
+    async def _ensure_character_available(
+        self, interaction: discord.Interaction
+    ) -> bool:
+        if interaction.guild_id is None:
+            await self._send_ephemeral_message(
+                interaction,
+                "Dungeon expeditions can only be joined from within a server.",
+            )
+            return False
+        try:
+            has_character = await self.characters.exists(
+                interaction.guild_id, interaction.user.id
+            )
+        except Exception:
+            has_character = False
+        if not has_character:
+            await self._send_ephemeral_message(
+                interaction,
+                "You need a character before venturing forth. Visit the tavern and run /character create first.",
+            )
+            return False
+        return True
+
+    async def _handle_party_membership_change(
+        self, guild_id: int, session: DungeonSession
+    ) -> None:
+        await self._update_tavern_access(guild_id)
+        await self._sync_party_channel_access(session)
 
     def _get_tavern_cog(self) -> Optional["Tavern"]:
         cog = self.bot.get_cog("Tavern")
@@ -877,6 +1022,9 @@ class DungeonCog(commands.Cog):
             )
             return False
 
+        if not await self._ensure_character_available(interaction):
+            return False
+
         try:
             party_channel = await self._ensure_party_channel(guild, dungeon_name=stored.name)
         except discord.Forbidden:
@@ -940,12 +1088,16 @@ class DungeonCog(commands.Cog):
         session.party_ids.add(interaction.user.id)
         await self.sessions.set(key, session)
 
+        await self._sync_party_channel_access(session)
+
         embed = self._build_room_embed(interaction, session)
         view = self._build_navigation_view(session)
         try:
             message = await party_channel.send(embed=embed, view=view)
         except discord.HTTPException as exc:
-            await self.sessions.pop(key)
+            removed = await self.sessions.pop(key)
+            if removed is not None:
+                await self._clear_party_channel_access(removed)
             await self._send_ephemeral_message(
                 interaction,
                 f"I couldn't start the expedition in {party_channel.mention}: {exc}.",
@@ -1100,6 +1252,7 @@ class DungeonCog(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True)
+        await self._clear_party_channel_access(session)
         if session.message_id is not None:
             try:
                 await interaction.followup.edit_message(message_id=session.message_id, view=None)
@@ -1224,6 +1377,69 @@ class DungeonCog(commands.Cog):
             ephemeral=True,
         )
 
+    @dungeon_group.command(
+        name="category",
+        description="Configure the category where delve channels are created.",
+    )
+    @app_commands.describe(
+        category="Category for new delve channels",
+        clear="Clear the configured category",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def configure_category(
+        self,
+        interaction: discord.Interaction,
+        category: Optional[discord.CategoryChannel] = None,
+        clear: bool = False,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Delve categories can only be managed from within a guild.",
+                ephemeral=True,
+            )
+            return
+
+        if clear:
+            await self.metadata_store.set_delve_category(interaction.guild_id, None)
+            await interaction.response.send_message(
+                "Cleared the configured delve category.",
+                ephemeral=True,
+            )
+            return
+
+        if category is None:
+            await interaction.response.send_message(
+                "Please choose a category or enable the clear option.",
+                ephemeral=True,
+            )
+            return
+
+        if category.guild.id != interaction.guild_id:
+            await interaction.response.send_message(
+                "Please select a category from this server.",
+                ephemeral=True,
+            )
+            return
+
+        me = interaction.guild.me
+        if me is not None:
+            permissions = category.permissions_for(me)
+            if not permissions.manage_channels:
+                await interaction.response.send_message(
+                    (
+                        f"I cannot create channels in {category.name}. "
+                        "Grant me Manage Channels permission for that category or choose another."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+        await self.metadata_store.set_delve_category(interaction.guild_id, category.id)
+        await interaction.response.send_message(
+            f"New delve channels will be created under {category.name}.",
+            ephemeral=True,
+        )
+
     # ---- Interaction handlers -------------------------------------------
     async def handle_exit(self, interaction: discord.Interaction, exit_key: str) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
@@ -1238,6 +1454,10 @@ class DungeonCog(commands.Cog):
                 ephemeral=True,
             )
             return
+
+        if interaction.user.id not in session.party_ids:
+            if not await self._ensure_character_available(interaction):
+                return
 
         await interaction.response.defer()
         moved = False
@@ -1306,7 +1526,7 @@ class DungeonCog(commands.Cog):
             return
 
         if added_member and interaction.guild_id is not None:
-            await self._update_tavern_access(interaction.guild_id)
+            await self._handle_party_membership_change(interaction.guild_id, session)
 
         if not moved:
             await interaction.followup.send(
@@ -1331,6 +1551,13 @@ class DungeonCog(commands.Cog):
 
     async def handle_search(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
+        current_session = await self.sessions.get(key)
+        if current_session is None:
+            await interaction.response.send_message("No active dungeon to search.", ephemeral=True)
+            return
+        if interaction.user.id not in current_session.party_ids:
+            if not await self._ensure_character_available(interaction):
+                return
         added_member = False
 
         def mutate(run: DungeonSession) -> None:
@@ -1347,7 +1574,7 @@ class DungeonCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         await self._refresh_session_message(interaction, session)
         if added_member and interaction.guild_id is not None:
-            await self._update_tavern_access(interaction.guild_id)
+            await self._handle_party_membership_change(interaction.guild_id, session)
         loot = session.room.encounter.loot
         if not loot:
             await interaction.followup.send(
@@ -1364,6 +1591,13 @@ class DungeonCog(commands.Cog):
 
     async def handle_disarm(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
+        current_session = await self.sessions.get(key)
+        if current_session is None:
+            await interaction.response.send_message("No traps challenge the party right now.", ephemeral=True)
+            return
+        if interaction.user.id not in current_session.party_ids:
+            if not await self._ensure_character_available(interaction):
+                return
         added_member = False
 
         def mutate(run: DungeonSession) -> None:
@@ -1380,7 +1614,7 @@ class DungeonCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         await self._refresh_session_message(interaction, session)
         if added_member and interaction.guild_id is not None:
-            await self._update_tavern_access(interaction.guild_id)
+            await self._handle_party_membership_change(interaction.guild_id, session)
         traps = session.room.encounter.traps
         if not traps:
             await interaction.followup.send(
@@ -1408,10 +1642,18 @@ class DungeonCog(commands.Cog):
 
     async def handle_engage(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
+        current_session = await self.sessions.get(key)
+        if current_session is None:
+            await interaction.response.send_message("No foes stand before the party right now.", ephemeral=True)
+            return
         added_member = False
         started_combat = False
         combat_in_progress = False
         no_targets = False
+
+        if interaction.user.id not in current_session.party_ids:
+            if not await self._ensure_character_available(interaction):
+                return
 
         def mutate(run: DungeonSession) -> None:
             nonlocal added_member, started_combat, combat_in_progress, no_targets
@@ -1436,7 +1678,7 @@ class DungeonCog(commands.Cog):
             return
 
         if added_member and interaction.guild_id is not None:
-            await self._update_tavern_access(interaction.guild_id)
+            await self._handle_party_membership_change(interaction.guild_id, session)
 
         if no_targets:
             await self._send_ephemeral_message(
@@ -1488,9 +1730,20 @@ class DungeonCog(commands.Cog):
         self, interaction: discord.Interaction, action: Literal["attack", "defend", "end"]
     ) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
+        current_session = await self.sessions.get(key)
+        if current_session is None:
+            await self._send_ephemeral_message(
+                interaction,
+                "No active dungeon for this party.",
+            )
+            return
         added_member = False
         error: Optional[str] = None
         summary: Optional[str] = None
+
+        if interaction.user.id not in current_session.party_ids:
+            if not await self._ensure_character_available(interaction):
+                return
 
         def mutate(run: DungeonSession) -> None:
             nonlocal added_member, error, summary
@@ -1540,7 +1793,7 @@ class DungeonCog(commands.Cog):
             return
 
         if added_member and interaction.guild_id is not None:
-            await self._update_tavern_access(interaction.guild_id)
+            await self._handle_party_membership_change(interaction.guild_id, session)
 
         if error is not None:
             await self._send_ephemeral_message(interaction, error)
