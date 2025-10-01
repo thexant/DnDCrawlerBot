@@ -1,0 +1,46 @@
+[
+  {
+    "key": "ghast",
+    "name": "Ghast",
+    "challenge": 3,
+    "armor_class": 12,
+    "hit_points": 36,
+    "attack_bonus": 5,
+    "damage": "2d6+3",
+    "ability_scores": {"STR": 16, "DEX": 17, "CON": 13},
+    "tags": ["undead", "brute"]
+  },
+  {
+    "key": "skeleton",
+    "name": "Skeleton",
+    "challenge": 0.25,
+    "armor_class": 13,
+    "hit_points": 13,
+    "attack_bonus": 4,
+    "damage": "1d6+2",
+    "ability_scores": {"STR": 10, "DEX": 14, "CON": 15},
+    "tags": ["undead", "minion"]
+  },
+  {
+    "key": "specter",
+    "name": "Specter",
+    "challenge": 1,
+    "armor_class": 12,
+    "hit_points": 22,
+    "attack_bonus": 4,
+    "damage": "3d6",
+    "ability_scores": {"STR": 1, "DEX": 14, "CON": 11},
+    "tags": ["undead", "incorporeal"]
+  },
+  {
+    "key": "wight",
+    "name": "Wight",
+    "challenge": 3,
+    "armor_class": 14,
+    "hit_points": 45,
+    "attack_bonus": 4,
+    "damage": "1d8+2 + 2d6",
+    "ability_scores": {"STR": 15, "DEX": 14, "CON": 16},
+    "tags": ["undead", "martial"]
+  }
+]

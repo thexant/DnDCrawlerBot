@@ -1,7 +1,0 @@
-{
-  "name": "Necrotic Miasma",
-  "description": "A swirling cloud of necrotic energy drains warmth and hope.",
-  "saving_throw": {"ability": "CON", "dc": 14},
-  "damage": "3d6 necrotic",
-  "tags": ["necrotic", "hazard"]
-}

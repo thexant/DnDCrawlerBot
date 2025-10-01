@@ -6,41 +6,47 @@ The bot loads encounter content from structured files under the top level `data/
 
 | Folder | Description |
 | ------ | ----------- |
-| `data/monsters/` | Individual creature stat blocks. |
-| `data/traps/` | Trap descriptions including saving throw details. |
+| `data/monsters/` | Creature stat blocks grouped by theme (for example `constructs.json`). |
+| `data/traps/` | Trap descriptions grouped by style (for example `arcane.json`). |
 | `data/items/` | Lootable items and treasures. |
 | `data/themes/` | Dungeon theme definitions that reference the other registries. |
 | `data/sessions/metadata.json` | Automatically managed guild session metadata (default theme, most recent run). |
 
 ## Schemas
 
-Each file defines a single entry. The loader uses the file name as the default identifier; you may optionally provide an explicit `id`, `key`, or `slug` field.
+Files may define a single entry or a list of entries. When working with grouped files it is recommended to provide an explicit `id`, `key`, or `slug` field for each entry to keep identifiers predictable.
 
 ### Monsters (`data/monsters/`)
 
 ```json
-{
-  "name": "Ghast",
-  "challenge": 3,
-  "armor_class": 12,
-  "hit_points": 36,
-  "attack_bonus": 5,
-  "damage": "2d6+3",
-  "ability_scores": {"STR": 16, "DEX": 17, "CON": 13},
-  "tags": ["undead", "brute"]
-}
+[
+  {
+    "key": "ghast",
+    "name": "Ghast",
+    "challenge": 3,
+    "armor_class": 12,
+    "hit_points": 36,
+    "attack_bonus": 5,
+    "damage": "2d6+3",
+    "ability_scores": {"STR": 16, "DEX": 17, "CON": 13},
+    "tags": ["undead", "brute"]
+  }
+]
 ```
 
 ### Traps (`data/traps/`)
 
 ```json
-{
-  "name": "Necrotic Miasma",
-  "description": "A swirling cloud of necrotic energy drains warmth and hope.",
-  "saving_throw": {"ability": "CON", "dc": 14},
-  "damage": "3d6 necrotic",
-  "tags": ["necrotic", "hazard"]
-}
+[
+  {
+    "key": "necrotic_miasma",
+    "name": "Necrotic Miasma",
+    "description": "A swirling cloud of necrotic energy drains warmth and hope.",
+    "saving_throw": {"ability": "CON", "dc": 14},
+    "damage": "3d6 necrotic",
+    "tags": ["necrotic", "hazard"]
+  }
+]
 ```
 
 ### Items (`data/items/`)
