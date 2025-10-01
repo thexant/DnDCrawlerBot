@@ -22,19 +22,6 @@ from dnd import (
 )
 from dnd.characters import EquipmentChoice, EquipmentChoiceOption, SkillSelection
 
-LANGUAGE_OPTIONS: tuple[str, ...] = (
-    "Common",
-    "Dwarvish",
-    "Elvish",
-    "Giant",
-    "Gnomish",
-    "Goblin",
-    "Halfling",
-    "Orc",
-    "Draconic",
-)
-
-
 class CreationStateError(ValueError):
     """Raised when invalid state transitions occur during creation."""
 
@@ -51,7 +38,6 @@ class CreationState:
     class_key: str | None = None
     class_skill_choices: tuple[str, ...] = field(default_factory=tuple)
     background_key: str | None = None
-    background_languages: tuple[str, ...] = field(default_factory=tuple)
     equipment_choices: Dict[str, tuple[str, ...]] = field(default_factory=dict)
     racial_bonuses: Dict[str, int] = field(default_factory=dict)
 
@@ -129,30 +115,11 @@ class CreationState:
             raise CreationStateError("Invalid skill selection for class")
         self.class_skill_choices = cleaned
 
-    def set_background(self, background_key: str, *, languages: Sequence[str] | None = None) -> None:
+    def set_background(self, background_key: str) -> None:
         key = background_key.lower()
         if key not in AVAILABLE_BACKGROUNDS:
             raise CreationStateError("Unknown background selection")
-        background = AVAILABLE_BACKGROUNDS[key]
-        validated = self._validate_languages(
-            languages or self.background_languages,
-            background.language_choices,
-            label=f"background {background.name}",
-            allow_empty=True,
-        )
         self.background_key = key
-        self.background_languages = validated
-
-    def set_background_languages(self, languages: Sequence[str]) -> None:
-        if not self.background_key:
-            raise CreationStateError("Select a background before choosing languages")
-        background = AVAILABLE_BACKGROUNDS[self.background_key]
-        validated = self._validate_languages(
-            languages,
-            background.language_choices,
-            label=f"background {background.name}",
-        )
-        self.background_languages = validated
 
     def set_equipment_choice(self, choice_key: str, option_keys: Sequence[str]) -> None:
         if not self.class_key:
@@ -178,35 +145,6 @@ class CreationState:
                 return choice
         raise CreationStateError("Unknown equipment choice")
 
-    # -- validation helpers -------------------------------------------------
-    def _validate_languages(
-        self,
-        languages: Sequence[str] | None,
-        required: int,
-        *,
-        label: str,
-        allow_empty: bool = False,
-    ) -> tuple[str, ...]:
-        if required == 0:
-            return tuple()
-        if languages is None:
-            if allow_empty:
-                return tuple()
-            raise CreationStateError(f"Provide {required} language choice{'s' if required != 1 else ''} for {label}")
-        cleaned = tuple(dict.fromkeys(lang.strip().title() for lang in languages if lang.strip()))
-        if len(cleaned) != required:
-            if allow_empty and not cleaned:
-                return tuple()
-            raise CreationStateError(
-                f"Select exactly {required} language choice{'s' if required != 1 else ''} for {label}"
-            )
-        invalid = [language for language in cleaned if language not in LANGUAGE_OPTIONS]
-        if invalid:
-            raise CreationStateError(
-                "Unsupported language selections: " + ", ".join(sorted(set(invalid)))
-            )
-        return cleaned
-
     # -- step helpers -------------------------------------------------------
     def needs_ability_scores(self) -> bool:
         return self.base_scores is None
@@ -226,12 +164,6 @@ class CreationState:
     def needs_background(self) -> bool:
         return self.background_key is None
 
-    def needs_background_languages(self) -> bool:
-        if not self.background_key:
-            return False
-        background = AVAILABLE_BACKGROUNDS[self.background_key]
-        return background.language_choices > 0 and len(self.background_languages) != background.language_choices
-
     def needs_equipment(self) -> bool:
         if not self.class_key:
             return False
@@ -250,7 +182,7 @@ class CreationState:
             return 2
         if self.needs_class() or self.needs_class_skills():
             return 3
-        if self.needs_background() or self.needs_background_languages():
+        if self.needs_background():
             return 4
         if self.needs_equipment():
             return 5
@@ -353,36 +285,6 @@ class CreationState:
             if option.key == key:
                 return option
         raise CreationStateError("Unknown equipment option")
-
-
-class LanguageSelectionModal(discord.ui.Modal):
-    def __init__(self, view: "CharacterCreationView", *, required: int) -> None:
-        super().__init__(title="Select Background Languages", timeout=None)
-        self.creation_view = view
-        placeholder = (
-            f"Enter {required} language name{'s' if required != 1 else ''} separated by commas."
-            if required
-            else "No languages required."
-        )
-        self.input = discord.ui.TextInput(
-            label="Languages",
-            style=discord.TextStyle.long,
-            placeholder=placeholder,
-            required=required > 0,
-            default=", ".join(view.get_languages("background")),
-        )
-        self.add_item(self.input)
-        self.required = required
-
-    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
-        raw_value = self.input.value or ""
-        languages = [lang.strip() for lang in raw_value.split(",") if lang.strip()]
-        try:
-            self.creation_view.state.set_background_languages(languages)
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return
-        await self.creation_view.refresh(interaction)
 
 
 class SkillSelectionView(discord.ui.View):
@@ -633,30 +535,6 @@ class CharacterCreationView(discord.ui.View):
         background_select.disabled = step < 4
         self.add_item(background_select)
 
-        if self.state.background_key:
-            background = AVAILABLE_BACKGROUNDS[self.state.background_key]
-            if background.language_choices > 0:
-                background_lang_button = discord.ui.Button(
-                    label=(
-                        f"Select Background Languages "
-                        f"({len(self.state.background_languages)}/{background.language_choices})"
-                    ),
-                    style=discord.ButtonStyle.secondary,
-                    row=0,
-                )
-
-                async def background_lang_callback(interaction: discord.Interaction) -> None:
-                    await interaction.response.send_modal(
-                        LanguageSelectionModal(
-                            self,
-                            required=background.language_choices,
-                        )
-                    )
-
-                background_lang_button.callback = background_lang_callback  # type: ignore[assignment]
-                background_lang_button.disabled = step < 4
-                self.add_item(background_lang_button)
-
         # Equipment selection
         if self.state.class_key:
             character_class = AVAILABLE_CLASSES[self.state.class_key]
@@ -761,7 +639,7 @@ class CharacterCreationView(discord.ui.View):
             1: "Step 1: Roll your ability scores until you're happy with the results.",
             2: "Step 2: Select a race.",
             3: "Step 3: Select a class and choose the required skill proficiencies.",
-            4: "Step 4: Choose a background and any additional languages it grants.",
+            4: "Step 4: Choose a background.",
             5: "Step 5: Pick your starting equipment options.",
             6: "Review your selections and confirm to save your character.",
         }
@@ -802,20 +680,11 @@ class CharacterCreationView(discord.ui.View):
         if not self.state.background_key:
             return "Not selected"
         background = AVAILABLE_BACKGROUNDS[self.state.background_key]
-        languages = ", ".join(self.state.background_languages) or "None"
         return (
             f"{background.name}\n"
             f"Skills: {', '.join(background.skill_proficiencies) or 'None'}\n"
-            f"Tools: {', '.join(background.tool_proficiencies) or 'None'}\n"
-            f"Languages: {languages}"
+            f"Tools: {', '.join(background.tool_proficiencies) or 'None'}"
         )
-
-    def get_languages(self, source: str) -> Sequence[str]:
-        if source == "race":
-            return self.state.race_languages
-        if source == "background":
-            return self.state.background_languages
-        return ()
 
     async def handle_confirm(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:

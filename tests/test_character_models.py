@@ -34,7 +34,6 @@ def test_character_serialization_round_trip() -> None:
     state.set_class_skills(["Athletics", "Perception"])
     state.set_equipment_choice("fighter_weapon", ["fighter_defense"])
     state.set_background("acolyte")
-    state.set_background_languages(["Giant", "Gnomish"])
     assert state.current_step() == 6
     assert state.is_ready()
 
@@ -64,6 +63,5 @@ def test_creation_state_validations() -> None:
     state.set_class_skills(["Arcana", "History"])
     state.set_equipment_choice("wizard_focus", ["wizard_component"])
     state.set_background("soldier")
-    assert state.needs_background_languages() is False
     assert state.needs_equipment() is False
     assert state.current_step() == 6
