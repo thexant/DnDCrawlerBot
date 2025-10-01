@@ -24,7 +24,6 @@ from dnd.characters import EquipmentChoice, EquipmentChoiceOption, SkillSelectio
 
 LANGUAGE_OPTIONS: tuple[str, ...] = (
     "Common",
-    "Human",
     "Dwarvish",
     "Elvish",
     "Giant",
