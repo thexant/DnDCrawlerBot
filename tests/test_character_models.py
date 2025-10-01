@@ -48,6 +48,8 @@ def test_character_serialization_round_trip() -> None:
     assert any("Class Fighter: Skill - Athletics" in entry for entry in restored.proficiencies)
     assert any("Background Acolyte: Skill - Insight" in entry for entry in restored.proficiencies)
     assert restored.equipment
+    assert restored.inventory == restored.equipment
+    assert restored.gold_coins == 0
 
 
 def test_creation_state_validations() -> None:

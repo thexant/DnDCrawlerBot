@@ -42,7 +42,15 @@ from .dungeon import (
     TrapDefinition,
 )
 from .repository import CharacterRepository
-from .tavern import TavernConfig, TavernConfigStore
+from .tavern import (
+    InsufficientFunds,
+    ItemNotCarried,
+    ShopItem,
+    ShopError,
+    TavernConfig,
+    TavernConfigStore,
+    TavernShop,
+)
 
 __all__ = [
     "ABILITY_NAMES",
@@ -83,4 +91,9 @@ __all__ = [
     "TrapDefinition",
     "TavernConfig",
     "TavernConfigStore",
+    "TavernShop",
+    "ShopItem",
+    "ShopError",
+    "InsufficientFunds",
+    "ItemNotCarried",
 ]

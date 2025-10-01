@@ -305,7 +305,7 @@ class CreationState:
             ability_scores=self.ability_scores,
             racial_bonuses=dict(self.racial_bonuses),
             proficiencies=tuple(proficiencies),
-            equipment=tuple(equipment),
+            inventory=tuple(equipment),
             name=name,
         )
 
