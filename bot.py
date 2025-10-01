@@ -56,6 +56,8 @@ class SlashCommandBot(commands.Bot):
     async def setup_hook(self) -> None:  # type: ignore[override]
         await load_cogs(self, self._cogs_path)
         logging.info("All cogs loaded")
+        synced_commands = await self.tree.sync()
+        logging.info("Synced %s application commands", len(synced_commands))
 
     def add_command(  # type: ignore[override]
         self, command: commands.Command, *args, **kwargs
