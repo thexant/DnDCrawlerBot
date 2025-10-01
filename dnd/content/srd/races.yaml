@@ -1,0 +1,72 @@
+- key: human
+  name: Human
+  description: Adaptable folk found throughout the realms.
+  ability_bonuses:
+    STR: 1
+    DEX: 1
+    CON: 1
+    INT: 1
+    WIS: 1
+    CHA: 1
+  speed: 30
+  proficiencies: []
+  languages:
+    fixed:
+      - Common
+    choices: 1
+  traits:
+    - level: 1
+      name: Extra Language
+      description: You gain one additional language of your choice.
+- key: elf
+  name: High Elf
+  description: Graceful spellcasters with keen senses.
+  ability_bonuses:
+    DEX: 2
+    INT: 1
+  speed: 30
+  proficiencies:
+    - category: weapon
+      name: Longsword
+    - category: weapon
+      name: Shortsword
+    - category: weapon
+      name: Shortbow
+    - category: weapon
+      name: Longbow
+    - category: skill
+      name: Perception
+  languages:
+    fixed:
+      - Common
+      - Elvish
+    choices: 0
+  traits:
+    - level: 1
+      name: Trance
+      description: Elves meditate instead of sleeping.
+- key: dwarf
+  name: Hill Dwarf
+  description: Stout and hardy folk of the mountains.
+  ability_bonuses:
+    CON: 2
+    WIS: 1
+  speed: 25
+  proficiencies:
+    - category: weapon
+      name: Battleaxe
+    - category: weapon
+      name: Handaxe
+    - category: weapon
+      name: Light Hammer
+    - category: weapon
+      name: Warhammer
+  languages:
+    fixed:
+      - Common
+      - Dwarvish
+    choices: 0
+  traits:
+    - level: 1
+      name: Dwarven Toughness
+      description: Your hit point maximum increases by 1, and increases by 1 every time you gain a level.

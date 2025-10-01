@@ -1,0 +1,25 @@
+- key: acolyte
+  name: Acolyte
+  skill_proficiencies:
+    - Insight
+    - Religion
+  tool_proficiencies: []
+  language_choices: 2
+  equipment:
+    - holy_symbol
+    - explorers_pack
+  description: You spent your life in service to a temple.
+- key: soldier
+  name: Soldier
+  skill_proficiencies:
+    - Athletics
+    - Intimidation
+  tool_proficiencies:
+    - Gaming set (choice)
+    - Vehicles (land)
+  language_choices: 0
+  equipment:
+    - insignia_of_rank
+    - trophy_of_war
+    - dungeoneers_pack
+  description: You served in a militia or army.
