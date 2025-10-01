@@ -2774,8 +2774,8 @@ class DungeonCog(commands.Cog):
 
         embed.add_field(name="Party", value=self._party_display(interaction, session), inline=False)
 
-        combat = session.combat_state
         if room.encounter.monsters or session.stealthed:
+            combat = session.combat_state
             if combat and combat.active:
                 status_text = "Spotted — combat is underway."
             elif session.stealthed:
@@ -2783,50 +2783,6 @@ class DungeonCog(commands.Cog):
             else:
                 status_text = "Spotted — nearby creatures are aware of the party."
             embed.add_field(name="Stealth Status", value=status_text, inline=False)
-
-        if combat is not None:
-            initiative_lines: list[str] = []
-            for index, combatant in enumerate(combat.order):
-                if combatant.defeated:
-                    status = "Defeated"
-                else:
-                    status_parts: List[str] = [f"{combatant.current_hp}/{combatant.max_hp} HP"]
-                    if combatant.conditions:
-                        status_parts.append(
-                            "Conditions: " + ", ".join(sorted(combatant.conditions))
-                        )
-                    if combatant.concentration:
-                        status_parts.append(f"Concentration: {combatant.concentration}")
-                    if combatant.death_save_successes or combatant.death_save_failures:
-                        status_parts.append(
-                            "Death Saves "
-                            f"S{combatant.death_save_successes}/F{combatant.death_save_failures}"
-                        )
-                    resource_text = self._summarise_combatant_resources(combatant)
-                    if resource_text:
-                        status_parts.append(resource_text)
-                    status = " | ".join(status_parts)
-                turn_marker = "➡️ " if combat.active and index == combat.turn_index and not combatant.defeated else ""
-                initiative_lines.append(
-                    f"{turn_marker}{combatant.name} — Init {combatant.initiative_total} "
-                    f"(Roll {combatant.initiative_roll}) — {status}"
-                )
-            if initiative_lines:
-                embed.add_field(name="Initiative Order", value="\n".join(initiative_lines), inline=False)
-            current = combat.current_combatant()
-            if combat.active and current is not None and not current.defeated:
-                turn_text = f"Round {combat.round_number}: {current.name} is acting."
-            elif combat.active:
-                turn_text = f"Round {combat.round_number}: resolving initiative..."
-            else:
-                turn_text = "Combat has concluded."
-            embed.add_field(name="Current Turn", value=turn_text, inline=False)
-            if combat.log:
-                log_entries = combat.log[-MAX_COMBAT_LOG_ENTRIES:]
-                while log_entries and len("\n".join(log_entries)) > 1024:
-                    log_entries = log_entries[1:]
-                log_text = "\n".join(log_entries) if log_entries else "(log truncated)"
-                embed.add_field(name="Combat Log", value=log_text or "No events yet.", inline=False)
 
         exit_lines: list[str] = []
         visited_rooms = set(session.breadcrumbs)
@@ -2869,6 +2825,7 @@ class DungeonCog(commands.Cog):
             if path_lines:
                 embed.add_field(name="Path Taken", value="\n".join(path_lines), inline=False)
 
+        combat = session.combat_state
         actions: list[str]
         if combat and combat.active:
             actions = ["Stand your ground and resolve the battle using the combat controls."]
@@ -2897,6 +2854,75 @@ class DungeonCog(commands.Cog):
         embed.set_footer(text=" • ".join(footer_parts))
         return embed
 
+    def _build_combat_embed(self, session: DungeonSession) -> Optional[discord.Embed]:
+        combat = session.combat_state
+        if combat is None or not combat.active:
+            return None
+
+        room = session.room
+        description = room.encounter.summary or "A pitched battle erupts!"
+        embed = discord.Embed(
+            title=f"Combat — Room {room.id + 1}",
+            description=description,
+            color=discord.Color.dark_red(),
+        )
+
+        initiative_lines: list[str] = []
+        for index, combatant in enumerate(combat.order):
+            if combatant.defeated:
+                status = "Defeated"
+            else:
+                status_parts: List[str] = [f"{combatant.current_hp}/{combatant.max_hp} HP"]
+                if combatant.conditions:
+                    status_parts.append(
+                        "Conditions: " + ", ".join(sorted(combatant.conditions))
+                    )
+                if combatant.concentration:
+                    status_parts.append(f"Concentration: {combatant.concentration}")
+                if combatant.death_save_successes or combatant.death_save_failures:
+                    status_parts.append(
+                        "Death Saves "
+                        f"S{combatant.death_save_successes}/F{combatant.death_save_failures}"
+                    )
+                resource_text = self._summarise_combatant_resources(combatant)
+                if resource_text:
+                    status_parts.append(resource_text)
+                status = " | ".join(status_parts)
+            turn_marker = "➡️ " if index == combat.turn_index and not combatant.defeated else ""
+            initiative_lines.append(
+                f"{turn_marker}{combatant.name} — Init {combatant.initiative_total} "
+                f"(Roll {combatant.initiative_roll}) — {status}"
+            )
+        if initiative_lines:
+            embed.add_field(name="Initiative Order", value="\n".join(initiative_lines), inline=False)
+
+        current = combat.current_combatant()
+        if current is not None and not current.defeated:
+            turn_text = f"Round {combat.round_number}: {current.name} is acting."
+        else:
+            turn_text = f"Round {combat.round_number}: resolving initiative..."
+        embed.add_field(name="Current Turn", value=turn_text, inline=False)
+
+        if combat.waiting_for is not None:
+            waiting = next(
+                (c for c in combat.order if c.user_id == combat.waiting_for),
+                None,
+            )
+            if waiting is not None:
+                waiting_text = f"Awaiting action from {waiting.name}."
+            else:
+                waiting_text = "Awaiting action from a party member."
+            embed.add_field(name="Awaiting", value=waiting_text, inline=False)
+
+        if combat.log:
+            log_entries = combat.log[-MAX_COMBAT_LOG_ENTRIES:]
+            while log_entries and len("\n".join(log_entries)) > 1024:
+                log_entries = log_entries[1:]
+            log_text = "\n".join(log_entries) if log_entries else "(log truncated)"
+            embed.add_field(name="Combat Log", value=log_text or "No events yet.", inline=False)
+
+        return embed
+
     def _build_navigation_view(self, session: DungeonSession) -> discord.ui.View:
         combat = session.combat_state
         if combat and combat.active:
@@ -2913,12 +2939,16 @@ class DungeonCog(commands.Cog):
     async def _refresh_session_message(self, interaction: discord.Interaction, session: DungeonSession) -> None:
         if session.message_id is None:
             return
-        embed = self._build_room_embed(interaction, session)
+        room_embed = self._build_room_embed(interaction, session)
+        embeds: List[discord.Embed] = [room_embed]
+        combat_embed = self._build_combat_embed(session)
+        if combat_embed is not None:
+            embeds.append(combat_embed)
         view = self._build_navigation_view(session)
         try:
             await interaction.followup.edit_message(
                 message_id=session.message_id,
-                embed=embed,
+                embeds=embeds,
                 view=view,
             )
             self.bot.add_view(view, message_id=session.message_id)
@@ -3019,10 +3049,14 @@ class DungeonCog(commands.Cog):
 
         await self._sync_party_channel_access(session)
 
-        embed = self._build_room_embed(interaction, session)
+        room_embed = self._build_room_embed(interaction, session)
+        embeds: List[discord.Embed] = [room_embed]
+        combat_embed = self._build_combat_embed(session)
+        if combat_embed is not None:
+            embeds.append(combat_embed)
         view = self._build_navigation_view(session)
         try:
-            message = await party_channel.send(embed=embed, view=view)
+            message = await party_channel.send(embeds=embeds, view=view)
         except discord.HTTPException as exc:
             removed = await self.sessions.pop(key)
             if removed is not None:
