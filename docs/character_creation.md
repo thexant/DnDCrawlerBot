@@ -7,8 +7,8 @@ process that mirrors the official SRD onboarding rules.
    provide values for all six ability scores. Point-buy totals are validated
    against the 27 point budget.
 2. **Race Selection** – Pick a race from the SRD catalog. Racial ability score
-   increases are applied immediately, and any required language choices are
-   enforced.
+   increases are applied immediately and each race automatically grants its
+   default languages.
 3. **Class Configuration** – Choose a class, then select the exact number of
    skill proficiencies required by that class.
 4. **Background & Languages** – Choose a background and satisfy any additional

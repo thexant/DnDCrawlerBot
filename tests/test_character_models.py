@@ -29,7 +29,7 @@ def test_character_serialization_round_trip() -> None:
     }
     state.assign_scores(base_assignments)
     state.apply_race("human")
-    state.set_race_languages(["Dwarvish"])
+    assert state.race_languages == ("Common", "Human")
     state.set_class("fighter")
     state.set_class_skills(["Athletics", "Perception"])
     state.set_equipment_choice("fighter_weapon", ["fighter_defense"])
