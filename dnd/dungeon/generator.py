@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 
 from dnd.content import EncounterTable, Item, Monster, RoomTemplate, Theme, Trap
 
@@ -72,6 +72,69 @@ class Dungeon:
         raise KeyError(room_id)
 
 
+@dataclass(frozen=True)
+class DifficultyProfile:
+    """Configuration tweaks applied when generating encounters."""
+
+    monster_count: tuple[int, int]
+    challenge_bias: float
+    trap_count: tuple[int, int]
+    trap_danger_bias: float
+    trap_min_dc: float | None
+    trap_max_dc: float | None
+    loot_combat: tuple[int, int]
+    loot_treasure: tuple[int, int]
+    loot_rarity_bias: float
+
+
+DIFFICULTY_PROFILES: Dict[str, DifficultyProfile] = {
+    "easy": DifficultyProfile(
+        monster_count=(1, 2),
+        challenge_bias=0.6,
+        trap_count=(1, 1),
+        trap_danger_bias=0.5,
+        trap_min_dc=None,
+        trap_max_dc=13,
+        loot_combat=(0, 1),
+        loot_treasure=(1, 2),
+        loot_rarity_bias=0.5,
+    ),
+    "standard": DifficultyProfile(
+        monster_count=(1, 3),
+        challenge_bias=1.0,
+        trap_count=(1, 2),
+        trap_danger_bias=1.0,
+        trap_min_dc=None,
+        trap_max_dc=None,
+        loot_combat=(0, 2),
+        loot_treasure=(1, 3),
+        loot_rarity_bias=1.0,
+    ),
+    "hard": DifficultyProfile(
+        monster_count=(2, 4),
+        challenge_bias=1.4,
+        trap_count=(1, 2),
+        trap_danger_bias=1.5,
+        trap_min_dc=14,
+        trap_max_dc=None,
+        loot_combat=(1, 2),
+        loot_treasure=(2, 4),
+        loot_rarity_bias=1.9,
+    ),
+    "deadly": DifficultyProfile(
+        monster_count=(3, 5),
+        challenge_bias=1.9,
+        trap_count=(2, 3),
+        trap_danger_bias=2.0,
+        trap_min_dc=15,
+        trap_max_dc=None,
+        loot_combat=(1, 3),
+        loot_treasure=(3, 5),
+        loot_rarity_bias=3.2,
+    ),
+}
+
+
 class DungeonGenerator:
     """Generate dungeons from theme data using deterministic RNG."""
 
@@ -85,9 +148,12 @@ class DungeonGenerator:
         if not difficulty:
             return "standard"
         lowered = difficulty.lower()
-        if lowered not in {"easy", "standard", "hard"}:
+        if lowered not in DIFFICULTY_PROFILES:
             return "standard"
         return lowered
+
+    def _get_profile(self, difficulty: str) -> DifficultyProfile:
+        return DIFFICULTY_PROFILES.get(difficulty, DIFFICULTY_PROFILES["standard"])
 
     def generate(
         self,
@@ -154,34 +220,65 @@ class DungeonGenerator:
         return table.roll(self._rng)
 
     def _build_encounter(self, kind: str, difficulty: str) -> EncounterResult:
+        profile = self._get_profile(difficulty)
         if kind == "combat":
-            available = len(self.theme.monsters) or 1
-            standard_max = max(1, min(3, available))
-            if difficulty == "easy":
-                upper = max(1, standard_max - 1)
-                lower = 1
-            elif difficulty == "hard":
-                upper = min(available, standard_max + 1)
-                lower = min(2, upper)
+            min_monsters, max_monsters = profile.monster_count
+            if max_monsters < min_monsters:
+                max_monsters = min_monsters
+            monster_count = self._rng.randint(max(0, min_monsters), max(0, max_monsters))
+            monsters = self.theme.random_monsters(
+                self._rng,
+                monster_count,
+                challenge_bias=profile.challenge_bias,
+            )
+            if monsters:
+                monster_names = ", ".join(monster.name for monster in monsters)
+                summary = f"Hostile presence detected ({difficulty.title()}): {monster_names}."
             else:
-                upper = standard_max
-                lower = 1
-            if upper < lower:
-                upper = lower
-            monster_count = self._rng.randint(lower, upper)
-            monsters = self.theme.random_monsters(self._rng, monster_count)
-            monster_names = ", ".join(monster.name for monster in monsters)
-            summary = f"Hostile presence detected ({difficulty.title()}): {monster_names}."
-            loot = self.theme.random_loot(self._rng, self._rng.randint(0, 2))
+                summary = (
+                    "The chamber was primed for battle, but no foes answered the call."
+                )
+            loot_count = self._rng.randint(
+                max(0, profile.loot_combat[0]),
+                max(0, max(profile.loot_combat[0], profile.loot_combat[1])),
+            )
+            loot = self.theme.random_loot(
+                self._rng,
+                loot_count,
+                rarity_bias=profile.loot_rarity_bias,
+            )
             return EncounterResult(kind=kind, summary=summary, monsters=monsters, loot=loot)
         if kind == "trap":
-            traps = self.theme.random_trap(self._rng)
-            trap_names = ", ".join(trap.name for trap in traps) if traps else "Subtle hazard"
-            summary = f"A trap awaits: {trap_names}."
+            min_traps, max_traps = profile.trap_count
+            if max_traps < min_traps:
+                max_traps = min_traps
+            trap_count = self._rng.randint(max(1, min_traps), max(1, max_traps))
+            traps = self.theme.random_traps(
+                self._rng,
+                trap_count,
+                danger_bias=profile.trap_danger_bias,
+                min_dc=profile.trap_min_dc,
+                max_dc=profile.trap_max_dc,
+            )
+            if traps:
+                trap_names = ", ".join(trap.name for trap in traps)
+            else:
+                trap_names = "Subtle hazard"
+            summary = f"A trap calibrated for {difficulty.title()} adventurers: {trap_names}."
             return EncounterResult(kind=kind, summary=summary, traps=traps)
         if kind == "treasure":
-            loot = self.theme.random_loot(self._rng, self._rng.randint(1, 3))
-            summary = "Hidden cache discovered." if loot else "Dusty alcoves hold no treasure."
+            min_loot, max_loot = profile.loot_treasure
+            if max_loot < min_loot:
+                max_loot = min_loot
+            loot_count = self._rng.randint(max(0, min_loot), max(0, max_loot))
+            loot = self.theme.random_loot(
+                self._rng,
+                loot_count,
+                rarity_bias=profile.loot_rarity_bias,
+            )
+            summary = (
+                "Hidden cache discovered." if loot else "Dusty alcoves hold no treasure."
+            )
             return EncounterResult(kind=kind, summary=summary, loot=loot)
         if kind == "empty":
             summary = "The chamber is eerily silent, devoid of immediate threats."
