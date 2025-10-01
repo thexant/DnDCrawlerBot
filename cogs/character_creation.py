@@ -24,6 +24,7 @@ from dnd.characters import EquipmentChoice, EquipmentChoiceOption, SkillSelectio
 
 LANGUAGE_OPTIONS: tuple[str, ...] = (
     "Common",
+    "Human",
     "Dwarvish",
     "Elvish",
     "Giant",
@@ -63,7 +64,7 @@ class CreationState:
         base = AbilityScores(normalized)
         self.base_scores = base
         if self.race_key:
-            self.apply_race(self.race_key, languages=self.race_languages)
+            self.apply_race(self.race_key)
         else:
             self.ability_scores = base
             self.racial_bonuses = {}
@@ -86,37 +87,22 @@ class CreationState:
             raise CreationStateError("Assign ability scores before selecting a race")
         return self.base_scores
 
-    def apply_race(self, race_key: str, *, languages: Sequence[str] | None = None) -> None:
+    def apply_race(self, race_key: str) -> None:
         base_scores = self._require_base_scores()
         key = race_key.lower()
         if key not in AVAILABLE_RACES:
             raise CreationStateError("Unknown race selection")
         race = AVAILABLE_RACES[key]
-        if languages is None:
-            languages = self.race_languages
-        required = race.languages.choices
-        validated = self._validate_languages(
-            languages,
-            required,
-            label=f"race {race.name}",
-            allow_empty=True,
-        )
-        self.race_languages = validated
+        languages = tuple(dict.fromkeys(race.languages.fixed)) or ("Common",)
+        if "Common" not in languages:
+            languages = ("Common",) + languages
+        self.race_languages = languages
         bonuses: Dict[str, int] = {}
         for bonus in race.ability_bonuses:
             bonuses[bonus.ability] = bonuses.get(bonus.ability, 0) + bonus.bonus
         self.racial_bonuses = bonuses
         self.ability_scores = base_scores.with_bonuses(bonuses)
         self.race_key = key
-
-    def set_race_languages(self, languages: Sequence[str]) -> None:
-        if not self.race_key:
-            raise CreationStateError("Select a race before choosing languages")
-        race = AVAILABLE_RACES[self.race_key]
-        validated = self._validate_languages(languages, race.languages.choices, label=f"race {race.name}")
-        self.race_languages = validated
-        if self.base_scores:
-            self.apply_race(self.race_key, languages=validated)
 
     def set_class(self, class_key: str) -> None:
         key = class_key.lower()
@@ -229,12 +215,6 @@ class CreationState:
     def needs_race(self) -> bool:
         return self.race_key is None
 
-    def needs_race_languages(self) -> bool:
-        if not self.race_key:
-            return False
-        race = AVAILABLE_RACES[self.race_key]
-        return race.languages.choices > 0 and len(self.race_languages) != race.languages.choices
-
     def needs_class(self) -> bool:
         return self.class_key is None
 
@@ -267,7 +247,7 @@ class CreationState:
     def current_step(self) -> int:
         if self.needs_ability_scores():
             return 1
-        if self.needs_race() or self.needs_race_languages():
+        if self.needs_race():
             return 2
         if self.needs_class() or self.needs_class_skills():
             return 3
@@ -377,14 +357,9 @@ class CreationState:
 
 
 class LanguageSelectionModal(discord.ui.Modal):
-    def __init__(self, view: "CharacterCreationView", *, source: str, required: int) -> None:
-        if source == "race":
-            title = "Select Race Languages"
-        else:
-            title = "Select Background Languages"
-        super().__init__(title=title, timeout=None)
+    def __init__(self, view: "CharacterCreationView", *, required: int) -> None:
+        super().__init__(title="Select Background Languages", timeout=None)
         self.creation_view = view
-        self.source = source
         placeholder = (
             f"Enter {required} language name{'s' if required != 1 else ''} separated by commas."
             if required
@@ -395,7 +370,7 @@ class LanguageSelectionModal(discord.ui.Modal):
             style=discord.TextStyle.long,
             placeholder=placeholder,
             required=required > 0,
-            default=", ".join(view.get_languages(source)),
+            default=", ".join(view.get_languages("background")),
         )
         self.add_item(self.input)
         self.required = required
@@ -404,10 +379,7 @@ class LanguageSelectionModal(discord.ui.Modal):
         raw_value = self.input.value or ""
         languages = [lang.strip() for lang in raw_value.split(",") if lang.strip()]
         try:
-            if self.source == "race":
-                self.creation_view.state.set_race_languages(languages)
-            else:
-                self.creation_view.state.set_background_languages(languages)
+            self.creation_view.state.set_background_languages(languages)
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
@@ -582,30 +554,6 @@ class CharacterCreationView(discord.ui.View):
         race_select.disabled = step < 2
         self.add_item(race_select)
 
-        # Race language button if needed
-        if self.state.race_key:
-            race = AVAILABLE_RACES[self.state.race_key]
-            if race.languages.choices > 0:
-                race_lang_button = discord.ui.Button(
-                    label=(
-                        f"Select Race Languages "
-                        f"({len(self.state.race_languages)}/{race.languages.choices})"
-                    ),
-                    style=discord.ButtonStyle.secondary,
-                    row=0,
-                )
-
-                async def race_lang_callback(interaction: discord.Interaction) -> None:
-                    await interaction.response.send_modal(
-                        LanguageSelectionModal(
-                            self, source="race", required=race.languages.choices
-                        )
-                    )
-
-                race_lang_button.callback = race_lang_callback  # type: ignore[assignment]
-                race_lang_button.disabled = step < 2
-                self.add_item(race_lang_button)
-
         # Class selection
         class_options = [
             discord.SelectOption(
@@ -702,7 +650,6 @@ class CharacterCreationView(discord.ui.View):
                     await interaction.response.send_modal(
                         LanguageSelectionModal(
                             self,
-                            source="background",
                             required=background.language_choices,
                         )
                     )
@@ -813,7 +760,7 @@ class CharacterCreationView(discord.ui.View):
     def _build_step_description(self, step: int) -> str:
         messages = {
             1: "Step 1: Roll your ability scores until you're happy with the results.",
-            2: "Step 2: Select a race and resolve any language choices.",
+            2: "Step 2: Select a race.",
             3: "Step 3: Select a class and choose the required skill proficiencies.",
             4: "Step 4: Choose a background and any additional languages it grants.",
             5: "Step 5: Pick your starting equipment options.",
@@ -830,9 +777,7 @@ class CharacterCreationView(discord.ui.View):
         if not self.state.race_key:
             return "Not selected"
         race = AVAILABLE_RACES[self.state.race_key]
-        languages = list(race.languages.fixed)
-        languages.extend(self.state.race_languages)
-        language_value = ", ".join(languages) if languages else "None"
+        language_value = ", ".join(self.state.race_languages) or "None"
         bonuses = ", ".join(
             f"{bonus.ability}+{bonus.bonus}" for bonus in race.ability_bonuses
         )

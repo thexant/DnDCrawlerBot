@@ -13,11 +13,12 @@
   languages:
     fixed:
       - Common
-    choices: 1
+      - Human
+    choices: 0
   traits:
     - level: 1
-      name: Extra Language
-      description: You gain one additional language of your choice.
+      name: Human Languages
+      description: Humans speak both Common and their native Human tongue.
 - key: elf
   name: High Elf
   description: Graceful spellcasters with keen senses.
