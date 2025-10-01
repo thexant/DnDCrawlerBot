@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
 
@@ -16,6 +17,7 @@ __all__ = [
     "EncounterTable",
     "Item",
     "Monster",
+    "RoomExit",
     "Room",
     "RoomTemplate",
     "Theme",
@@ -42,7 +44,17 @@ class Room:
     name: str
     description: str
     encounter: EncounterResult
-    exits: Sequence[int] = field(default_factory=tuple)
+    exits: Sequence["RoomExit"] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class RoomExit:
+    """A named passage that links one room to another."""
+
+    key: str
+    label: str
+    destination: int
+    description: str | None = None
 
 
 @dataclass
@@ -52,6 +64,8 @@ class Corridor:
     from_room: int
     to_room: int
     description: str
+    from_label: str
+    to_label: str
 
 
 @dataclass
@@ -177,6 +191,28 @@ class DungeonGenerator:
                 corridor = self._generate_corridor(rooms[index - 1], room)
                 corridors.append(corridor)
 
+        exits_map: dict[int, list[RoomExit]] = defaultdict(list)
+        for corridor in corridors:
+            exits_map[corridor.from_room].append(
+                RoomExit(
+                    key=f"r{corridor.from_room}:to{corridor.to_room}:{len(exits_map[corridor.from_room])}",
+                    label=corridor.from_label,
+                    destination=corridor.to_room,
+                    description=corridor.description,
+                )
+            )
+            exits_map[corridor.to_room].append(
+                RoomExit(
+                    key=f"r{corridor.to_room}:to{corridor.from_room}:{len(exits_map[corridor.to_room])}",
+                    label=corridor.to_label,
+                    destination=corridor.from_room,
+                    description=corridor.description,
+                )
+            )
+
+        for room in rooms:
+            room.exits = tuple(exits_map.get(room.id, ()))
+
         dungeon_name = name or f"{self.theme.name} Expedition"
         return Dungeon(
             name=dungeon_name,
@@ -197,20 +233,33 @@ class DungeonGenerator:
             description_parts.append(encounter.summary)
         description = "\n\n".join(part.strip() for part in description_parts if part)
 
-        exits = () if room_index == 0 else (room_index - 1,)
         return Room(
             id=room_index,
             name=template.name,
             description=description,
             encounter=encounter,
-            exits=exits,
         )
 
     def _generate_corridor(self, from_room: Room, to_room: Room) -> Corridor:
         length_descriptor = self._rng.choice(["short", "winding", "shadowy", "ancient"])
         adornment = self._rng.choice(["etched runes", "broken statues", "hanging roots", "flickering torches"])
         description = f"A {length_descriptor} corridor lined with {adornment}."
-        return Corridor(from_room=from_room.id, to_room=to_room.id, description=description)
+        label_pairs = [
+            ("Northern passage", "Southern passage"),
+            ("Eastern archway", "Western archway"),
+            ("Ascending stair", "Descending stair"),
+            ("Ironbound door", "Rearward arch"),
+            ("Glowing hallway", "Shadowed hallway"),
+            ("Left-hand path", "Right-hand path"),
+        ]
+        from_label, to_label = self._rng.choice(label_pairs)
+        return Corridor(
+            from_room=from_room.id,
+            to_room=to_room.id,
+            description=description,
+            from_label=from_label,
+            to_label=to_label,
+        )
 
     def _select_encounter_kind(self, template: RoomTemplate) -> str:
         if template.encounter_weights:

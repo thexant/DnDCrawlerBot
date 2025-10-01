@@ -2,7 +2,7 @@
 
 from dnd.content import EncounterTable, Item, Monster, RoomTemplate, Theme, ThemeRegistry, Trap
 
-from .generator import Corridor, Dungeon, DungeonGenerator, EncounterResult, Room
+from .generator import Corridor, Dungeon, DungeonGenerator, EncounterResult, Room, RoomExit
 
 LootDefinition = Item
 MonsterDefinition = Monster
@@ -19,6 +19,7 @@ __all__ = [
     "Monster",
     "MonsterDefinition",
     "Room",
+    "RoomExit",
     "RoomTemplate",
     "Theme",
     "ThemeRegistry",
