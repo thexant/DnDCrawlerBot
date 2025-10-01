@@ -259,6 +259,20 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
             return None
         return cog if isinstance(cog, DungeonCog) else None
 
+    async def refresh_tavern_access(self, guild_id: int) -> None:
+        """Synchronise tavern role membership for ``guild_id``."""
+
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return
+        try:
+            role = await self._ensure_tavern_role(guild)
+        except discord.HTTPException as exc:
+            log.debug("Unable to ensure tavern role in %s: %s", guild.name, exc)
+            return
+        allowed = await self._eligible_member_ids(guild_id)
+        await self._sync_role_membership(role, allowed)
+
     async def _refresh_tavern_for_config(self, config: TavernConfig) -> None:
         guild = self.bot.get_guild(config.guild_id)
         if guild is None:

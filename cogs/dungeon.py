@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Literal, Optional
@@ -16,6 +18,9 @@ from dnd.content import ContentLibrary, ContentLoadError
 from dnd.dungeon import Dungeon, DungeonGenerator, Room, Theme, ThemeRegistry
 from dnd.dungeon.state import DungeonMetadataStore, StoredDungeon
 from dnd.sessions import SessionKey, SessionManager
+
+
+log = logging.getLogger(__name__)
 
 
 def _default_data_path() -> Path:
@@ -182,6 +187,85 @@ class DungeonCog(commands.Cog):
     def _session_key(self, guild_id: Optional[int], channel_id: Optional[int]) -> SessionKey:
         return SessionManager.make_key(guild_id, channel_id)
 
+    def _normalise_party_channel_name(self, dungeon_name: str) -> str:
+        slug = re.sub(r"[^a-z0-9\-\s]", "", dungeon_name.lower())
+        slug = re.sub(r"\s+", "-", slug)
+        slug = re.sub(r"-+", "-", slug).strip("-")
+        if not slug:
+            slug = "delve"
+        base = f"delve-{slug}"
+        return base[:95]
+
+    async def _ensure_party_channel(
+        self, guild: discord.Guild, *, dungeon_name: str
+    ) -> discord.TextChannel:
+        """Return an available party channel for the guild.
+
+        Reuses an existing text channel if it is not currently associated with an
+        active dungeon session. Otherwise, attempts to create a new text channel
+        with a derived name.
+        """
+
+        base_name = self._normalise_party_channel_name(dungeon_name)
+        try:
+            active_keys = await self.sessions.keys()
+        except Exception:  # pragma: no cover - defensive
+            active_keys = ()
+        active_channels = {
+            channel_id for guild_id, channel_id in active_keys if guild_id == guild.id
+        }
+
+        candidates = [base_name]
+        for index in range(2, 11):
+            candidates.append(f"{base_name}-{index}")
+
+        for name in candidates:
+            channel = discord.utils.get(guild.text_channels, name=name)
+            if channel and channel.id not in active_channels:
+                if isinstance(channel, discord.TextChannel):
+                    return channel
+
+        topic = f"Dungeon party channel for {dungeon_name}"[:1024]
+        for name in candidates:
+            if discord.utils.get(guild.text_channels, name=name):
+                continue
+            try:
+                channel = await guild.create_text_channel(
+                    name,
+                    topic=topic,
+                    reason="Dungeon party channel created for a delve",
+                )
+            except discord.Forbidden:
+                raise
+            except discord.HTTPException as exc:
+                log.warning("Failed to create party channel %s in %s: %s", name, guild, exc)
+                continue
+            else:
+                return channel
+
+        raise RuntimeError("Unable to provision a party channel")
+
+    def _get_tavern_cog(self) -> Optional["Tavern"]:
+        cog = self.bot.get_cog("Tavern")
+        if cog is None:
+            return None
+        try:
+            from cogs.tavern import Tavern
+        except ImportError:  # pragma: no cover - defensive
+            return None
+        return cog if isinstance(cog, Tavern) else None
+
+    async def _update_tavern_access(self, guild_id: Optional[int]) -> None:
+        if guild_id is None:
+            return
+        tavern_cog = self._get_tavern_cog()
+        if tavern_cog is None:
+            return
+        try:
+            await tavern_cog.refresh_tavern_access(guild_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("Failed to refresh tavern access for %s: %s", guild_id, exc)
+
     async def _resolve_theme(self, theme_name: Optional[str], guild_id: Optional[int]) -> Theme:
         if theme_name:
             return self.theme_registry.get(theme_name)
@@ -326,14 +410,47 @@ class DungeonCog(commands.Cog):
             )
             return False
 
-        key = self._session_key(interaction.guild_id, interaction.channel_id)
+        guild = interaction.guild
+        if guild is None:
+            await self._send_ephemeral_message(
+                interaction,
+                "Dungeon parties can only be started within a guild channel.",
+            )
+            return False
+
+        try:
+            party_channel = await self._ensure_party_channel(guild, dungeon_name=stored.name)
+        except discord.Forbidden:
+            await self._send_ephemeral_message(
+                interaction,
+                "I do not have permission to create or manage party channels.",
+            )
+            return False
+        except RuntimeError:
+            await self._send_ephemeral_message(
+                interaction,
+                "Unable to find an available party channel for this delve.",
+            )
+            return False
+
+        key = self._session_key(interaction.guild_id, party_channel.id)
         existing = await self.sessions.get(key)
         if existing is not None:
             await self._send_ephemeral_message(
                 interaction,
-                "A party is already exploring this channel. Use /dungeon reset to start over.",
+                f"A party is already delving in {party_channel.mention}.",
             )
             return False
+
+        me = guild.me
+        if me is not None:
+            permissions = party_channel.permissions_for(me)
+            if not permissions.send_messages or not permissions.view_channel:
+                await self._send_ephemeral_message(
+                    interaction,
+                    f"I cannot send messages in {party_channel.mention}. Please adjust permissions and try again.",
+                )
+                return False
 
         try:
             theme = self.theme_registry.get(stored.theme)
@@ -358,7 +475,7 @@ class DungeonCog(commands.Cog):
         session = DungeonSession(
             dungeon=dungeon,
             guild_id=interaction.guild_id,
-            channel_id=interaction.channel_id or interaction.user.id,
+            channel_id=party_channel.id,
             seed=stored.seed,
         )
         session.party_ids.add(interaction.user.id)
@@ -366,17 +483,20 @@ class DungeonCog(commands.Cog):
 
         embed = self._build_room_embed(interaction, session)
         view = self._build_navigation_view(session)
-        if interaction.response.is_done():
-            message = await interaction.followup.send(embed=embed, view=view)
-        else:
-            await interaction.response.send_message(embed=embed, view=view)
-            message = await interaction.original_response()
+        try:
+            message = await party_channel.send(embed=embed, view=view)
+        except discord.HTTPException as exc:
+            await self.sessions.pop(key)
+            await self._send_ephemeral_message(
+                interaction,
+                f"I couldn't start the expedition in {party_channel.mention}: {exc}.",
+            )
+            return False
 
-        session = await self.sessions.update(
-            key, lambda run: setattr(run, "message_id", message.id)
-        )
-        if session is not None:
-            self.bot.add_view(view, message_id=message.id)
+        await self.sessions.update(key, lambda run: setattr(run, "message_id", message.id))
+        self.bot.add_view(view, message_id=message.id)
+
+        await self._update_tavern_access(interaction.guild_id)
 
         await self.metadata_store.record_session(
             interaction.guild_id,
@@ -385,6 +505,10 @@ class DungeonCog(commands.Cog):
             difficulty=dungeon.difficulty,
             name=dungeon.name,
             room_count=room_count,
+        )
+        await self._send_ephemeral_message(
+            interaction,
+            f"The party gathers in {party_channel.mention}!",
         )
         return True
 
@@ -523,6 +647,8 @@ class DungeonCog(commands.Cog):
             except discord.HTTPException:
                 pass
         await interaction.followup.send("The dungeon session has been reset.", ephemeral=True)
+        if interaction.guild_id is not None:
+            await self._update_tavern_access(interaction.guild_id)
 
     @dungeon_group.command(name="delete", description="Delete a stored dungeon by name.")
     @app_commands.describe(name="Name of the stored dungeon to delete")
@@ -651,9 +777,13 @@ class DungeonCog(commands.Cog):
         advanced = False
         reached_final = session.at_final_room
 
+        added_member = False
+
         def mutate(run: DungeonSession) -> None:
-            nonlocal advanced, reached_final
-            run.party_ids.add(interaction.user.id)
+            nonlocal advanced, reached_final, added_member
+            if interaction.user.id not in run.party_ids:
+                run.party_ids.add(interaction.user.id)
+                added_member = True
             if run.at_final_room:
                 reached_final = True
                 return
@@ -665,6 +795,9 @@ class DungeonCog(commands.Cog):
         if session is None:
             await interaction.followup.send("No active dungeon for this party.", ephemeral=True)
             return
+
+        if added_member and interaction.guild_id is not None:
+            await self._update_tavern_access(interaction.guild_id)
 
         await self._refresh_session_message(interaction, session)
         if advanced:
@@ -682,13 +815,23 @@ class DungeonCog(commands.Cog):
 
     async def handle_search(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
-        session = await self.sessions.update(key, lambda run: run.party_ids.add(interaction.user.id))
+        added_member = False
+
+        def mutate(run: DungeonSession) -> None:
+            nonlocal added_member
+            if interaction.user.id not in run.party_ids:
+                run.party_ids.add(interaction.user.id)
+                added_member = True
+
+        session = await self.sessions.update(key, mutate)
         if session is None:
             await interaction.response.send_message("No active dungeon to search.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
         await self._refresh_session_message(interaction, session)
+        if added_member and interaction.guild_id is not None:
+            await self._update_tavern_access(interaction.guild_id)
         loot = session.room.encounter.loot
         if not loot:
             await interaction.followup.send(
@@ -705,13 +848,23 @@ class DungeonCog(commands.Cog):
 
     async def handle_disarm(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
-        session = await self.sessions.update(key, lambda run: run.party_ids.add(interaction.user.id))
+        added_member = False
+
+        def mutate(run: DungeonSession) -> None:
+            nonlocal added_member
+            if interaction.user.id not in run.party_ids:
+                run.party_ids.add(interaction.user.id)
+                added_member = True
+
+        session = await self.sessions.update(key, mutate)
         if session is None:
             await interaction.response.send_message("No traps challenge the party right now.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
         await self._refresh_session_message(interaction, session)
+        if added_member and interaction.guild_id is not None:
+            await self._update_tavern_access(interaction.guild_id)
         traps = session.room.encounter.traps
         if not traps:
             await interaction.followup.send(
@@ -739,13 +892,23 @@ class DungeonCog(commands.Cog):
 
     async def handle_engage(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
-        session = await self.sessions.update(key, lambda run: run.party_ids.add(interaction.user.id))
+        added_member = False
+
+        def mutate(run: DungeonSession) -> None:
+            nonlocal added_member
+            if interaction.user.id not in run.party_ids:
+                run.party_ids.add(interaction.user.id)
+                added_member = True
+
+        session = await self.sessions.update(key, mutate)
         if session is None:
             await interaction.response.send_message("No foes stand before the party right now.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
         await self._refresh_session_message(interaction, session)
+        if added_member and interaction.guild_id is not None:
+            await self._update_tavern_access(interaction.guild_id)
         monsters = session.room.encounter.monsters
         if not monsters:
             await interaction.followup.send(
