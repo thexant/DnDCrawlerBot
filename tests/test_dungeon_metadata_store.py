@@ -15,6 +15,7 @@ def test_record_multiple_dungeons(tmp_path: Path) -> None:
             seed=111,
             difficulty="hard",
             name="Alpha Run",
+            room_count=7,
         )
         await store.record_session(
             123,
@@ -22,6 +23,7 @@ def test_record_multiple_dungeons(tmp_path: Path) -> None:
             seed=222,
             difficulty="easy",
             name="Bravo Run",
+            room_count=4,
         )
 
         names = await store.list_dungeon_names(123)
@@ -32,6 +34,11 @@ def test_record_multiple_dungeons(tmp_path: Path) -> None:
         assert stored.theme == "crypts"
         assert stored.seed == 111
         assert stored.difficulty == "hard"
+        assert stored.room_count == 7
+
+        listed = await store.list_dungeons(123)
+        assert [dungeon.name for dungeon in listed] == ["Alpha Run", "Bravo Run"]
+        assert listed[1].room_count == 4
 
     asyncio.run(run())
 
@@ -40,11 +47,22 @@ def test_record_multiple_dungeons(tmp_path: Path) -> None:
     assert json.loads(metadata_file.read_text()) == {
         "123": {
             "dungeons": {
-                "Alpha Run": {"difficulty": "hard", "seed": 111, "theme": "crypts"},
-                "Bravo Run": {"difficulty": "easy", "seed": 222, "theme": "catacombs"},
+                "Alpha Run": {
+                    "difficulty": "hard",
+                    "room_count": 7,
+                    "seed": 111,
+                    "theme": "crypts",
+                },
+                "Bravo Run": {
+                    "difficulty": "easy",
+                    "room_count": 4,
+                    "seed": 222,
+                    "theme": "catacombs",
+                },
             },
             "last_difficulty": "easy",
             "last_name": "Bravo Run",
+            "last_room_count": 4,
             "last_seed": 222,
             "last_theme": "catacombs",
         }
@@ -61,6 +79,7 @@ def test_delete_dungeon(tmp_path: Path) -> None:
             seed=987,
             difficulty="standard",
             name="Weekly Crawl",
+            room_count=6,
         )
 
         deleted = await store.delete_dungeon(55, "weekly crawl")
@@ -94,6 +113,7 @@ def test_delete_nonexistent_dungeon(tmp_path: Path) -> None:
             seed=1,
             difficulty="standard",
             name="Emerald Vault",
+            room_count=10,
         )
 
         deleted = await store.delete_dungeon(77, "Unknown")

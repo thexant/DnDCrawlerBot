@@ -21,6 +21,7 @@ class GuildSessionMetadata:
     last_seed: int | None = None
     last_difficulty: str | None = None
     last_name: str | None = None
+    last_room_count: int | None = None
     dungeons: Dict[str, "StoredDungeon"] = field(default_factory=dict)
 
     def _resolve_dungeon_key(self, name: str) -> Optional[str]:
@@ -61,6 +62,8 @@ class GuildSessionMetadata:
             data["last_difficulty"] = self.last_difficulty
         if self.last_name is not None:
             data["last_name"] = self.last_name
+        if self.last_room_count is not None:
+            data["last_room_count"] = self.last_room_count
         if self.dungeons:
             data["dungeons"] = {
                 name: dungeon.to_dict() for name, dungeon in self.dungeons.items()
@@ -94,6 +97,9 @@ class GuildSessionMetadata:
             last_seed=int(last_seed) if isinstance(last_seed, int) else None,
             last_difficulty=str(last_difficulty) if isinstance(last_difficulty, str) else None,
             last_name=str(last_name) if isinstance(last_name, str) else None,
+            last_room_count=int(last_room_count)
+            if isinstance(last_room_count, int)
+            else None,
             dungeons=dungeons,
         )
 
@@ -106,6 +112,7 @@ class StoredDungeon:
     theme: str
     seed: int | None = None
     difficulty: str | None = None
+    room_count: int | None = None
 
     def to_dict(self) -> Dict[str, object]:
         data: Dict[str, object] = {"theme": self.theme}
@@ -113,6 +120,8 @@ class StoredDungeon:
             data["seed"] = self.seed
         if self.difficulty is not None:
             data["difficulty"] = self.difficulty
+        if self.room_count is not None:
+            data["room_count"] = self.room_count
         return data
 
     @classmethod
@@ -122,11 +131,13 @@ class StoredDungeon:
             raise ValueError("Dungeon entries must include a theme")
         seed = raw.get("seed")
         difficulty = raw.get("difficulty")
+        room_count = raw.get("room_count")
         return cls(
             name=name,
             theme=theme,
             seed=int(seed) if isinstance(seed, int) else None,
             difficulty=str(difficulty) if isinstance(difficulty, str) else None,
+            room_count=int(room_count) if isinstance(room_count, int) else None,
         )
 
 
@@ -210,6 +221,7 @@ class DungeonMetadataStore:
         seed: Optional[int],
         difficulty: Optional[str] = None,
         name: Optional[str] = None,
+        room_count: Optional[int] = None,
     ) -> GuildSessionMetadata:
         async with self._lock:
             await self._ensure_loaded()
@@ -222,12 +234,14 @@ class DungeonMetadataStore:
             metadata.last_seed = seed if seed is None else int(seed)
             metadata.last_difficulty = difficulty
             metadata.last_name = name
+            metadata.last_room_count = room_count if room_count is None else int(room_count)
             if name:
                 dungeon = StoredDungeon(
                     name=name,
                     theme=theme,
                     seed=metadata.last_seed,
                     difficulty=difficulty,
+                    room_count=metadata.last_room_count,
                 )
                 metadata.upsert_dungeon(dungeon)
             await self._persist()
@@ -245,6 +259,7 @@ class DungeonMetadataStore:
             metadata.last_seed = None
             metadata.last_difficulty = None
             metadata.last_name = None
+            metadata.last_room_count = None
             metadata.dungeons.clear()
             del self._cache[key]
             await self._persist()
@@ -277,14 +292,27 @@ class DungeonMetadataStore:
                 return False
             if metadata.last_name and metadata.last_name.casefold() == name.casefold():
                 metadata.last_name = None
+                metadata.last_room_count = None
             if (
                 metadata.default_theme is None
                 and metadata.last_theme is None
                 and metadata.last_seed is None
                 and metadata.last_difficulty is None
                 and metadata.last_name is None
+                and metadata.last_room_count is None
                 and not metadata.dungeons
             ):
                 del self._cache[key]
             await self._persist()
             return True
+
+    async def list_dungeons(self, guild_id: int) -> tuple[StoredDungeon, ...]:
+        async with self._lock:
+            await self._ensure_loaded()
+            metadata = self._cache.get(str(guild_id))
+            if metadata is None:
+                return ()
+            return tuple(
+                metadata.dungeons[name]
+                for name in sorted(metadata.dungeons, key=lambda value: value.lower())
+            )
