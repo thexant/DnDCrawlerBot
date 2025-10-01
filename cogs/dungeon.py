@@ -7,7 +7,7 @@ import random
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, Iterable, List, Literal, Optional
+from typing import Awaitable, Callable, Dict, Iterable, List, Literal, Optional
 
 import discord
 from discord import app_commands
@@ -47,6 +47,11 @@ class DungeonSession:
     party_ids: set[int] = field(default_factory=set)
     message_id: Optional[int] = None
     combat_state: Optional["CombatState"] = None
+    breadcrumbs: list[int] = field(default_factory=list)
+    exit_history: list[str] = field(default_factory=list)
+    last_exit_taken: Optional[str] = None
+    last_travel_description: Optional[str] = None
+    last_travel_note: Optional[str] = None
 
     @property
     def room(self) -> Room:
@@ -57,12 +62,11 @@ class DungeonSession:
         return self.current_room >= len(self.dungeon.rooms) - 1
 
     def travel_description(self) -> Optional[str]:
-        if self.current_room == 0:
-            return None
-        for corridor in self.dungeon.corridors:
-            if corridor.to_room == self.current_room:
-                return corridor.description
-        return None
+        return self.last_travel_description
+
+    def __post_init__(self) -> None:
+        if not self.breadcrumbs:
+            self.breadcrumbs.append(self.current_room)
 
 
 @dataclass
@@ -128,38 +132,82 @@ class DungeonNavigationView(discord.ui.View):
     def __init__(
         self,
         cog: "DungeonCog",
+        session: DungeonSession,
         *,
-        disable_proceed: bool = False,
         disable_search: bool = False,
         disable_disarm: bool = False,
         disable_engage: bool = False,
     ) -> None:
         super().__init__(timeout=None)
         self.cog = cog
-        disabled = {
-            "dungeon:proceed": disable_proceed,
-            "dungeon:search": disable_search,
-            "dungeon:disarm": disable_disarm,
-            "dungeon:engage": disable_engage,
-        }
-        for child in self.children:
-            if isinstance(child, discord.ui.Button) and child.custom_id in disabled:
-                child.disabled = disabled[child.custom_id]
+        self._session = session
+        self._add_exit_controls(session)
+        self._add_action_button(
+            label="Search",
+            style=discord.ButtonStyle.secondary,
+            custom_id="dungeon:search",
+            disabled=disable_search,
+            handler=self._handle_search,
+        )
+        self._add_action_button(
+            label="Disarm Trap",
+            style=discord.ButtonStyle.danger,
+            custom_id="dungeon:disarm",
+            disabled=disable_disarm,
+            handler=self._handle_disarm,
+        )
+        self._add_action_button(
+            label="Engage",
+            style=discord.ButtonStyle.success,
+            custom_id="dungeon:engage",
+            disabled=disable_engage,
+            handler=self._handle_engage,
+        )
 
-    @discord.ui.button(label="Proceed", style=discord.ButtonStyle.primary, custom_id="dungeon:proceed")
-    async def proceed(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
-        await self.cog.handle_proceed(interaction)
+    def _add_exit_controls(self, session: DungeonSession) -> None:
+        for exit_option in session.room.exits:
+            custom_id = f"dungeon:exit:{session.channel_id}:{exit_option.key}"
+            button = discord.ui.Button(
+                label=exit_option.label,
+                style=discord.ButtonStyle.primary,
+                custom_id=custom_id,
+            )
+            button.callback = self._make_exit_callback(exit_option.key)
+            self.add_item(button)
 
-    @discord.ui.button(label="Search", style=discord.ButtonStyle.secondary, custom_id="dungeon:search")
-    async def search(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+    def _add_action_button(
+        self,
+        *,
+        label: str,
+        style: discord.ButtonStyle,
+        custom_id: str,
+        disabled: bool,
+        handler: Callable[[discord.Interaction], Awaitable[None]],
+    ) -> None:
+        button = discord.ui.Button(
+            label=label,
+            style=style,
+            custom_id=custom_id,
+            disabled=disabled,
+        )
+        button.callback = handler
+        self.add_item(button)
+
+    def _make_exit_callback(
+        self, exit_key: str
+    ) -> Callable[[discord.Interaction], Awaitable[None]]:
+        async def _callback(interaction: discord.Interaction) -> None:
+            await self.cog.handle_exit(interaction, exit_key)
+
+        return _callback
+
+    async def _handle_search(self, interaction: discord.Interaction) -> None:
         await self.cog.handle_search(interaction)
 
-    @discord.ui.button(label="Disarm Trap", style=discord.ButtonStyle.danger, custom_id="dungeon:disarm")
-    async def disarm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+    async def _handle_disarm(self, interaction: discord.Interaction) -> None:
         await self.cog.handle_disarm(interaction)
 
-    @discord.ui.button(label="Engage", style=discord.ButtonStyle.success, custom_id="dungeon:engage")
-    async def engage(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+    async def _handle_engage(self, interaction: discord.Interaction) -> None:
         await self.cog.handle_engage(interaction)
 
 
@@ -664,9 +712,14 @@ class DungeonCog(commands.Cog):
             loot_lines = [f"• {item.name} ({item.rarity})" for item in room.encounter.loot]
             embed.add_field(name="Loot", value="\n".join(loot_lines), inline=False)
 
+        approach_lines: list[str] = []
+        if session.last_travel_note:
+            approach_lines.append(session.last_travel_note)
         travel = session.travel_description()
         if travel:
-            embed.add_field(name="Approach", value=travel, inline=False)
+            approach_lines.append(travel)
+        if approach_lines:
+            embed.add_field(name="Approach", value="\n".join(approach_lines), inline=False)
 
         embed.add_field(name="Party", value=self._party_display(interaction, session), inline=False)
 
@@ -701,13 +754,56 @@ class DungeonCog(commands.Cog):
                 log_text = "\n".join(log_entries) if log_entries else "(log truncated)"
                 embed.add_field(name="Combat Log", value=log_text or "No events yet.", inline=False)
 
+        exit_lines: list[str] = []
+        visited_rooms = set(session.breadcrumbs)
+        previous_room = session.breadcrumbs[-2] if len(session.breadcrumbs) >= 2 else None
+        for exit_option in room.exits:
+            try:
+                destination_room = dungeon.get_room(exit_option.destination)
+            except KeyError:
+                continue
+            status: str
+            if exit_option.destination == previous_room:
+                status = f"Backtrack to Room {destination_room.id + 1}: {destination_room.name}"
+            elif exit_option.destination in visited_rooms:
+                status = f"Visited Room {destination_room.id + 1}: {destination_room.name}"
+            else:
+                status = "Unexplored passage"
+            exit_lines.append(f"• {exit_option.label} — {status}")
+        if exit_lines:
+            embed.add_field(name="Exits", value="\n".join(exit_lines), inline=False)
+        else:
+            embed.add_field(name="Exits", value="No obvious exits are visible.", inline=False)
+
+        if session.breadcrumbs:
+            path_lines: list[str] = []
+            for index, room_id in enumerate(session.breadcrumbs):
+                try:
+                    breadcrumb_room = dungeon.get_room(room_id)
+                except KeyError:
+                    continue
+                label = f"Room {breadcrumb_room.id + 1}: {breadcrumb_room.name}"
+                if index == 0:
+                    path_lines.append(label)
+                else:
+                    direction = (
+                        session.exit_history[index - 1]
+                        if index - 1 < len(session.exit_history)
+                        else "Unknown path"
+                    )
+                    path_lines.append(f"↳ {direction} → {label}")
+            if path_lines:
+                embed.add_field(name="Path Taken", value="\n".join(path_lines), inline=False)
+
         actions: list[str]
         if combat and combat.active:
             actions = ["Stand your ground and resolve the battle using the combat controls."]
         else:
             actions = []
-            if not session.at_final_room:
-                actions.append("Proceed deeper into the dungeon.")
+            if room.exits:
+                actions.append("Choose an exit to continue the expedition or retrace your steps.")
+            else:
+                actions.append("Search the chamber for hidden exits or wait for rescue.")
             if room.encounter.monsters:
                 actions.append("Engage the monsters in combat.")
             if room.encounter.traps:
@@ -734,7 +830,7 @@ class DungeonCog(commands.Cog):
         room = session.room
         return DungeonNavigationView(
             self,
-            disable_proceed=session.at_final_room,
+            session,
             disable_search=not bool(room.encounter.loot),
             disable_disarm=not bool(room.encounter.traps),
             disable_engage=not bool(room.encounter.monsters),
@@ -1129,7 +1225,7 @@ class DungeonCog(commands.Cog):
         )
 
     # ---- Interaction handlers -------------------------------------------
-    async def handle_proceed(self, interaction: discord.Interaction) -> None:
+    async def handle_exit(self, interaction: discord.Interaction, exit_key: str) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
         session = await self.sessions.get(key)
         if session is None:
@@ -1144,22 +1240,65 @@ class DungeonCog(commands.Cog):
             return
 
         await interaction.response.defer()
-        advanced = False
-        reached_final = session.at_final_room
-
+        moved = False
+        backtracked = False
         added_member = False
+        exit_label: Optional[str] = None
+        destination_room: Optional[Room] = None
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal advanced, reached_final, added_member
+            nonlocal moved, backtracked, added_member, exit_label, destination_room
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
-            if run.at_final_room:
-                reached_final = True
+
+            current_room = run.room
+            selected_exit = next((option for option in current_room.exits if option.key == exit_key), None)
+            if selected_exit is None:
                 return
-            run.current_room += 1
-            advanced = True
-            reached_final = run.at_final_room
+
+            origin_room_id = run.current_room
+            destination_id = selected_exit.destination
+            if destination_id == origin_room_id:
+                return
+
+            try:
+                destination_room_local = run.dungeon.get_room(destination_id)
+            except KeyError:
+                return
+
+            corridor = next(
+                (
+                    link
+                    for link in run.dungeon.corridors
+                    if {link.from_room, link.to_room} == {origin_room_id, destination_id}
+                ),
+                None,
+            )
+
+            previous_room = run.breadcrumbs[-2] if len(run.breadcrumbs) >= 2 else None
+            if previous_room == destination_id:
+                if run.breadcrumbs:
+                    run.breadcrumbs.pop()
+                if run.exit_history:
+                    run.exit_history.pop()
+                backtracked = True
+            else:
+                run.breadcrumbs.append(destination_id)
+                run.exit_history.append(selected_exit.label)
+                backtracked = False
+
+            run.current_room = destination_id
+            run.last_exit_taken = selected_exit.key
+            run.last_travel_description = corridor.description if corridor else None
+            exit_label = selected_exit.label
+            lower_label = selected_exit.label.lower()
+            if backtracked:
+                run.last_travel_note = f"The party backtracks through the {lower_label}."
+            else:
+                run.last_travel_note = f"The party takes the {lower_label}."
+            destination_room = destination_room_local
+            moved = True
 
         session = await self.sessions.update(key, mutate)
         if session is None:
@@ -1169,19 +1308,26 @@ class DungeonCog(commands.Cog):
         if added_member and interaction.guild_id is not None:
             await self._update_tavern_access(interaction.guild_id)
 
+        if not moved:
+            await interaction.followup.send(
+                "That passage isn't accessible right now. Try another direction.",
+                ephemeral=True,
+            )
+            return
+
         await self._refresh_session_message(interaction, session)
-        if advanced:
-            await interaction.followup.send("You press onward into the next chamber...", ephemeral=True)
-        elif reached_final:
-            await interaction.followup.send(
-                "The party has already reached the end of this dungeon!",
-                ephemeral=True,
-            )
+
+        if destination_room is not None and exit_label is not None:
+            target_text = f"Room {destination_room.id + 1}: {destination_room.name}"
+            lower_label = exit_label.lower()
+            if backtracked:
+                message = f"You backtrack through the {lower_label} to {target_text}."
+            else:
+                message = f"You take the {lower_label} toward {target_text}."
         else:
-            await interaction.followup.send(
-                "Unable to proceed right now. Try again in a moment.",
-                ephemeral=True,
-            )
+            message = "You make your way through the chosen passage."
+
+        await interaction.followup.send(message, ephemeral=True)
 
     async def handle_search(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
