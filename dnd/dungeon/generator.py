@@ -99,6 +99,8 @@ class DifficultyProfile:
     loot_combat: tuple[int, int]
     loot_treasure: tuple[int, int]
     loot_rarity_bias: float
+    min_monster_challenge: float | None = None
+    max_monster_challenge: float | None = None
 
 
 DIFFICULTY_PROFILES: Dict[str, DifficultyProfile] = {
@@ -116,6 +118,7 @@ DIFFICULTY_PROFILES: Dict[str, DifficultyProfile] = {
     "easy": DifficultyProfile(
         monster_count=(1, 2),
         challenge_bias=0.6,
+        max_monster_challenge=2.0,
         trap_count=(1, 1),
         trap_danger_bias=0.5,
         trap_min_dc=None,
@@ -127,6 +130,7 @@ DIFFICULTY_PROFILES: Dict[str, DifficultyProfile] = {
     "standard": DifficultyProfile(
         monster_count=(1, 3),
         challenge_bias=1.0,
+        min_monster_challenge=0.5,
         trap_count=(1, 2),
         trap_danger_bias=1.0,
         trap_min_dc=None,
@@ -138,6 +142,7 @@ DIFFICULTY_PROFILES: Dict[str, DifficultyProfile] = {
     "challenging": DifficultyProfile(
         monster_count=(2, 4),
         challenge_bias=1.3,
+        min_monster_challenge=1.0,
         trap_count=(1, 2),
         trap_danger_bias=1.3,
         trap_min_dc=13,
@@ -149,6 +154,7 @@ DIFFICULTY_PROFILES: Dict[str, DifficultyProfile] = {
     "hard": DifficultyProfile(
         monster_count=(3, 5),
         challenge_bias=1.7,
+        min_monster_challenge=2.0,
         trap_count=(2, 3),
         trap_danger_bias=1.8,
         trap_min_dc=15,
@@ -160,6 +166,7 @@ DIFFICULTY_PROFILES: Dict[str, DifficultyProfile] = {
     "deadly": DifficultyProfile(
         monster_count=(5, 7),
         challenge_bias=2.6,
+        min_monster_challenge=3.0,
         trap_count=(3, 4),
         trap_danger_bias=2.6,
         trap_min_dc=17,
@@ -301,6 +308,8 @@ class DungeonGenerator:
                 self._rng,
                 monster_count,
                 challenge_bias=profile.challenge_bias,
+                min_challenge=profile.min_monster_challenge,
+                max_challenge=profile.max_monster_challenge,
             )
             if monsters:
                 monster_names = ", ".join(monster.name for monster in monsters)

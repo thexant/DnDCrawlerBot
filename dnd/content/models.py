@@ -252,16 +252,43 @@ class Theme:
         count: int,
         *,
         challenge_bias: float = 1.0,
+        min_challenge: float | None = None,
+        max_challenge: float | None = None,
     ) -> Sequence[Monster]:
         if not self.monsters or count <= 0:
             return ()
         population = list(self.monsters)
-        weights = []
+        filtered: list[Monster] = []
         for monster in population:
+            challenge = float(monster.challenge)
+            if min_challenge is not None and challenge < min_challenge:
+                continue
+            if max_challenge is not None and challenge > max_challenge:
+                continue
+            filtered.append(monster)
+        if not filtered:
+            if min_challenge is not None:
+                highest = max(float(monster.challenge) for monster in population)
+                filtered = [
+                    monster
+                    for monster in population
+                    if float(monster.challenge) == highest
+                ]
+            elif max_challenge is not None:
+                lowest = min(float(monster.challenge) for monster in population)
+                filtered = [
+                    monster
+                    for monster in population
+                    if float(monster.challenge) == lowest
+                ]
+            else:
+                filtered = population
+        weights = []
+        for monster in filtered:
             base = max(0.0, float(monster.challenge)) + 1.0
             weight = base ** challenge_bias
             weights.append(max(weight, 1e-6))
-        return tuple(rng.choices(population, weights=weights, k=count))
+        return tuple(rng.choices(filtered, weights=weights, k=count))
 
     def random_traps(
         self,
