@@ -71,7 +71,7 @@ Themes stitch the registries together.
       "tags": ["undead", "relics"]
     }
   ],
-  "monsters": ["skeletal_guardian", "ghast", "wight_captain"],
+  "monsters": ["skeleton", "ghast", "wight"],
   "traps": ["falling_sarcophagus_lid", "necrotic_miasma"],
   "loot": ["ruby_eye_gem", "blessed_reliquary", "potion_of_vitality"],
   "encounters": {"combat": 5, "trap": 3, "treasure": 1, "empty": 1}

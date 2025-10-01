@@ -26,8 +26,8 @@
   ],
   "monsters": [
     "animated_armor",
-    "spectral_mage",
-    "arcane_sentinel"
+    "specter",
+    "helmed_horror"
   ],
   "traps": [
     "glyph_of_detonation",

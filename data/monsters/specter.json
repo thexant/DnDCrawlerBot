@@ -1,0 +1,10 @@
+{
+  "name": "Specter",
+  "challenge": 1,
+  "armor_class": 12,
+  "hit_points": 22,
+  "attack_bonus": 4,
+  "damage": "3d6",
+  "ability_scores": {"STR": 1, "DEX": 14, "CON": 11},
+  "tags": ["undead", "incorporeal"]
+}
