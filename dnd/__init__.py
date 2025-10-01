@@ -9,6 +9,31 @@ from .characters import (
     CharacterClass,
     Race,
 )
+from .combat import (
+    AttackRollResult,
+    Combatant,
+    InitiativeResult,
+    SavingThrowResult,
+    ability_modifier,
+    attack_roll,
+    roll_d20,
+    roll_initiative,
+    saving_throw,
+)
+from .dungeon import (
+    Corridor,
+    Dungeon,
+    DungeonGenerator,
+    EncounterResult,
+    EncounterTable,
+    LootDefinition,
+    MonsterDefinition,
+    Room,
+    RoomTemplate,
+    Theme,
+    ThemeRegistry,
+    TrapDefinition,
+)
 from .repository import CharacterRepository
 
 __all__ = [
@@ -20,4 +45,25 @@ __all__ = [
     "CharacterClass",
     "Race",
     "CharacterRepository",
+    "AttackRollResult",
+    "Combatant",
+    "Corridor",
+    "Dungeon",
+    "DungeonGenerator",
+    "EncounterResult",
+    "EncounterTable",
+    "InitiativeResult",
+    "LootDefinition",
+    "MonsterDefinition",
+    "Room",
+    "RoomTemplate",
+    "Theme",
+    "ThemeRegistry",
+    "SavingThrowResult",
+    "ability_modifier",
+    "attack_roll",
+    "roll_d20",
+    "roll_initiative",
+    "saving_throw",
+    "TrapDefinition",
 ]

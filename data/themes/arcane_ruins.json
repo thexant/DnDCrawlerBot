@@ -1,0 +1,76 @@
+{
+  "name": "Arcane Ruins",
+  "description": "Forgotten sanctums where unstable magic lingers in the air.",
+  "room_templates": [
+    {
+      "name": "Cracked Library",
+      "description": "Shelves of dust-caked tomes collapse around a glowing sigil on the floor.",
+      "encounter_weights": {"combat": 3, "trap": 1, "treasure": 1},
+      "weight": 2,
+      "tags": ["knowledge", "arcane"]
+    },
+    {
+      "name": "Runic Observatory",
+      "description": "Shattered lenses float midair, refracting motes of eldritch light.",
+      "encounter_weights": {"combat": 2, "empty": 1, "treasure": 2},
+      "weight": 1,
+      "tags": ["stars", "ritual"]
+    },
+    {
+      "name": "Planar Rift Chamber",
+      "description": "A thin veil crackles with planar energy, distorting time and sound.",
+      "encounter_weights": {"combat": 2, "trap": 2, "empty": 1},
+      "weight": 1,
+      "tags": ["planar", "hazard"]
+    }
+  ],
+  "monsters": [
+    {
+      "name": "Animated Armor",
+      "challenge": 3,
+      "armor_class": 18,
+      "hit_points": 33,
+      "attack_bonus": 5,
+      "damage": "1d8+3",
+      "ability_scores": {"STR": 14, "DEX": 11, "CON": 13}
+    },
+    {
+      "name": "Spectral Mage",
+      "challenge": 4,
+      "armor_class": 12,
+      "hit_points": 40,
+      "attack_bonus": 6,
+      "damage": "2d8+4",
+      "ability_scores": {"INT": 18, "DEX": 14, "WIS": 12}
+    },
+    {
+      "name": "Arcane Sentinel",
+      "challenge": 5,
+      "armor_class": 17,
+      "hit_points": 68,
+      "attack_bonus": 7,
+      "damage": "2d10+4",
+      "ability_scores": {"STR": 18, "CON": 16, "WIS": 10}
+    }
+  ],
+  "traps": [
+    {
+      "name": "Glyph of Detonation",
+      "description": "A hidden rune unleashes a burst of force when stepped upon.",
+      "saving_throw": {"ability": "DEX", "dc": 15},
+      "damage": "4d6 force"
+    },
+    {
+      "name": "Temporal Snare",
+      "description": "An amber field freezes victims in a loop of slow time.",
+      "saving_throw": {"ability": "WIS", "dc": 14},
+      "damage": null
+    }
+  ],
+  "loot": [
+    {"name": "Spell Scroll of Counterspell", "rarity": "Rare"},
+    {"name": "Wand of the War Mage", "rarity": "Uncommon"},
+    {"name": "Potion of Arcane Recovery", "rarity": "Uncommon"}
+  ],
+  "encounters": {"combat": 4, "trap": 2, "treasure": 2, "empty": 1}
+}
