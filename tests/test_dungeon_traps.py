@@ -146,6 +146,7 @@ def test_failed_disarm_triggers_damage(monkeypatch: pytest.MonkeyPatch) -> None:
 
         results = iter(
             [
+                dungeon_module.SavingThrowResult(total=18, roll=18, natural=18, success=True),
                 dungeon_module.SavingThrowResult(total=5, roll=5, natural=5, success=False),
                 dungeon_module.SavingThrowResult(total=8, roll=8, natural=8, success=False),
             ]
@@ -158,6 +159,7 @@ def test_failed_disarm_triggers_damage(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cog, "_roll_damage", lambda *_args, **_kwargs: 6)
 
         await cog.handle_disarm(interaction)
+        await cog.handle_disarm(interaction)
 
     asyncio.run(runner())
 
@@ -167,8 +169,82 @@ def test_failed_disarm_triggers_damage(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not session.room.encounter.traps
     assert interaction.followup.sent_messages
     last_message = interaction.followup.sent_messages[-1]
-    assert "springs" in last_message
+    assert "sprung" in last_message
     assert "damage" in last_message
+
+
+def test_failed_detection_keeps_trap_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    cog = _make_cog(monkeypatch)
+    session = _make_trap_session()
+    interaction = DummyInteraction()
+    key = cog._session_key(interaction.guild_id, interaction.channel_id)
+    user_id = interaction.user.id
+
+    async def runner() -> None:
+        await cog.sessions.set(key, session)
+
+        results = iter(
+            [
+                dungeon_module.SavingThrowResult(total=4, roll=4, natural=4, success=False),
+            ]
+        )
+
+        def fake_saving_throw(*_args, **_kwargs):
+            return next(results)
+
+        monkeypatch.setattr(dungeon_module, "saving_throw", fake_saving_throw)
+
+        await cog.handle_disarm(interaction)
+
+    asyncio.run(runner())
+
+    room_id = session.room.id
+    trap_key = session.room.encounter.traps[0].key
+    assert session.trap_states[room_id][trap_key] == "hidden"
+    assert session.room.encounter.traps
+    attempts = session.trap_detection_attempts[room_id][user_id]
+    assert attempts == 1
+    assert interaction.followup.sent_messages
+    message = interaction.followup.sent_messages[-1]
+    assert "fail to spot" in message
+
+
+def test_detection_limit_blocks_additional_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    cog = _make_cog(monkeypatch)
+    session = _make_trap_session()
+    interaction = DummyInteraction()
+    key = cog._session_key(interaction.guild_id, interaction.channel_id)
+    user_id = interaction.user.id
+
+    async def runner() -> None:
+        await cog.sessions.set(key, session)
+
+        results = iter(
+            [
+                dungeon_module.SavingThrowResult(total=6, roll=6, natural=6, success=False),
+                dungeon_module.SavingThrowResult(total=7, roll=7, natural=7, success=False),
+            ]
+        )
+
+        def fake_saving_throw(*_args, **_kwargs):
+            return next(results)
+
+        monkeypatch.setattr(dungeon_module, "saving_throw", fake_saving_throw)
+
+        await cog.handle_disarm(interaction)
+        await cog.handle_disarm(interaction)
+        await cog.handle_disarm(interaction)
+
+    asyncio.run(runner())
+
+    room_id = session.room.id
+    trap_key = session.room.encounter.traps[0].key
+    attempts = session.trap_detection_attempts[room_id][user_id]
+    assert attempts == dungeon_module.MAX_TRAP_DETECTION_ATTEMPTS
+    assert session.trap_states[room_id][trap_key] == "hidden"
+    assert session.room.encounter.traps
+    assert interaction.followup.sent_messages
+    assert "scoured the chamber" in interaction.followup.sent_messages[-1]
 
 
 def test_successful_detection_and_disarm_updates_state(monkeypatch: pytest.MonkeyPatch) -> None:
