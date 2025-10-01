@@ -534,4 +534,7 @@ class DungeonCog(commands.Cog):
 async def setup(bot: commands.Bot) -> None:
     cog = DungeonCog(bot)
     await bot.add_cog(cog)
+    existing = bot.tree.get_command(cog.dungeon_group.name, type=cog.dungeon_group.type)
+    if existing is not None:
+        bot.tree.remove_command(cog.dungeon_group.name, type=cog.dungeon_group.type)
     bot.tree.add_command(cog.dungeon_group)
