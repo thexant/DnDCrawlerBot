@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from pathlib import Path
 from statistics import mean
 import sys
@@ -175,8 +176,16 @@ def test_generate_builds_branching_graph(arcane_theme: Theme) -> None:
     for corridor in dungeon.corridors:
         from_room = dungeon.get_room(corridor.from_room)
         to_room = dungeon.get_room(corridor.to_room)
-        assert any(option.destination == corridor.to_room for option in from_room.exits)
-        assert any(option.destination == corridor.from_room for option in to_room.exits)
+        assert any(
+            option.destination == corridor.to_room
+            for option in from_room.exits
+            if option.destination is not None
+        )
+        assert any(
+            option.destination == corridor.from_room
+            for option in to_room.exits
+            if option.destination is not None
+        )
 
 
 def test_generated_corridors_allow_backtracking(arcane_theme: Theme) -> None:
@@ -185,10 +194,42 @@ def test_generated_corridors_allow_backtracking(arcane_theme: Theme) -> None:
 
     for room in dungeon.rooms:
         for exit_option in room.exits:
+            if exit_option.destination is None:
+                continue
             destination_room = dungeon.get_room(exit_option.destination)
             assert any(
-                return_path.destination == room.id for return_path in destination_room.exits
+                return_path.destination == room.id
+                for return_path in destination_room.exits
+                if return_path.destination is not None
             ), "Each exit should provide a return path"
+
+
+def test_farthest_room_contains_exit_to_tavern(arcane_theme: Theme) -> None:
+    generator = DungeonGenerator(arcane_theme, seed=123)
+    dungeon = generator.generate(room_count=6)
+
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    for corridor in dungeon.corridors:
+        adjacency[corridor.from_room].add(corridor.to_room)
+        adjacency[corridor.to_room].add(corridor.from_room)
+
+    start = dungeon.rooms[0].id
+    distances: dict[int, int] = {start: 0}
+    queue: deque[tuple[int, int]] = deque([(start, 0)])
+    while queue:
+        room_id, distance = queue.popleft()
+        for neighbor in adjacency.get(room_id, set()):
+            if neighbor in distances:
+                continue
+            distances[neighbor] = distance + 1
+            queue.append((neighbor, distance + 1))
+
+    farthest_room_id = max(distances.items(), key=lambda item: (item[1], item[0]))[0]
+    farthest_room = dungeon.get_room(farthest_room_id)
+    exit_options = [option for option in farthest_room.exits if option.completes_delve]
+
+    assert exit_options, "Farthest room should contain a delve exit"
+    assert all(option.destination is None for option in exit_options)
 
 
 def test_sparse_theme_gracefully_degrades(arcane_theme: Theme) -> None:

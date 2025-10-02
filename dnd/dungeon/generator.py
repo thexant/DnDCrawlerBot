@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
 
@@ -54,8 +54,9 @@ class RoomExit:
 
     key: str
     label: str
-    destination: int
+    destination: int | None
     description: str | None = None
+    completes_delve: bool = False
 
 
 @dataclass
@@ -339,6 +340,33 @@ class DungeonGenerator:
                     description=corridor.description,
                 )
             )
+
+        farthest_room_id = 0
+        if rooms:
+            start_id = rooms[0].id
+            distances: Dict[int, int] = {start_id: 0}
+            queue: deque[tuple[int, int]] = deque([(start_id, 0)])
+            while queue:
+                room_id, distance = queue.popleft()
+                for neighbor in adjacency.get(room_id, ()):  # pragma: no branch
+                    if neighbor in distances:
+                        continue
+                    distances[neighbor] = distance + 1
+                    queue.append((neighbor, distance + 1))
+            if distances:
+                farthest_room_id = max(
+                    distances.items(), key=lambda item: (item[1], item[0])
+                )[0]
+        exit_key = f"delve-exit:r{farthest_room_id}"
+        exits_map[farthest_room_id].append(
+            RoomExit(
+                key=exit_key,
+                label="Exit",
+                destination=None,
+                description="A passage leading back to safety.",
+                completes_delve=True,
+            )
+        )
 
         for room in rooms:
             room.exits = tuple(exits_map.get(room.id, ()))
