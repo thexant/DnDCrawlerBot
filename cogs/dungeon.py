@@ -8,6 +8,7 @@ import logging
 import random
 import re
 import secrets
+from datetime import datetime, timezone
 from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -244,6 +245,12 @@ class DungeonSession:
     discovered_loot: Dict[int, Set[str]] = field(default_factory=dict)
     discovered_exits: Dict[int, Set[str]] = field(default_factory=dict)
     perception_attempts: Dict[int, Dict[int, int]] = field(default_factory=dict)
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    monsters_defeated: int = 0
+    traps_disarmed: int = 0
+    traps_triggered: int = 0
+    treasure_items_claimed: int = 0
+    treasure_gold_claimed: int = 0
 
     @property
     def room(self) -> Room:
@@ -1057,9 +1064,11 @@ class DungeonCog(commands.Cog):
         guild_id: int,
         characters: MutableMapping[int, Character],
         shares: Sequence[RewardShare],
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], tuple[int, int]]:
         item_lines: list[str] = []
         gold_lines: list[str] = []
+        delivered_items = 0
+        delivered_gold = 0
         for share in shares:
             character = characters.get(share.user_id)
             if character is None:
@@ -1090,11 +1099,13 @@ class DungeonCog(commands.Cog):
                 item_lines.append(
                     f"• <@{share.user_id}> gains {', '.join(new_items)}"
                 )
+                delivered_items += len(new_items)
             if share.gold:
                 gold_lines.append(
                     f"• <@{share.user_id}> gains {share.gold} gold coins"
                 )
-        return item_lines, gold_lines
+                delivered_gold += share.gold
+        return item_lines, gold_lines, (delivered_items, delivered_gold)
 
     def _get_tavern_cog(self) -> Optional["Tavern"]:
         cog = self.bot.get_cog("Tavern")
@@ -1276,7 +1287,15 @@ class DungeonCog(commands.Cog):
         if not discovered_exits and session.dungeon.rooms:
             starting_room_id = session.dungeon.rooms[0].id
             if room.id == starting_room_id and room.exits:
-                discovered_exits.add(room.exits[0].key)
+                first_exit = room.exits[0]
+                destination = getattr(first_exit, "destination", None)
+                if len(room.exits) > 1 or (
+                    destination is not None and destination != room.id
+                ):
+                    discovered_exits.add(first_exit.key)
+        for exit_option in room.exits:
+            if getattr(exit_option, "completes_delve", False):
+                discovered_exits.add(exit_option.key)
 
     def _get_trap_status(
         self, session: DungeonSession, room_id: int, trap_key: str
@@ -1354,6 +1373,7 @@ class DungeonCog(commands.Cog):
                 )
             )
 
+        session.traps_triggered += 1
         lines: list[str] = [f"The {trap.name} is sprung!"]
         if trap.damage:
             description = trap.damage
@@ -1683,6 +1703,7 @@ class DungeonCog(commands.Cog):
         if victory:
             state.log.append("The party is victorious!")
             encounter = session.room.encounter
+            session.monsters_defeated += len(encounter.monsters)
             session.room.encounter = replace(
                 encounter,
                 monsters=tuple(),
@@ -3074,14 +3095,24 @@ class DungeonCog(commands.Cog):
         for exit_option in room.exits:
             if exit_option.key not in discovered_exits:
                 continue
+            if getattr(exit_option, "completes_delve", False):
+                status = "Leave the dungeon and return to the tavern"
+                exit_lines.append(f"• {exit_option.label} — {status}")
+                continue
+            destination_id = exit_option.destination
+            if destination_id is None:
+                exit_lines.append(
+                    f"• {exit_option.label} — Destination unknown"
+                )
+                continue
             try:
-                destination_room = dungeon.get_room(exit_option.destination)
+                destination_room = dungeon.get_room(destination_id)
             except KeyError:
                 continue
             status: str
-            if exit_option.destination == previous_room:
+            if destination_id == previous_room:
                 status = f"Backtrack to Room {destination_room.id + 1}: {destination_room.name}"
-            elif exit_option.destination in visited_rooms:
+            elif destination_id in visited_rooms:
                 status = f"Visited Room {destination_room.id + 1}: {destination_room.name}"
             else:
                 status = "Unexplored passage"
@@ -3624,6 +3655,160 @@ class DungeonCog(commands.Cog):
         except discord.HTTPException:
             pass
 
+    async def _find_tavern_channel(
+        self, guild_id: Optional[int]
+    ) -> Optional[discord.TextChannel]:
+        if guild_id is None:
+            return None
+        tavern_cog = self._get_tavern_cog()
+        if tavern_cog is None:
+            return None
+        try:
+            config = await tavern_cog.config_store.get_config(guild_id)
+        except Exception:
+            return None
+        if config is None:
+            return None
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return None
+        channel = guild.get_channel(config.channel_id)
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    @staticmethod
+    def _format_duration(started_at: datetime) -> str:
+        now = datetime.now(timezone.utc)
+        elapsed = now - started_at
+        total_seconds = int(max(0, elapsed.total_seconds()))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        parts: list[str] = []
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes or hours:
+            parts.append(f"{minutes}m")
+        parts.append(f"{seconds}s")
+        return " ".join(parts)
+
+    def _build_completion_embed(
+        self, session: DungeonSession, *, exit_label: Optional[str]
+    ) -> discord.Embed:
+        title = f"Delve Complete — {session.dungeon.name}"
+        if exit_label:
+            description = (
+                f"The party emerges through the {exit_label.lower()} and returns to the tavern."
+            )
+        else:
+            description = "The party returns to the tavern victorious."
+        embed = discord.Embed(colour=discord.Colour.green(), title=title, description=description)
+
+        party_ids = tuple(sorted(session.party_ids))
+        if party_ids:
+            adventurers = "\n".join(f"• <@{user_id}>" for user_id in party_ids)
+        else:
+            adventurers = "• Unknown adventurers"
+        embed.add_field(name="Adventurers", value=adventurers, inline=False)
+
+        rooms_explored = len(set(session.breadcrumbs)) or 1
+        summary_lines = [
+            f"Rooms explored: {rooms_explored}",
+            f"Monsters defeated: {session.monsters_defeated}",
+            f"Traps disarmed: {session.traps_disarmed}",
+        ]
+        if session.traps_triggered:
+            summary_lines.append(f"Traps sprung: {session.traps_triggered}")
+        embed.add_field(name="Summary", value="\n".join(summary_lines), inline=False)
+
+        if session.treasure_items_claimed or session.treasure_gold_claimed:
+            treasure_lines: list[str] = []
+            if session.treasure_items_claimed:
+                treasure_lines.append(
+                    f"Items recovered: {session.treasure_items_claimed}"
+                )
+            if session.treasure_gold_claimed:
+                treasure_lines.append(
+                    f"Gold secured: {session.treasure_gold_claimed}"
+                )
+            treasure_value = "\n".join(treasure_lines)
+        else:
+            treasure_value = "No treasure recovered."
+        embed.add_field(name="Treasure", value=treasure_value, inline=False)
+
+        duration_text = self._format_duration(session.started_at)
+        embed.add_field(name="Duration", value=duration_text, inline=False)
+        return embed
+
+    async def _handle_delve_completion(
+        self,
+        interaction: discord.Interaction,
+        session: DungeonSession,
+        *,
+        exit_label: Optional[str],
+        party_snapshot: tuple[int, ...],
+    ) -> None:
+        key = self._session_key(session.guild_id, session.channel_id)
+        removed = await self.sessions.pop(key)
+        if removed is None:
+            removed = session
+        if party_snapshot:
+            removed.party_ids.update(party_snapshot)
+
+        exit_phrase = exit_label.lower() if exit_label else "exit"
+        await interaction.followup.send(
+            (
+                f"You step through the {exit_phrase} and return to the tavern. "
+                "Your success is heralded for all to hear!"
+            ),
+            ephemeral=True,
+        )
+
+        if removed.message_id is not None:
+            try:
+                await interaction.followup.edit_message(
+                    message_id=removed.message_id,
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
+
+        guild = interaction.guild or (
+            self.bot.get_guild(removed.guild_id) if removed.guild_id is not None else None
+        )
+        party_channel: Optional[discord.TextChannel] = None
+        if isinstance(interaction.channel, discord.TextChannel):
+            party_channel = interaction.channel
+        elif guild is not None:
+            channel = guild.get_channel(removed.channel_id)
+            if isinstance(channel, discord.TextChannel):
+                party_channel = channel
+
+        if party_channel is not None:
+            try:
+                await party_channel.send(
+                    f"The party returns triumphant from {removed.dungeon.name}!"
+                )
+            except discord.HTTPException:
+                pass
+
+        embed = self._build_completion_embed(removed, exit_label=exit_label)
+        announcement_channel = await self._find_tavern_channel(removed.guild_id)
+        targets: list[discord.TextChannel] = []
+        if announcement_channel is not None:
+            targets.append(announcement_channel)
+        elif party_channel is not None:
+            targets.append(party_channel)
+        delivered_channels: set[int] = set()
+        for target in targets:
+            if target.id in delivered_channels:
+                continue
+            try:
+                await target.send(embed=embed)
+            except discord.HTTPException:
+                continue
+            delivered_channels.add(target.id)
+
+        await self._clear_party_channel_access(removed)
+        await self._update_tavern_access(removed.guild_id)
     async def _send_ephemeral_message(
         self, interaction: discord.Interaction, message: str
     ) -> None:
@@ -4103,9 +4288,11 @@ class DungeonCog(commands.Cog):
         party_snapshot: tuple[int, ...] = ()
         triggered_events: list[tuple[int, Trap, str]] = []
         avoidance_messages: list[str] = []
+        completed_delve = False
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal moved, backtracked, added_member, exit_label, destination_room, party_snapshot, triggered_events, avoidance_messages
+            nonlocal moved, backtracked, added_member, exit_label, destination_room
+            nonlocal party_snapshot, triggered_events, avoidance_messages, completed_delve
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
@@ -4161,8 +4348,22 @@ class DungeonCog(commands.Cog):
                 return
 
             origin_room_id = run.current_room
+            if getattr(selected_exit, "completes_delve", False):
+                run.discovered_exits.setdefault(origin_room_id, set()).add(selected_exit.key)
+                run.exit_history.append(selected_exit.label)
+                run.last_exit_taken = selected_exit.key
+                run.last_travel_description = selected_exit.description
+                lower_label = selected_exit.label.lower()
+                run.last_travel_note = f"The party leaves via the {lower_label}."
+                run.stealthed = False
+                party_snapshot = tuple(sorted(run.party_ids))
+                exit_label = selected_exit.label
+                moved = True
+                completed_delve = True
+                return
+
             destination_id = selected_exit.destination
-            if destination_id == origin_room_id:
+            if destination_id is None or destination_id == origin_room_id:
                 return
 
             run.discovered_exits.setdefault(origin_room_id, set()).add(selected_exit.key)
@@ -4216,6 +4417,15 @@ class DungeonCog(commands.Cog):
         session = await self.sessions.update(key, mutate)
         if session is None:
             await interaction.followup.send("No active dungeon for this party.", ephemeral=True)
+            return
+
+        if completed_delve:
+            await self._handle_delve_completion(
+                interaction,
+                session,
+                exit_label=exit_label,
+                party_snapshot=party_snapshot,
+            )
             return
 
         if added_member and interaction.guild_id is not None:
@@ -4412,9 +4622,19 @@ class DungeonCog(commands.Cog):
             )
             return
 
-        item_lines, gold_lines = await self._apply_reward_shares(
+        item_lines, gold_lines, delivered_totals = await self._apply_reward_shares(
             session.guild_id, characters, shares
         )
+        delivered_items, delivered_gold = delivered_totals
+        if delivered_items or delivered_gold:
+
+            def record_rewards(run: DungeonSession) -> None:
+                run.treasure_items_claimed += delivered_items
+                run.treasure_gold_claimed += delivered_gold
+
+            updated = await self.sessions.update(key, record_rewards)
+            if updated is not None:
+                session = updated
 
         next_cursor = loot_cursor
         if party_snapshot:
@@ -4733,6 +4953,11 @@ class DungeonCog(commands.Cog):
         check_summary = f"(Disarm roll {disarm_result.total}, DC {dc} {ability} save)"
         if disarm_result.success:
             reward_lines: list[str] = []
+            updated_session = await self.sessions.update(
+                key, lambda run: setattr(run, "traps_disarmed", run.traps_disarmed + 1)
+            )
+            if updated_session is not None:
+                session = updated_session
             if session.guild_id is not None and party_snapshot:
                 characters = await self._load_party_characters(session.guild_id, party_snapshot)
                 if characters:
@@ -4740,10 +4965,26 @@ class DungeonCog(commands.Cog):
                     reward_amount = trap_reward_value(attempted_trap, dc)
                     shares = split_gold(reward_amount, order)
                     if shares:
-                        _, gold_lines = await self._apply_reward_shares(
+                        (
+                            _,
+                            gold_lines,
+                            delivered_totals,
+                        ) = await self._apply_reward_shares(
                             session.guild_id, characters, shares
                         )
                         reward_lines.extend(gold_lines)
+                        delivered_items, delivered_gold = delivered_totals
+                        if delivered_items or delivered_gold:
+
+                            def record_rewards(run: DungeonSession) -> None:
+                                run.treasure_items_claimed += delivered_items
+                                run.treasure_gold_claimed += delivered_gold
+
+                            updated_rewards = await self.sessions.update(
+                                key, record_rewards
+                            )
+                            if updated_rewards is not None:
+                                session = updated_rewards
                         if order and party_snapshot:
                             remainder = reward_amount % len(order)
                             if remainder:
