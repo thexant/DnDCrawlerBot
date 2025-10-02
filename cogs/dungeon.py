@@ -384,7 +384,7 @@ class DungeonNavigationView(discord.ui.View):
             label="Perception",
             style=discord.ButtonStyle.secondary,
             custom_id="dungeon:perception",
-            disabled=disable_search,
+            disabled=False,
             handler=self._handle_perception,
         )
         self._add_action_button(
