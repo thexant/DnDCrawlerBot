@@ -8,6 +8,7 @@ import logging
 import random
 import re
 import secrets
+from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (
@@ -3154,23 +3155,219 @@ class DungeonCog(commands.Cog):
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
 
-        reverse_lookup = {value: key for key, value in positions.items()}
-        lines: list[str] = []
-        for y in range(max_y, min_y - 1, -1):
-            cells: list[str] = []
-            for x in range(min_x, max_x + 1):
-                room_id = reverse_lookup.get((x, y))
-                if room_id is None:
-                    cells.append("   ")
-                    continue
-                label = f"{room_id + 1:02d}"
-                if room_id == session.current_room:
-                    cells.append(f"[{label}]")
-                else:
-                    cells.append(f" {label} ")
-            lines.append("".join(cells).rstrip())
+        width = max_x - min_x + 1
+        height = max_y - min_y + 1
 
-        # Ensure there is at least an empty string if all rows were blank (should not happen).
+        interior_width = 4
+        box_height = 3
+        tile_width = interior_width + 4  # corridor padding on both sides
+        tile_height = box_height + 2  # corridor padding above and below
+
+        map_width = width * tile_width
+        map_height = height * tile_height
+
+        grid: list[list[str]] = [[" " for _ in range(map_width)] for _ in range(map_height)]
+        blocked: Set[tuple[int, int]] = set()
+
+        def write_room_char(x: int, y: int, char: str) -> None:
+            if not (0 <= x < map_width and 0 <= y < map_height):
+                return
+            grid[y][x] = char
+            blocked.add((x, y))
+
+        def place_char(x: int, y: int, char: str) -> None:
+            if not (0 <= x < map_width and 0 <= y < map_height):
+                return
+            if char == " ":
+                return
+            existing = grid[y][x]
+            if existing == char:
+                return
+            if (x, y) in blocked:
+                if char == "+":
+                    grid[y][x] = "+"
+                elif {existing, char} <= {"-", "|"}:
+                    grid[y][x] = "+"
+                return
+            if existing == " ":
+                grid[y][x] = char
+                return
+            if char == "+" or existing == "+":
+                grid[y][x] = "+"
+                return
+            if {existing, char} <= {"-", "|"} or (existing in "-|" and char in "-|"):
+                grid[y][x] = "+"
+                return
+            # Avoid overwriting room labels and borders with corridor characters.
+
+        room_draw_info: Dict[int, Dict[str, int]] = {}
+        for room_id, (room_x, room_y) in positions.items():
+            x_offset = (room_x - min_x) * tile_width
+            y_offset = (max_y - room_y) * tile_height
+
+            left_border = x_offset + 1
+            right_border = x_offset + tile_width - 2
+            top_border = y_offset + 1
+            bottom_border = y_offset + tile_height - 2
+            label_row = top_border + 1
+
+            room_draw_info[room_id] = {
+                "x_offset": x_offset,
+                "y_offset": y_offset,
+                "left_border": left_border,
+                "right_border": right_border,
+                "top_border": top_border,
+                "bottom_border": bottom_border,
+                "label_row": label_row,
+                "center_x": left_border + (right_border - left_border) // 2,
+                "center_y": label_row,
+                "left_corridor": x_offset,
+                "right_corridor": x_offset + tile_width - 1,
+                "top_corridor": y_offset,
+                "bottom_corridor": y_offset + tile_height - 1,
+            }
+
+            # Top border
+            write_room_char(left_border, top_border, "+")
+            for x in range(left_border + 1, right_border):
+                write_room_char(x, top_border, "-")
+            write_room_char(right_border, top_border, "+")
+
+            # Bottom border
+            write_room_char(left_border, bottom_border, "+")
+            for x in range(left_border + 1, right_border):
+                write_room_char(x, bottom_border, "-")
+            write_room_char(right_border, bottom_border, "+")
+
+            # Label row with borders
+            write_room_char(left_border, label_row, "|")
+            write_room_char(right_border, label_row, "|")
+
+            label = f"{room_id + 1:02d}"
+            label_text = f"[{label}]" if room_id == session.current_room else label
+            padded = label_text.center(interior_width)
+            for index, char in enumerate(padded):
+                write_room_char(left_border + 1 + index, label_row, char)
+
+        corridors = getattr(dungeon, "corridors", ())
+
+        def connect_room_border(room_id: int, direction: str) -> None:
+            info = room_draw_info[room_id]
+            if direction == "left":
+                place_char(info["left_border"], info["label_row"], "+")
+                blocked.add((info["left_border"], info["label_row"]))
+            elif direction == "right":
+                place_char(info["right_border"], info["label_row"], "+")
+                blocked.add((info["right_border"], info["label_row"]))
+            elif direction == "up":
+                place_char(info["center_x"], info["top_border"], "+")
+                blocked.add((info["center_x"], info["top_border"]))
+            elif direction == "down":
+                place_char(info["center_x"], info["bottom_border"], "+")
+                blocked.add((info["center_x"], info["bottom_border"]))
+
+        def find_path(start: tuple[int, int], end: tuple[int, int]) -> Optional[list[tuple[int, int]]]:
+            if start == end:
+                return [start]
+            queue: deque[tuple[int, int]] = deque([start])
+            came_from: Dict[tuple[int, int], Optional[tuple[int, int]]] = {start: None}
+            while queue:
+                current = queue.popleft()
+                if current == end:
+                    break
+                cx, cy = current
+                for dx_step, dy_step in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx, ny = cx + dx_step, cy + dy_step
+                    if not (0 <= nx < map_width and 0 <= ny < map_height):
+                        continue
+                    neighbor = (nx, ny)
+                    if neighbor in came_from or neighbor in blocked:
+                        continue
+                    queue.append(neighbor)
+                    came_from[neighbor] = current
+            else:
+                return None
+
+            path: list[tuple[int, int]] = []
+            node: Optional[tuple[int, int]] = end
+            while node is not None:
+                path.append(node)
+                node = came_from.get(node)
+            path.reverse()
+            return path
+
+        for corridor in corridors:
+            first = corridor.from_room
+            second = corridor.to_room
+            if first not in room_draw_info or second not in room_draw_info:
+                continue
+
+            first_info = room_draw_info[first]
+            second_info = room_draw_info[second]
+            dx = positions[second][0] - positions[first][0]
+            dy = positions[second][1] - positions[first][1]
+
+            if dx == 0 and dy == 0:
+                continue
+
+            if abs(dx) >= abs(dy):
+                if dx >= 0:
+                    start = (first_info["right_corridor"], first_info["center_y"])
+                    end = (second_info["left_corridor"], second_info["center_y"])
+                    connect_room_border(first, "right")
+                    connect_room_border(second, "left")
+                else:
+                    start = (first_info["left_corridor"], first_info["center_y"])
+                    end = (second_info["right_corridor"], second_info["center_y"])
+                    connect_room_border(first, "left")
+                    connect_room_border(second, "right")
+            else:
+                if dy >= 0:
+                    start = (first_info["center_x"], first_info["top_corridor"])
+                    end = (second_info["center_x"], second_info["bottom_corridor"])
+                    connect_room_border(first, "up")
+                    connect_room_border(second, "down")
+                else:
+                    start = (first_info["center_x"], first_info["bottom_corridor"])
+                    end = (second_info["center_x"], second_info["top_corridor"])
+                    connect_room_border(first, "down")
+                    connect_room_border(second, "up")
+
+            path = find_path(start, end)
+            if not path:
+                continue
+
+            for index, (x, y) in enumerate(path):
+                prev_point = path[index - 1] if index > 0 else None
+                next_point = path[index + 1] if index + 1 < len(path) else None
+                horizontal = False
+                vertical = False
+                if prev_point:
+                    if prev_point[0] != x:
+                        horizontal = True
+                    if prev_point[1] != y:
+                        vertical = True
+                if next_point:
+                    if next_point[0] != x:
+                        horizontal = True
+                    if next_point[1] != y:
+                        vertical = True
+                if horizontal and vertical:
+                    char = "+"
+                elif horizontal:
+                    char = "-"
+                elif vertical:
+                    char = "|"
+                else:
+                    char = "-"
+                place_char(x, y, char)
+
+        lines = ["".join(row).rstrip() for row in grid]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+
         return "\n".join(lines) if lines else "(no rooms)"
 
     def _build_session_embeds(
