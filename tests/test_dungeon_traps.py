@@ -294,6 +294,7 @@ def test_failed_perception_keeps_trap_hidden(monkeypatch: pytest.MonkeyPatch) ->
                 return dungeon_module.SavingThrowResult(total=1, roll=1, natural=1, success=False)
 
         monkeypatch.setattr(dungeon_module, "saving_throw", fake_saving_throw)
+        monkeypatch.setattr(dungeon_module.random, "random", lambda: 1.0)
 
         await cog.handle_perception(interaction)
 
@@ -308,9 +309,11 @@ def test_failed_perception_keeps_trap_hidden(monkeypatch: pytest.MonkeyPatch) ->
     assert interaction.followup.sent_messages
     message = interaction.followup.sent_messages[-1]
     assert "fail to spot" in message
+    assert "scoured" not in message
+    assert "try again" in message
 
 
-def test_perception_attempt_limit_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_failed_perception_can_increase_difficulty(monkeypatch: pytest.MonkeyPatch) -> None:
     cog = _make_cog(monkeypatch)
     session = _make_trap_session()
     session.discovered_exits.setdefault(session.room.id, set()).update(
@@ -318,7 +321,6 @@ def test_perception_attempt_limit_enforced(monkeypatch: pytest.MonkeyPatch) -> N
     )
     interaction = DummyInteraction()
     key = cog._session_key(interaction.guild_id, interaction.channel_id)
-    user_id = interaction.user.id
 
     async def runner() -> None:
         await cog.sessions.set(key, session)
@@ -329,29 +331,34 @@ def test_perception_attempt_limit_enforced(monkeypatch: pytest.MonkeyPatch) -> N
                 dungeon_module.SavingThrowResult(total=7, roll=7, natural=7, success=False),
             ]
         )
+        random_values = iter([0.1, 1.0])
+        recorded_dcs: list[int] = []
 
-        def fake_saving_throw(*_args, **_kwargs):
+        def fake_saving_throw(*_args, **kwargs):
+            recorded_dcs.append(kwargs.get("dc"))
             try:
                 return next(results)
             except StopIteration:
                 return dungeon_module.SavingThrowResult(total=1, roll=1, natural=1, success=False)
 
         monkeypatch.setattr(dungeon_module, "saving_throw", fake_saving_throw)
+        monkeypatch.setattr(dungeon_module.random, "random", lambda: next(random_values))
 
         await cog.handle_perception(interaction)
         await cog.handle_perception(interaction)
-        await cog.handle_perception(interaction)
+
+        assert recorded_dcs[:2] == [13, 14]
 
     asyncio.run(runner())
 
     room_id = session.room.id
     trap_key = session.room.encounter.traps[0].key
-    attempts = session.perception_attempts[room_id][user_id]
-    assert attempts == dungeon_module.MAX_TRAP_DETECTION_ATTEMPTS
+    difficulty_key = ("trap", trap_key)
     assert session.trap_states[room_id][trap_key] == "hidden"
     assert session.room.encounter.traps
+    assert session.perception_difficulties[room_id][difficulty_key] == 1
     assert interaction.followup.sent_messages
-    assert "scoured the chamber" in interaction.followup.sent_messages[-1]
+    assert "try again" in interaction.followup.sent_messages[-1]
 
 
 def test_successful_detection_and_disarm_updates_state(monkeypatch: pytest.MonkeyPatch) -> None:

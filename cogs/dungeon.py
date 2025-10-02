@@ -84,8 +84,8 @@ def _format_difficulty_label(value: str) -> str:
     return " ".join(part.capitalize() for part in value.split("_"))
 
 
-MAX_TRAP_DETECTION_ATTEMPTS = 2
 DEFAULT_PERCEPTION_DC = 15
+PERCEPTION_DC_INCREASE_CHANCE = 0.25
 ABILITY_NAME_OVERRIDES = {
     "STR": "Strength",
     "DEX": "Dexterity",
@@ -245,6 +245,9 @@ class DungeonSession:
     discovered_loot: Dict[int, Set[str]] = field(default_factory=dict)
     discovered_exits: Dict[int, Set[str]] = field(default_factory=dict)
     perception_attempts: Dict[int, Dict[int, int]] = field(default_factory=dict)
+    perception_difficulties: Dict[int, Dict[tuple[str, str], int]] = field(
+        default_factory=dict
+    )
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     monsters_defeated: int = 0
     traps_disarmed: int = 0
@@ -1283,6 +1286,7 @@ class DungeonCog(commands.Cog):
         session.discovered_loot.setdefault(room.id, set())
         discovered_exits = session.discovered_exits.setdefault(room.id, set())
         session.perception_attempts.setdefault(room.id, {})
+        session.perception_difficulties.setdefault(room.id, {})
 
         if not discovered_exits and session.dungeon.rooms:
             starting_room_id = session.dungeon.rooms[0].id
@@ -4672,13 +4676,12 @@ class DungeonCog(commands.Cog):
             if not await self._ensure_character_available(interaction):
                 return
         added_member = False
-        limit_reached = False
         nothing_hidden = False
         room_id: Optional[int] = None
         results: list[tuple[str, str, SavingThrowResult, int, str]] = []
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal added_member, limit_reached, nothing_hidden, room_id
+            nonlocal added_member, nothing_hidden, room_id
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
@@ -4693,6 +4696,7 @@ class DungeonCog(commands.Cog):
             discovered_exits = run.discovered_exits.setdefault(room_id_local, set())
             attempts_map = run.perception_attempts.setdefault(room_id_local, {})
             trap_catalog = run.trap_catalog.setdefault(room_id_local, {})
+            difficulty_map = run.perception_difficulties.setdefault(room_id_local, {})
 
             hidden_traps: list[Trap] = []
             for trap in room.encounter.traps:
@@ -4714,9 +4718,6 @@ class DungeonCog(commands.Cog):
                 return
 
             attempts_used = attempts_map.get(interaction.user.id, 0)
-            if attempts_used >= MAX_TRAP_DETECTION_ATTEMPTS:
-                limit_reached = True
-                return
             attempts_map[interaction.user.id] = attempts_used + 1
 
             for trap in hidden_traps:
@@ -4728,22 +4729,43 @@ class DungeonCog(commands.Cog):
                     dc_value = int(dc_raw)
                 except (TypeError, ValueError):
                     dc_value = DEFAULT_PERCEPTION_DC
-                result = saving_throw(save_bonus=5, dc=dc_value)
-                results.append(("trap", trap.name, result, dc_value, ability))
+                difficulty_key = ("trap", trap.key)
+                dc_shift = difficulty_map.get(difficulty_key, 0)
+                adjusted_dc = dc_value + dc_shift
+                result = saving_throw(save_bonus=5, dc=adjusted_dc)
+                results.append(("trap", trap.name, result, adjusted_dc, ability))
                 if result.success:
                     self._set_trap_status(run, room_id_local, trap.key, "discovered")
+                    if difficulty_key in difficulty_map:
+                        difficulty_map.pop(difficulty_key, None)
+                elif random.random() < PERCEPTION_DC_INCREASE_CHANCE:
+                    difficulty_map[difficulty_key] = dc_shift + 1
 
             for item in hidden_loot:
-                result = saving_throw(save_bonus=5, dc=DEFAULT_PERCEPTION_DC)
-                results.append(("loot", item.name, result, DEFAULT_PERCEPTION_DC, "WIS"))
+                difficulty_key = ("loot", item.key)
+                dc_shift = difficulty_map.get(difficulty_key, 0)
+                adjusted_dc = DEFAULT_PERCEPTION_DC + dc_shift
+                result = saving_throw(save_bonus=5, dc=adjusted_dc)
+                results.append(("loot", item.name, result, adjusted_dc, "WIS"))
                 if result.success:
                     discovered_loot.add(item.key)
+                    if difficulty_key in difficulty_map:
+                        difficulty_map.pop(difficulty_key, None)
+                elif random.random() < PERCEPTION_DC_INCREASE_CHANCE:
+                    difficulty_map[difficulty_key] = dc_shift + 1
 
             for exit_option in hidden_exits:
-                result = saving_throw(save_bonus=5, dc=DEFAULT_PERCEPTION_DC)
-                results.append(("exit", exit_option.label, result, DEFAULT_PERCEPTION_DC, "WIS"))
+                difficulty_key = ("exit", exit_option.key)
+                dc_shift = difficulty_map.get(difficulty_key, 0)
+                adjusted_dc = DEFAULT_PERCEPTION_DC + dc_shift
+                result = saving_throw(save_bonus=5, dc=adjusted_dc)
+                results.append(("exit", exit_option.label, result, adjusted_dc, "WIS"))
                 if result.success:
                     discovered_exits.add(exit_option.key)
+                    if difficulty_key in difficulty_map:
+                        difficulty_map.pop(difficulty_key, None)
+                elif random.random() < PERCEPTION_DC_INCREASE_CHANCE:
+                    difficulty_map[difficulty_key] = dc_shift + 1
 
         session = await self.sessions.update(key, mutate)
         if session is None:
@@ -4764,27 +4786,12 @@ class DungeonCog(commands.Cog):
             )
             return
 
-        if limit_reached:
-            await self._refresh_session_message(interaction, session)
-            await interaction.followup.send(
-                "You've already scoured the chamber thoroughly—further searching turns up nothing new.",
-                ephemeral=True,
-            )
-            return
-
         if nothing_hidden and not results:
             await self._refresh_session_message(interaction, session)
             await interaction.followup.send(
                 "You find no clues to any hidden dangers.", ephemeral=True
             )
             return
-
-        attempts_remaining = max(
-            0,
-            MAX_TRAP_DETECTION_ATTEMPTS
-            - session.perception_attempts.get(room_id, {}).get(interaction.user.id, 0),
-        )
-
         await self._refresh_session_message(interaction, session)
 
         if not results:
@@ -4825,13 +4832,9 @@ class DungeonCog(commands.Cog):
                     )
 
         if not successes:
-            if attempts_remaining:
-                attempt_word = "attempts" if attempts_remaining > 1 else "attempt"
-                message_lines.append(
-                    f"You can try once more ({attempts_remaining} {attempt_word} remaining)."
-                )
-            else:
-                message_lines.append("Further searching seems futile.")
+            message_lines.append(
+                "You can try again, though each failure may make the search more challenging."
+            )
 
         await interaction.followup.send("\n".join(message_lines), ephemeral=True)
 
