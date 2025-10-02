@@ -161,6 +161,36 @@ def test_treasure_scaling_by_difficulty(arcane_theme: Theme) -> None:
     assert average_rarities[0] < average_rarities[-1]
 
 
+def test_generate_builds_branching_graph(arcane_theme: Theme) -> None:
+    generator = DungeonGenerator(arcane_theme, seed=103)
+    dungeon = generator.generate(room_count=5)
+
+    exit_counts = {room.id: len(room.exits) for room in dungeon.rooms}
+    assert any(count > 2 for count in exit_counts.values())
+
+    exit_keys = [exit.key for room in dungeon.rooms for exit in room.exits]
+    assert len(exit_keys) == len(set(exit_keys))
+    assert all(exit.label.strip() for room in dungeon.rooms for exit in room.exits)
+
+    for corridor in dungeon.corridors:
+        from_room = dungeon.get_room(corridor.from_room)
+        to_room = dungeon.get_room(corridor.to_room)
+        assert any(option.destination == corridor.to_room for option in from_room.exits)
+        assert any(option.destination == corridor.from_room for option in to_room.exits)
+
+
+def test_generated_corridors_allow_backtracking(arcane_theme: Theme) -> None:
+    generator = DungeonGenerator(arcane_theme, seed=104)
+    dungeon = generator.generate(room_count=6)
+
+    for room in dungeon.rooms:
+        for exit_option in room.exits:
+            destination_room = dungeon.get_room(exit_option.destination)
+            assert any(
+                return_path.destination == room.id for return_path in destination_room.exits
+            ), "Each exit should provide a return path"
+
+
 def test_sparse_theme_gracefully_degrades(arcane_theme: Theme) -> None:
     sparse_theme = Theme(
         key="sparse",
