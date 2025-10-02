@@ -4815,22 +4815,6 @@ class DungeonCog(commands.Cog):
             else:
                 message_lines.append(f"You reveal a hidden exit: {name}! {summary}")
 
-        if failures:
-            if successes:
-                message_lines.append("")
-            for kind, name, roll, dc, _ability in failures:
-                summary = f"(Perception roll {roll.total} vs DC {dc})"
-                if kind == "trap":
-                    message_lines.append(f"You fail to spot any hidden dangers {summary}.")
-                elif kind == "loot":
-                    message_lines.append(
-                        f"You fail to uncover any hidden treasure {summary}."
-                    )
-                else:
-                    message_lines.append(
-                        f"You fail to notice any hidden passages {summary}."
-                    )
-
         if not successes:
             message_lines.append(
                 "You can try again, though each failure may make the search more challenging."
