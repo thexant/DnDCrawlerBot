@@ -230,6 +230,7 @@ class DungeonSession:
     current_room: int = 0
     seed: Optional[int] = None
     party_ids: set[int] = field(default_factory=set)
+    fallen_players: set[object] = field(default_factory=set)
     message_id: Optional[int] = None
     combat_state: Optional["CombatState"] = None
     breadcrumbs: list[int] = field(default_factory=list)
@@ -800,6 +801,33 @@ class DungeonDeleteConfirmation(discord.ui.View):
         self.stop()
 
 
+class ReturnToTavernView(discord.ui.View):
+    def __init__(self, cog: "DungeonCog", session: DungeonSession) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.session = session
+
+    @discord.ui.button(
+        label="Return to Tavern",
+        style=discord.ButtonStyle.primary,
+        custom_id="dungeon:return_to_tavern",
+    )
+    async def return_to_tavern(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:  # noqa: D401
+        tavern_channel = await self.cog._find_tavern_channel(self.session.guild_id)
+        if tavern_channel is not None:
+            await interaction.response.send_message(
+                f"Head back to {tavern_channel.mention} to regroup and recover.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "No tavern channel is currently configured. Coordinate with your party to recover.",
+            ephemeral=True,
+        )
+
+
 class DungeonCog(commands.Cog):
     """Slash commands to generate and explore procedural dungeons."""
 
@@ -839,6 +867,93 @@ class DungeonCog(commands.Cog):
             self.content_library = library
             self.theme_registry = library.themes
             self._content_error = None
+
+    @staticmethod
+    def _fallen_identifier(combatant: CombatantState) -> object:
+        return combatant.user_id if combatant.user_id is not None else combatant.identifier
+
+    def _identify_newly_fallen(
+        self, session: DungeonSession, combat: CombatState
+    ) -> list[CombatantState]:
+        newly_fallen: list[CombatantState] = []
+        for combatant in combat.order:
+            if not combatant.is_player or not combatant.is_dead:
+                continue
+            key = self._fallen_identifier(combatant)
+            if key in session.fallen_players:
+                continue
+            session.fallen_players.add(key)
+            newly_fallen.append(combatant)
+        return newly_fallen
+
+    def _build_player_death_embed(
+        self, session: DungeonSession, combatant: CombatantState
+    ) -> discord.Embed:
+        room = session.room
+        embed = discord.Embed(
+            colour=discord.Colour.dark_red(),
+            title=f"A Hero Falls — {combatant.name}",
+            description=(
+                f"{combatant.name} has fallen in the depths of {session.dungeon.name}."
+            ),
+        )
+        if combatant.user_id is not None:
+            embed.add_field(
+                name="Adventurer",
+                value=f"<@{combatant.user_id}>",
+                inline=False,
+            )
+        embed.add_field(
+            name="Final Stand",
+            value=f"Room {room.id + 1}: {room.name}",
+            inline=False,
+        )
+        embed.add_field(
+            name="Last Known Vitality",
+            value=f"{max(combatant.current_hp, 0)}/{combatant.max_hp} HP",
+            inline=False,
+        )
+        embed.set_footer(text="Raise a toast at the tavern to honour the fallen.")
+        return embed
+
+    async def _announce_player_death(
+        self, session: DungeonSession, combatant: CombatantState
+    ) -> None:
+        guild_id = session.guild_id
+        user_id = combatant.user_id
+        if guild_id is not None and user_id is not None:
+            try:
+                await self.characters.clear(guild_id, user_id)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log.warning(
+                    "Failed to clear character %s in guild %s after death: %s",
+                    user_id,
+                    guild_id,
+                    exc,
+                )
+        channel = self.bot.get_channel(session.channel_id)
+        if channel is None:
+            return
+        send = getattr(channel, "send", None)
+        if not callable(send):
+            return
+        embed = self._build_player_death_embed(session, combatant)
+        view = ReturnToTavernView(self, session)
+        try:
+            message = await send(embed=embed, view=view)
+        except Exception:  # pragma: no cover - defensive logging
+            log.warning(
+                "Failed to deliver death announcement for %s in channel %s",
+                combatant.identifier,
+                session.channel_id,
+            )
+            return
+        message_id = getattr(message, "id", None)
+        if message_id is not None:
+            try:
+                self.bot.add_view(view, message_id=message_id)
+            except Exception:  # pragma: no cover - defensive logging
+                log.debug("Failed to register death view for message %s", message_id)
 
     def _session_key(self, guild_id: Optional[int], channel_id: Optional[int]) -> SessionKey:
         return SessionManager.make_key(guild_id, channel_id)
@@ -2504,6 +2619,9 @@ class DungeonCog(commands.Cog):
             if current.is_player and current.current_hp <= 0:
                 handled = self._handle_player_zero_hp_turn(state, current)
                 if handled:
+                    newly_fallen = self._identify_newly_fallen(session, state)
+                    for fallen in newly_fallen:
+                        await self._announce_player_death(session, fallen)
                     self._evaluate_combat_state(session, state)
                     await self._refresh_session_view(session)
                     if not state.active:
@@ -2530,6 +2648,9 @@ class DungeonCog(commands.Cog):
             if state.log and state.log[-1] == thinking_entry:
                 state.log.pop()
             self._resolve_monster_action(state, current)
+            newly_fallen = self._identify_newly_fallen(session, state)
+            for fallen in newly_fallen:
+                await self._announce_player_death(session, fallen)
             self._evaluate_combat_state(session, state)
             await self._refresh_session_view(session)
             if not state.active:
@@ -2839,6 +2960,7 @@ class DungeonCog(commands.Cog):
         session: DungeonSession,
         party_order: Optional[Sequence[int]] = None,
     ) -> CombatState:
+        session.fallen_players.clear()
         combatants: List[CombatantState] = []
         warnings_log: List[str] = []
         guild_id = interaction.guild_id
@@ -5132,13 +5254,14 @@ class DungeonCog(commands.Cog):
         error: Optional[str] = None
         summary: Optional[str] = None
         trigger_monster_turns = False
+        pending_fallen: list[CombatantState] = []
 
         if interaction.user.id not in current_session.party_ids:
             if not await self._ensure_character_available(interaction):
                 return
 
         def mutate(run: DungeonSession) -> None:
-            nonlocal added_member, error, summary, trigger_monster_turns
+            nonlocal added_member, error, summary, trigger_monster_turns, pending_fallen
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
@@ -5158,12 +5281,16 @@ class DungeonCog(commands.Cog):
 
             if action == "weapon" or action == "attack":
                 summary = self._player_weapon_attack(run, combat, current, selection)
+                pending_fallen.extend(self._identify_newly_fallen(run, combat))
             elif action == "spell":
                 summary = self._player_cast_spell(run, combat, current, selection)
+                pending_fallen.extend(self._identify_newly_fallen(run, combat))
             elif action == "feature":
                 summary = self._player_use_feature(combat, current, selection)
+                pending_fallen.extend(self._identify_newly_fallen(run, combat))
             elif action == "defend":
                 summary = self._player_defend(combat, current)
+                pending_fallen.extend(self._identify_newly_fallen(run, combat))
             elif action == "end":
                 combat.log.append(f"{current.name} ends their turn without further action.")
                 self._trim_combat_log(combat)
@@ -5188,6 +5315,9 @@ class DungeonCog(commands.Cog):
                 "No active dungeon for this party.",
             )
             return
+
+        for fallen in pending_fallen:
+            await self._announce_player_death(session, fallen)
 
         if trigger_monster_turns:
             self._schedule_automatic_turns(session, session.combat_state)

@@ -1,5 +1,10 @@
+import asyncio
 import random
+from typing import Optional
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import discord
 import pytest
 
 import dnd.combat as combat_utils
@@ -254,3 +259,92 @@ def test_player_spell_consumes_resources(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "automatically dealing" in summary
     assert resources["spell_slots"]["1"]["available"] == 1
     assert "Magic Missile" in state.log[-1]
+
+
+def test_player_death_announcement_clears_character_and_offers_return() -> None:
+    async def _run() -> None:
+        cog = _make_cog()
+        session = _make_session()
+        session.guild_id = 123
+        player = CombatantState(
+            identifier="player:fallen",
+            name="Fallen Hero",
+            initiative_roll=10,
+            initiative_total=12,
+            max_hp=20,
+            current_hp=0,
+            is_player=True,
+            user_id=42,
+            metadata={"armor_class": 12},
+            death_save_failures=3,
+        )
+        combat = CombatState(order=[player], log=[], active=True)
+        session.combat_state = combat
+
+        clear_mock = AsyncMock()
+        cog.characters = SimpleNamespace(clear=clear_mock)
+
+        class DummyChannel:
+            def __init__(self) -> None:
+                self.sent_messages: list[dict[str, object]] = []
+
+            async def send(
+                self, *, embed: discord.Embed, view: discord.ui.View
+            ) -> SimpleNamespace:
+                self.sent_messages.append({"embed": embed, "view": view})
+                return SimpleNamespace(id=987654321)
+
+        dummy_channel = DummyChannel()
+
+        class DummyBot:
+            def __init__(self, channel: DummyChannel) -> None:
+                self._channel = channel
+                self.registered: list[tuple[discord.ui.View, int]] = []
+
+            def get_channel(self, channel_id: int) -> DummyChannel:
+                return self._channel
+
+            def add_view(
+                self, view: discord.ui.View, message_id: Optional[int] = None
+            ) -> None:
+                self.registered.append((view, message_id))
+
+        cog.bot = DummyBot(dummy_channel)
+
+        await cog._announce_player_death(session, player)
+
+        assert clear_mock.await_count == 1
+        assert clear_mock.await_args_list[0].args == (session.guild_id, player.user_id)
+        assert dummy_channel.sent_messages, "Death announcement was not sent"
+
+        sent_payload = dummy_channel.sent_messages[0]
+        embed = sent_payload["embed"]
+        assert isinstance(embed, discord.Embed)
+        assert player.name in (embed.title or "")
+        assert "has fallen" in (embed.description or "")
+
+        view = sent_payload["view"]
+        assert isinstance(view, discord.ui.View)
+        buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+        assert any(button.label == "Return to Tavern" for button in buttons)
+
+        return_button = next(button for button in buttons if button.label == "Return to Tavern")
+        fake_tavern = SimpleNamespace(mention="#tavern")
+        cog._find_tavern_channel = AsyncMock(return_value=fake_tavern)
+
+        class DummyResponse:
+            def __init__(self) -> None:
+                self.messages: list[tuple[str, bool]] = []
+
+            async def send_message(self, content: str, *, ephemeral: bool) -> None:
+                self.messages.append((content, ephemeral))
+
+        interaction = SimpleNamespace(response=DummyResponse())
+        await return_button.callback(interaction)
+
+        assert interaction.response.messages
+        message_content, ephemeral = interaction.response.messages[0]
+        assert ephemeral is True
+        assert fake_tavern.mention in message_content
+
+    asyncio.run(_run())
