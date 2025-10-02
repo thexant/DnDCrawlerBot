@@ -123,6 +123,59 @@ def _find_field(embed, name: str):
     return None
 
 
+def test_starting_room_reveals_at_least_one_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    cog = _make_cog(monkeypatch)
+    exits = (
+        RoomExit(key="forward", label="Forward", destination=0),
+        RoomExit(key="secret", label="Secret Passage", destination=0),
+    )
+    session = _make_trap_session(exits=exits)
+
+    cog._ensure_room_discovery_state(session, session.room)
+
+    discovered = session.discovered_exits.get(session.room.id, set())
+    assert discovered, "Starting room should reveal at least one exit"
+    assert exits[0].key in discovered, "First exit should be visible by default"
+
+
+def test_non_starting_room_exits_remain_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    cog = _make_cog(monkeypatch)
+
+    empty_encounter = EncounterResult(kind="empty", summary="Quiet chamber.")
+    start_exit = RoomExit(key="start-forward", label="Forward", destination=1)
+    return_exit = RoomExit(key="return", label="Back", destination=0)
+
+    start_room = Room(id=0, name="Foyer", description="", encounter=empty_encounter, exits=(start_exit,))
+    second_room = Room(id=1, name="Chamber", description="", encounter=empty_encounter, exits=(return_exit,))
+
+    theme = Theme(
+        key="test",
+        name="Test",
+        description="",
+        room_templates=(),
+        monsters=(),
+        traps=(),
+        loot=(),
+        encounter_table=EncounterTable({"empty": 1}),
+    )
+    dungeon = Dungeon(
+        name="Test Dungeon",
+        seed=None,
+        theme=theme,
+        difficulty="standard",
+        rooms=(start_room, second_room),
+        corridors=(),
+    )
+
+    session = DungeonSession(dungeon=dungeon, guild_id=None, channel_id=1)
+    session.current_room = 1
+
+    cog._ensure_room_discovery_state(session, session.room)
+
+    discovered = session.discovered_exits.get(session.room.id, set())
+    assert not discovered, "Non-starting rooms should keep exits hidden until discovered"
+
+
 def test_trap_hidden_until_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     cog = _make_cog(monkeypatch)
     session = _make_trap_session()

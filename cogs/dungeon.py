@@ -1270,8 +1270,13 @@ class DungeonCog(commands.Cog):
     def _ensure_room_discovery_state(self, session: DungeonSession, room: Room) -> None:
         session.discovered_traps.setdefault(room.id, set())
         session.discovered_loot.setdefault(room.id, set())
-        session.discovered_exits.setdefault(room.id, set())
+        discovered_exits = session.discovered_exits.setdefault(room.id, set())
         session.perception_attempts.setdefault(room.id, {})
+
+        if not discovered_exits and session.dungeon.rooms:
+            starting_room_id = session.dungeon.rooms[0].id
+            if room.id == starting_room_id and room.exits:
+                discovered_exits.add(room.exits[0].key)
 
     def _get_trap_status(
         self, session: DungeonSession, room_id: int, trap_key: str
