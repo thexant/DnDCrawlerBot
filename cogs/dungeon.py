@@ -3097,6 +3097,64 @@ class DungeonCog(commands.Cog):
         embed.set_footer(text=" • ".join(footer_parts))
         return embed
 
+    def _build_map_string(self, session: DungeonSession) -> str:
+        dungeon = session.dungeon
+        raw_positions = getattr(dungeon, "room_positions", None)
+        positions: Dict[int, tuple[int, int]] = {}
+        for room in dungeon.rooms:
+            if raw_positions and room.id in raw_positions:
+                pos = raw_positions[room.id]
+            else:
+                pos = getattr(room, "position", None)
+                if not isinstance(pos, tuple) or len(pos) != 2:
+                    pos = (room.id, 0)
+            positions[room.id] = pos
+
+        if not positions:
+            return "(no rooms)"
+
+        xs = [coord[0] for coord in positions.values()]
+        ys = [coord[1] for coord in positions.values()]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        reverse_lookup = {value: key for key, value in positions.items()}
+        lines: list[str] = []
+        for y in range(max_y, min_y - 1, -1):
+            cells: list[str] = []
+            for x in range(min_x, max_x + 1):
+                room_id = reverse_lookup.get((x, y))
+                if room_id is None:
+                    cells.append("   ")
+                    continue
+                label = f"{room_id + 1:02d}"
+                if room_id == session.current_room:
+                    cells.append(f"[{label}]")
+                else:
+                    cells.append(f" {label} ")
+            lines.append("".join(cells).rstrip())
+
+        # Ensure there is at least an empty string if all rows were blank (should not happen).
+        return "\n".join(lines) if lines else "(no rooms)"
+
+    def _build_session_embeds(
+        self, session: DungeonSession, *, interaction: Optional[discord.Interaction] = None
+    ) -> List[discord.Embed]:
+        map_string = self._build_map_string(session)
+        map_embed = discord.Embed(
+            title="Dungeon Map",
+            description=f"```\n{map_string}\n```",
+        )
+
+        embeds: List[discord.Embed] = [map_embed]
+        room_embed = self._build_room_embed(interaction, session)
+        embeds.append(room_embed)
+
+        combat_embed = self._build_combat_embed(session)
+        if combat_embed is not None:
+            embeds.append(combat_embed)
+        return embeds
+
     def _build_combat_embed(self, session: DungeonSession) -> Optional[discord.Embed]:
         combat = session.combat_state
         if combat is None or not combat.active:
@@ -3193,11 +3251,7 @@ class DungeonCog(commands.Cog):
                 message = await channel.fetch_message(session.message_id)
             except (discord.HTTPException, AttributeError):
                 return
-        room_embed = self._build_room_embed(None, session)
-        embeds: List[discord.Embed] = [room_embed]
-        combat_embed = self._build_combat_embed(session)
-        if combat_embed is not None:
-            embeds.append(combat_embed)
+        embeds = self._build_session_embeds(session)
         view = self._build_navigation_view(session)
         try:
             await message.edit(embeds=embeds, view=view)
@@ -3208,11 +3262,7 @@ class DungeonCog(commands.Cog):
     async def _refresh_session_message(self, interaction: discord.Interaction, session: DungeonSession) -> None:
         if session.message_id is None:
             return
-        room_embed = self._build_room_embed(interaction, session)
-        embeds: List[discord.Embed] = [room_embed]
-        combat_embed = self._build_combat_embed(session)
-        if combat_embed is not None:
-            embeds.append(combat_embed)
+        embeds = self._build_session_embeds(session, interaction=interaction)
         view = self._build_navigation_view(session)
         try:
             await interaction.followup.edit_message(
@@ -3318,11 +3368,7 @@ class DungeonCog(commands.Cog):
 
         await self._sync_party_channel_access(session)
 
-        room_embed = self._build_room_embed(interaction, session)
-        embeds: List[discord.Embed] = [room_embed]
-        combat_embed = self._build_combat_embed(session)
-        if combat_embed is not None:
-            embeds.append(combat_embed)
+        embeds = self._build_session_embeds(session, interaction=interaction)
         view = self._build_navigation_view(session)
         try:
             message = await party_channel.send(embeds=embeds, view=view)

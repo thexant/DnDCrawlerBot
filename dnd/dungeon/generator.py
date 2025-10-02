@@ -45,6 +45,7 @@ class Room:
     description: str
     encounter: EncounterResult
     exits: Sequence["RoomExit"] = field(default_factory=tuple)
+    position: tuple[int, int] = (0, 0)
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class Dungeon:
     difficulty: str
     rooms: Sequence[Room]
     corridors: Sequence[Corridor]
+    room_positions: Dict[int, tuple[int, int]] = field(default_factory=dict)
 
     def get_room(self, room_id: int) -> Room:
         for room in self.rooms:
@@ -212,6 +214,8 @@ class DungeonGenerator:
 
         rooms: List[Room] = []
         corridors: List[Corridor] = []
+        positions: Dict[int, tuple[int, int]] = {}
+        occupied: set[tuple[int, int]] = set()
         adjacency: Dict[int, set[int]] = defaultdict(set)
 
         def add_corridor_between(first: int, second: int) -> None:
@@ -224,19 +228,82 @@ class DungeonGenerator:
             adjacency[first].add(second)
             adjacency[second].add(first)
 
+        def allocate_position(room_id: int, *, anchor: int | None = None) -> tuple[int, int]:
+            if not positions:
+                origin = (0, 0)
+                positions[room_id] = origin
+                occupied.add(origin)
+                return origin
+
+            candidates = list(range(room_id)) if anchor is None else [anchor]
+            if not candidates:
+                origin = (0, 0)
+                positions[room_id] = origin
+                occupied.add(origin)
+                return origin
+
+            self._rng.shuffle(candidates)
+            offsets = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+            for candidate_anchor in candidates:
+                anchor_position = positions[candidate_anchor]
+                shuffled_offsets = offsets[:]
+                self._rng.shuffle(shuffled_offsets)
+                for dx, dy in shuffled_offsets:
+                    candidate_position = (anchor_position[0] + dx, anchor_position[1] + dy)
+                    if candidate_position not in occupied:
+                        positions[room_id] = candidate_position
+                        occupied.add(candidate_position)
+                        return candidate_position
+
+            # Fallback: expand search outward from chosen anchor until a space is found.
+            fallback_anchor = candidates[0]
+            anchor_position = positions[fallback_anchor]
+            radius = 2
+            while True:
+                potential: list[tuple[int, int]] = []
+                for dx in range(-radius, radius + 1):
+                    for dy in range(-radius, radius + 1):
+                        if abs(dx) + abs(dy) != radius:
+                            continue
+                        candidate_position = (anchor_position[0] + dx, anchor_position[1] + dy)
+                        if candidate_position not in occupied:
+                            potential.append(candidate_position)
+                if potential:
+                    choice = self._rng.choice(potential)
+                    positions[room_id] = choice
+                    occupied.add(choice)
+                    return choice
+                radius += 1
+
         for index in range(room_count):
             room = self._generate_room(index, difficulty=active_difficulty)
             rooms.append(room)
             adjacency[room.id]  # ensure key initialised
-            if index > 0:
-                previous_indices = list(range(index))
-                primary = self._rng.choice(previous_indices)
-                add_corridor_between(primary, index)
+            if index == 0:
+                room.position = allocate_position(room.id)
+                continue
 
-                alternate_candidates = [candidate for candidate in previous_indices if candidate != primary]
-                if alternate_candidates and self._rng.random() < 0.35:
-                    secondary = self._rng.choice(alternate_candidates)
-                    add_corridor_between(secondary, index)
+            previous_indices = list(range(index))
+            primary_candidates = previous_indices[:]
+            self._rng.shuffle(primary_candidates)
+            primary = primary_candidates[0]
+            for candidate in primary_candidates:
+                anchor_position = positions[candidate]
+                neighbors = [
+                    (anchor_position[0] + dx, anchor_position[1] + dy)
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                ]
+                if any(neighbor not in occupied for neighbor in neighbors):
+                    primary = candidate
+                    break
+            room.position = allocate_position(room.id, anchor=primary)
+            add_corridor_between(primary, index)
+
+            alternate_candidates = [candidate for candidate in previous_indices if candidate != primary]
+            if alternate_candidates and self._rng.random() < 0.35:
+                secondary = self._rng.choice(alternate_candidates)
+                add_corridor_between(secondary, index)
 
         if room_count > 2:
             potential_pairs: list[tuple[int, int]] = []
@@ -275,6 +342,8 @@ class DungeonGenerator:
 
         for room in rooms:
             room.exits = tuple(exits_map.get(room.id, ()))
+            if room.id in positions:
+                room.position = positions[room.id]
 
         dungeon_name = name or f"{self.theme.name} Expedition"
         return Dungeon(
@@ -284,6 +353,7 @@ class DungeonGenerator:
             difficulty=active_difficulty,
             rooms=tuple(rooms),
             corridors=tuple(corridors),
+            room_positions=dict(positions),
         )
 
     def _generate_room(self, room_index: int, *, difficulty: str) -> Room:
