@@ -308,7 +308,8 @@ def test_failed_perception_keeps_trap_hidden(monkeypatch: pytest.MonkeyPatch) ->
     assert attempts == 1
     assert interaction.followup.sent_messages
     message = interaction.followup.sent_messages[-1]
-    assert "fail to spot" in message
+    assert "fail to spot" not in message
+    assert "fail to uncover" not in message
     assert "scoured" not in message
     assert "try again" in message
 
