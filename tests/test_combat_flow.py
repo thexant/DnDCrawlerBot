@@ -35,6 +35,100 @@ def _make_cog() -> DungeonCog:
     return DungeonCog.__new__(DungeonCog)
 
 
+def test_combat_embed_highlights_player_action() -> None:
+    cog = _make_cog()
+    session = _make_session()
+    player = CombatantState(
+        identifier="player:hero",
+        name="Hero",
+        initiative_roll=15,
+        initiative_total=18,
+        max_hp=20,
+        current_hp=18,
+        is_player=True,
+        user_id=1,
+        metadata={"armor_class": 13},
+    )
+    monster = CombatantState(
+        identifier="monster:goblin",
+        name="Goblin",
+        initiative_roll=10,
+        initiative_total=12,
+        max_hp=12,
+        current_hp=12,
+        is_player=False,
+        metadata={"armor_class": 12},
+    )
+    state = CombatState(order=[player, monster], log=[], active=True)
+    state.turn_index = 0
+    state.current_action = {
+        "actor": player.name,
+        "state": "weapon attack",
+        "summary": "Striking Goblin with Longsword",
+        "detail": "You hit Goblin for 7 damage!",
+        "emoji": "⚔️",
+        "team": "player",
+    }
+    session.combat_state = state
+
+    embed = cog._build_combat_embed(session)
+
+    assert embed is not None
+    action_field = next(field for field in embed.fields if field.name.endswith("Player Action"))
+    assert action_field.name == "⚔️ Player Action"
+    assert "**Hero**" in action_field.value
+    assert "Striking Goblin with Longsword" in action_field.value
+    assert "*Weapon Attack*" in action_field.value
+    assert "You hit Goblin for 7 damage!" in action_field.value
+
+
+def test_combat_embed_shows_enemy_thinking() -> None:
+    cog = _make_cog()
+    session = _make_session()
+    player = CombatantState(
+        identifier="player:hero",
+        name="Hero",
+        initiative_roll=15,
+        initiative_total=18,
+        max_hp=20,
+        current_hp=18,
+        is_player=True,
+        user_id=1,
+        metadata={"armor_class": 13},
+    )
+    monster = CombatantState(
+        identifier="monster:goblin",
+        name="Goblin",
+        initiative_roll=19,
+        initiative_total=22,
+        max_hp=12,
+        current_hp=12,
+        is_player=False,
+        metadata={"armor_class": 12},
+    )
+    state = CombatState(order=[monster, player], log=[], active=True)
+    state.turn_index = 0
+    state.current_action = {
+        "actor": monster.name,
+        "state": "thinking",
+        "summary": "Plotting their next move...",
+        "detail": "The goblin eyes the party, biding its time.",
+        "emoji": "🤔",
+        "team": "enemy",
+    }
+    session.combat_state = state
+
+    embed = cog._build_combat_embed(session)
+
+    assert embed is not None
+    action_field = next(field for field in embed.fields if field.name.endswith("Enemy Turn"))
+    assert action_field.name == "🤔 Enemy Turn"
+    assert "**Goblin**" in action_field.value
+    assert "Plotting their next move" in action_field.value
+    assert "*Thinking*" in action_field.value
+    assert "The goblin eyes the party" in action_field.value
+
+
 def test_monster_multiattack_respects_resistances_and_advantage(monkeypatch: pytest.MonkeyPatch) -> None:
     cog = _make_cog()
     player = CombatantState(
