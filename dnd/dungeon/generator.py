@@ -212,19 +212,53 @@ class DungeonGenerator:
 
         rooms: List[Room] = []
         corridors: List[Corridor] = []
+        adjacency: Dict[int, set[int]] = defaultdict(set)
+
+        def add_corridor_between(first: int, second: int) -> None:
+            if first == second:
+                return
+            if second in adjacency[first]:
+                return
+            corridor = self._generate_corridor(rooms[first], rooms[second])
+            corridors.append(corridor)
+            adjacency[first].add(second)
+            adjacency[second].add(first)
 
         for index in range(room_count):
             room = self._generate_room(index, difficulty=active_difficulty)
             rooms.append(room)
+            adjacency[room.id]  # ensure key initialised
             if index > 0:
-                corridor = self._generate_corridor(rooms[index - 1], room)
-                corridors.append(corridor)
+                previous_indices = list(range(index))
+                primary = self._rng.choice(previous_indices)
+                add_corridor_between(primary, index)
+
+                alternate_candidates = [candidate for candidate in previous_indices if candidate != primary]
+                if alternate_candidates and self._rng.random() < 0.35:
+                    secondary = self._rng.choice(alternate_candidates)
+                    add_corridor_between(secondary, index)
+
+        if room_count > 2:
+            potential_pairs: list[tuple[int, int]] = []
+            for first in range(room_count):
+                for second in range(first + 1, room_count):
+                    if second not in adjacency[first]:
+                        potential_pairs.append((first, second))
+            self._rng.shuffle(potential_pairs)
+            extra_corridors = self._rng.randint(0, max(1, room_count // 2))
+            added = 0
+            for first, second in potential_pairs:
+                if added >= extra_corridors:
+                    break
+                add_corridor_between(first, second)
+                added += 1
 
         exits_map: dict[int, list[RoomExit]] = defaultdict(list)
-        for corridor in corridors:
+        for corridor_index, corridor in enumerate(corridors):
+            corridor_key = f"c{corridor_index}"
             exits_map[corridor.from_room].append(
                 RoomExit(
-                    key=f"r{corridor.from_room}:to{corridor.to_room}:{len(exits_map[corridor.from_room])}",
+                    key=f"{corridor_key}:r{corridor.from_room}->r{corridor.to_room}",
                     label=corridor.from_label,
                     destination=corridor.to_room,
                     description=corridor.description,
@@ -232,7 +266,7 @@ class DungeonGenerator:
             )
             exits_map[corridor.to_room].append(
                 RoomExit(
-                    key=f"r{corridor.to_room}:to{corridor.from_room}:{len(exits_map[corridor.to_room])}",
+                    key=f"{corridor_key}:r{corridor.to_room}->r{corridor.from_room}",
                     label=corridor.to_label,
                     destination=corridor.from_room,
                     description=corridor.description,
