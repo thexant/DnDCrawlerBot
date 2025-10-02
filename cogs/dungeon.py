@@ -317,6 +317,7 @@ class CombatState:
     active: bool = True
     round_number: int = 1
     log: List[str] = field(default_factory=list)
+    current_action: Optional[Dict[str, str]] = None
 
     def current_combatant(self) -> Optional[CombatantState]:
         if not self.order:
@@ -1818,6 +1819,7 @@ class DungeonCog(commands.Cog):
     def _finish_combat(self, session: DungeonSession, state: CombatState, *, victory: bool) -> None:
         state.active = False
         state.waiting_for = None
+        state.current_action = None
         session.stealthed = False
         if victory:
             state.log.append("The party is victorious!")
@@ -2016,6 +2018,14 @@ class DungeonCog(commands.Cog):
             if combatant.is_player and not combatant.is_dead
         ]
         if not potential_targets:
+            state.current_action = {
+                "actor": monster.name,
+                "state": "idle",
+                "summary": "Searching for a target",
+                "detail": f"{monster.name} finds no adventurers to strike.",
+                "emoji": "👹",
+                "team": "enemy",
+            }
             return None
         conscious_targets = [target for target in potential_targets if target.current_hp > 0]
         if conscious_targets:
@@ -2029,7 +2039,15 @@ class DungeonCog(commands.Cog):
         vulnerabilities = self._normalise_damage_traits(target.metadata.get("vulnerabilities"))
         immunities = self._normalise_damage_traits(target.metadata.get("immunities"))
         message: Optional[str]
+        action_payload = {
+            "actor": monster.name,
+            "state": "monster action",
+            "summary": f"Strikes at {target.name}",
+            "emoji": "👹",
+            "team": "enemy",
+        }
         if multiattack:
+            action_payload["summary"] = f"Unleashing a flurry against {target.name}"
             message = self._execute_monster_multiattack(
                 monster,
                 target,
@@ -2070,8 +2088,17 @@ class DungeonCog(commands.Cog):
                     vulnerabilities=vulnerabilities,
                     immunities=immunities,
                 )
+            action_name = str(action.get("name", action_type.title())) if action else action_type.title()
+            if action_type == "save":
+                action_payload["summary"] = f"Forcing {target.name} to resist {action_name}"
+            elif action_type == "auto":
+                action_payload["summary"] = f"Unleashing {action_name} on {target.name}"
+            else:
+                action_payload["summary"] = f"Striking {target.name} with {action_name}"
         if not message:
             message = f"{monster.name} hesitates, accomplishing nothing."
+        action_payload["detail"] = message
+        state.current_action = action_payload
         state.log.append(message)
         self._trim_combat_log(state)
         return message
@@ -2613,6 +2640,7 @@ class DungeonCog(commands.Cog):
             await self._refresh_session_view(session)
             return
         while state.active:
+            state.current_action = None
             current = state.current_combatant()
             if current is None:
                 break
@@ -2637,9 +2665,23 @@ class DungeonCog(commands.Cog):
                 continue
             if current.is_player:
                 state.waiting_for = current.user_id
+                state.current_action = {
+                    "actor": current.name,
+                    "state": "awaiting action",
+                    "summary": "Awaiting their next move...",
+                    "emoji": "🎲",
+                    "team": "player",
+                }
                 await self._refresh_session_view(session)
                 break
             state.waiting_for = None
+            state.current_action = {
+                "actor": current.name,
+                "state": "thinking",
+                "summary": "Plotting their next move...",
+                "emoji": "🤔",
+                "team": "enemy",
+            }
             thinking_entry = "Enemy is thinking..."
             state.log.append(thinking_entry)
             self._trim_combat_log(state)
@@ -2660,6 +2702,7 @@ class DungeonCog(commands.Cog):
                 break
         if not state.active:
             state.waiting_for = None
+            state.current_action = None
             await self._refresh_session_view(session)
 
     def _schedule_automatic_turns(
@@ -2711,6 +2754,17 @@ class DungeonCog(commands.Cog):
             damage_expr = str(option.get("damage", damage_expr))
             weapon_label = str(option.get("name", weapon_label))
         target_ac = int(target.metadata.get("armor_class", 10))
+        if weapon_label.lower() == "weapon":
+            action_summary = f"Attacking {target.name}"
+        else:
+            action_summary = f"Striking {target.name} with {weapon_label}"
+        action_payload = {
+            "actor": player.name,
+            "state": "weapon attack",
+            "summary": action_summary,
+            "emoji": "⚔️",
+            "team": "player",
+        }
         result = attack_roll(attack_bonus, target_ac)
         if result.hits:
             extra_dice = option.get("critical_extra_dice") if isinstance(option, Mapping) else None
@@ -2751,6 +2805,8 @@ class DungeonCog(commands.Cog):
                 f"{player.name}'s attack{weapon_text} misses {target.name}. "
                 f"(Attack {result.total} vs AC {target_ac})"
             )
+        action_payload["detail"] = summary
+        state.current_action = action_payload
         state.log.append(log_entry)
         self._trim_combat_log(state)
         self._evaluate_combat_state(session, state)
@@ -2797,6 +2853,18 @@ class DungeonCog(commands.Cog):
             critical_dice = None
         log_entry: str
         summary: str
+        target_label = target.name if target is not None else "the area"
+        if target_required and target is not None:
+            action_summary = f"Casting {spell_name} at {target_label}"
+        else:
+            action_summary = f"Channeling {spell_name}"
+        action_payload = {
+            "actor": player.name,
+            "state": "spell",
+            "summary": action_summary,
+            "emoji": "✨",
+            "team": "player",
+        }
         if effect_type == "attack" and target is not None:
             target_ac = int(target.metadata.get("armor_class", DEFAULT_PLAYER_ARMOR_CLASS))
             result = attack_roll(attack_bonus, target_ac)
@@ -2896,6 +2964,8 @@ class DungeonCog(commands.Cog):
         if status_text:
             summary += f" {status_text}"
         self._sync_combatant_state(player)
+        action_payload["detail"] = summary
+        state.current_action = action_payload
         state.log.append(log_entry)
         self._trim_combat_log(state)
         self._evaluate_combat_state(session, state)
@@ -2923,6 +2993,13 @@ class DungeonCog(commands.Cog):
         effect = feature.get("effects") if isinstance(feature, Mapping) else None
         log_entry = f"{player.name} uses {feature_name}."
         summary = f"You activate {feature_name}."
+        action_payload = {
+            "actor": player.name,
+            "state": "feature",
+            "summary": f"Activating {feature_name}",
+            "emoji": "🎖️",
+            "team": "player",
+        }
         if isinstance(effect, Mapping):
             effect_type = str(effect.get("type", "")).lower()
             if effect_type == "heal":
@@ -2944,12 +3021,22 @@ class DungeonCog(commands.Cog):
         if status_text:
             summary += f" {status_text}"
         self._sync_combatant_state(player)
+        action_payload["detail"] = summary
+        state.current_action = action_payload
         state.log.append(log_entry)
         self._trim_combat_log(state)
         return summary
 
     def _player_defend(self, state: CombatState, player: CombatantState) -> str:
         message = f"{player.name} takes a defensive stance, ready for the next assault."
+        state.current_action = {
+            "actor": player.name,
+            "state": "defend",
+            "summary": "Taking a defensive stance",
+            "detail": "You brace yourself, gaining no additional effects but readying for the next turn.",
+            "emoji": "🛡️",
+            "team": "player",
+        }
         state.log.append(message)
         self._trim_combat_log(state)
         return "You brace yourself, gaining no additional effects but readying for the next turn."
@@ -3718,6 +3805,32 @@ class DungeonCog(commands.Cog):
         else:
             turn_text = f"Round {combat.round_number}: resolving initiative..."
         embed.add_field(name="Current Turn", value=turn_text, inline=False)
+
+        current_action = combat.current_action or {}
+        if current_action:
+            team = current_action.get("team")
+            if team == "enemy":
+                section_label = "Enemy Turn"
+            elif team == "player":
+                section_label = "Player Action"
+            else:
+                section_label = "Current Action"
+            emoji = current_action.get("emoji") or ("👹" if team == "enemy" else "🎲")
+            field_name = f"{emoji} {section_label}".strip()
+            actor = current_action.get("actor") or "Unknown"
+            summary_line = current_action.get("summary") or "Taking action..."
+            detail = current_action.get("detail")
+            state_label = current_action.get("state")
+            value_lines: List[str] = [f"**{actor}** — {summary_line}"]
+            if state_label:
+                formatted_state = state_label.replace("_", " ").title()
+                value_lines.append(f"*{formatted_state}*")
+            if detail and detail != summary_line:
+                value_lines.append(str(detail))
+            action_value = "\n".join(value_lines)
+            if len(action_value) > 1024:
+                action_value = action_value[:1021] + "..."
+            embed.add_field(name=field_name, value=action_value or "Taking action...", inline=False)
 
         if combat.waiting_for is not None:
             waiting = next(
@@ -5279,6 +5392,7 @@ class DungeonCog(commands.Cog):
                 error = "It isn't your turn to act."
                 return
 
+            combat.waiting_for = None
             if action == "weapon" or action == "attack":
                 summary = self._player_weapon_attack(run, combat, current, selection)
                 pending_fallen.extend(self._identify_newly_fallen(run, combat))
