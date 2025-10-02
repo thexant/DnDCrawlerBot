@@ -407,6 +407,22 @@ def test_exit_hidden_until_discovered(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exit_field is not None
     assert "No obvious exits" in exit_field.value
 
+    async def _build_view(target_session: DungeonSession):
+        return dungeon_module.DungeonNavigationView(cog, target_session)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        view = loop.run_until_complete(_build_view(session))
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+    exit_custom_id = f"dungeon:exit:{session.channel_id}:{secret_exit.key}"
+    assert all(
+        getattr(item, "custom_id", None) != exit_custom_id for item in view.children
+    )
+
     async def runner() -> None:
         await cog.sessions.set(key, session)
         results = iter(
@@ -426,10 +442,25 @@ def test_exit_hidden_until_discovered(monkeypatch: pytest.MonkeyPatch) -> None:
 
     asyncio.run(runner())
 
-    embed_after = cog._build_room_embed(None, session)
+    updated_session = asyncio.run(cog.sessions.get(key))
+    assert updated_session is not None
+
+    embed_after = cog._build_room_embed(None, updated_session)
     exit_field_after = _find_field(embed_after, "Exits")
     assert exit_field_after is not None
     assert "Secret Door" in exit_field_after.value
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        view_after = loop.run_until_complete(_build_view(updated_session))
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+    assert any(
+        getattr(item, "custom_id", None) == exit_custom_id for item in view_after.children
+    )
 
 
 def test_disarm_button_requires_detection(monkeypatch: pytest.MonkeyPatch) -> None:

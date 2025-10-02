@@ -404,7 +404,10 @@ class DungeonNavigationView(discord.ui.View):
         self.add_item(button)
 
     def _add_exit_controls(self, session: DungeonSession) -> None:
+        discovered = session.discovered_exits.get(session.room.id, set())
         for exit_option in session.room.exits:
+            if exit_option.key not in discovered:
+                continue
             custom_id = f"dungeon:exit:{session.channel_id}:{exit_option.key}"
             button = discord.ui.Button(
                 label=exit_option.label,
@@ -4589,11 +4592,11 @@ class DungeonCog(commands.Cog):
                     message_lines.append(f"You fail to spot any hidden dangers {summary}.")
                 elif kind == "loot":
                     message_lines.append(
-                        f"You fail to uncover the stash of {name} {summary}."
+                        f"You fail to uncover any hidden treasure {summary}."
                     )
                 else:
                     message_lines.append(
-                        f"You fail to find any sign of the {name} {summary}."
+                        f"You fail to notice any hidden passages {summary}."
                     )
 
         if not successes:
