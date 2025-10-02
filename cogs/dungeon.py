@@ -3009,12 +3009,25 @@ class DungeonCog(commands.Cog):
     ) -> discord.Embed:
         room = session.room
         dungeon = session.dungeon
+        self._ensure_room_trap_state(session, room)
+        self._ensure_room_discovery_state(session, room)
+        trap_catalog = session.trap_catalog.get(room.id, {})
+        trap_states = session.trap_states.get(room.id, {})
+        discovered_traps = session.discovered_traps.get(room.id, set())
+        trap_detected = any(
+            trap_states.get(trap.key, "hidden") != "hidden" or trap.key in discovered_traps
+            for trap in room.encounter.traps
+        )
+
         embed = discord.Embed(
             title=f"{dungeon.name} — Room {room.id + 1}: {room.name}",
             description=room.description,
             color=discord.Color.dark_purple(),
         )
-        embed.add_field(name="Encounter", value=room.encounter.summary or "Quiet for now.", inline=False)
+        encounter_summary = room.encounter.summary or "Quiet for now."
+        if room.encounter.traps and not trap_detected:
+            encounter_summary = "Quiet for now."
+        embed.add_field(name="Encounter", value=encounter_summary, inline=False)
 
         if room.encounter.monsters:
             monsters = "\n".join(
@@ -3023,11 +3036,6 @@ class DungeonCog(commands.Cog):
             )
             embed.add_field(name="Monsters", value=monsters, inline=False)
 
-        self._ensure_room_trap_state(session, room)
-        self._ensure_room_discovery_state(session, room)
-        trap_catalog = session.trap_catalog.get(room.id, {})
-        trap_states = session.trap_states.get(room.id, {})
-        discovered_traps = session.discovered_traps.get(room.id, set())
         if trap_catalog:
             trap_lines: list[str] = []
             ordered_keys = [trap.key for trap in room.encounter.traps]

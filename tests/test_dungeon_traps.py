@@ -85,9 +85,10 @@ def _make_trap_session(
     )
     trap_pool = traps if traps is not None else (default_trap,)
     exit_pool = exits if exits is not None else (RoomExit(key="forward", label="Forward", destination=0),)
+    trap_names = ", ".join(trap.name for trap in trap_pool) or "Subtle hazard"
     trap_encounter = EncounterResult(
         kind="trap",
-        summary="A precarious hazard lurks here.",
+        summary=f"A trap calibrated for standard adventurers: {trap_names}.",
         traps=trap_pool,
         loot=loot,
         monsters=(),
@@ -184,7 +185,11 @@ def test_trap_hidden_until_detected(monkeypatch: pytest.MonkeyPatch) -> None:
         exit_option.key for exit_option in session.room.exits
     )
 
+    trap_name = session.room.encounter.traps[0].name
     embed = cog._build_room_embed(None, session)
+    encounter_field = _find_field(embed, "Encounter")
+    assert encounter_field is not None
+    assert trap_name not in encounter_field.value
     assert _find_field(embed, "Traps") is None
 
     interaction = DummyInteraction()
@@ -210,6 +215,9 @@ def test_trap_hidden_until_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     asyncio.run(runner())
 
     detected_embed = cog._build_room_embed(None, session)
+    detected_encounter_field = _find_field(detected_embed, "Encounter")
+    assert detected_encounter_field is not None
+    assert trap_name in detected_encounter_field.value
     trap_field = _find_field(detected_embed, "Traps")
     assert trap_field is not None
     assert "detected" in trap_field.value
