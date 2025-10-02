@@ -73,6 +73,8 @@ DEFAULT_PLAYER_ARMOR_CLASS = 13
 DEFAULT_PLAYER_ATTACK_BONUS = 5
 DEFAULT_PLAYER_DAMAGE = "1d8+3"
 PROFICIENCY_BONUS = 2
+MONSTER_THINKING_DELAY_RANGE = (5, 10)
+MONSTER_ACTION_PAUSE_RANGE = (3, 5)
 SPELLCASTING_ABILITIES: Dict[str, str] = {
     "wizard": "INT",
 }
@@ -2686,7 +2688,7 @@ class DungeonCog(commands.Cog):
             state.log.append(thinking_entry)
             self._trim_combat_log(state)
             await self._refresh_session_view(session)
-            await asyncio.sleep(random.uniform(5, 10))
+            await asyncio.sleep(random.uniform(*MONSTER_THINKING_DELAY_RANGE))
             if state.log and state.log[-1] == thinking_entry:
                 state.log.pop()
             self._resolve_monster_action(state, current)
@@ -2695,6 +2697,7 @@ class DungeonCog(commands.Cog):
                 await self._announce_player_death(session, fallen)
             self._evaluate_combat_state(session, state)
             await self._refresh_session_view(session)
+            await asyncio.sleep(random.uniform(*MONSTER_ACTION_PAUSE_RANGE))
             if not state.active:
                 break
             next_combatant = state.advance_turn()
