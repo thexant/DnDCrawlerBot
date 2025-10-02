@@ -121,3 +121,62 @@ def test_map_draws_vertical_corridors() -> None:
     assert "[01]" in map_string or "[02]" in map_string
     assert "+----+" in map_string
     assert "   |" in map_string
+
+
+def test_resolve_room_positions_infers_missing_coordinates() -> None:
+    empty_encounter = EncounterResult(kind="empty", summary="Quiet chamber.")
+    rooms = [
+        Room(id=0, name="Alpha", description="", encounter=empty_encounter),
+        Room(id=1, name="Beta", description="", encounter=empty_encounter),
+        Room(id=2, name="Gamma", description="", encounter=empty_encounter),
+    ]
+
+    corridor_chain = (
+        Corridor(
+            from_room=0,
+            to_room=1,
+            description="",
+            from_label="Northern archway",
+            to_label="Southern archway",
+        ),
+        Corridor(
+            from_room=1,
+            to_room=2,
+            description="",
+            from_label="Eastern stair",
+            to_label="Western stair",
+        ),
+    )
+
+    theme = Theme(
+        key="test",
+        name="Test Theme",
+        description="",
+        room_templates=(),
+        monsters=(),
+        traps=(),
+        loot=(),
+        encounter_table=EncounterTable({"empty": 1}),
+    )
+    dungeon = Dungeon(
+        name="Chain",
+        seed=None,
+        theme=theme,
+        difficulty="standard",
+        rooms=tuple(rooms),
+        corridors=corridor_chain,
+        room_positions={0: (5, 5)},
+    )
+
+    session = DungeonSession(dungeon=dungeon, guild_id=None, channel_id=7)
+    cog = DungeonCog.__new__(DungeonCog)
+    resolved = cog._resolve_room_positions(dungeon)
+
+    assert resolved[0] == (5, 5)
+    assert resolved[1] == (6, 5)
+    assert resolved[2] == (7, 5)
+
+    map_string = cog._build_map_string(session)
+    assert "[01]" in map_string
+    assert " 02" in map_string
+    assert " 03" in map_string

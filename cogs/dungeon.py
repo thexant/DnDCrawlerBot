@@ -3134,18 +3134,127 @@ class DungeonCog(commands.Cog):
         embed.set_footer(text=" • ".join(footer_parts))
         return embed
 
+    def _resolve_room_positions(self, dungeon: Dungeon) -> Dict[int, tuple[int, int]]:
+        raw_positions = getattr(dungeon, "room_positions", None) or {}
+        room_position_values = [getattr(room, "position", None) for room in dungeon.rooms]
+        use_room_attributes = any(
+            value not in (None, (0, 0)) for value in room_position_values
+        )
+        positions: Dict[int, tuple[int, int]] = {}
+        occupied: Set[tuple[int, int]] = set()
+
+        def normalise(value: object) -> Optional[tuple[int, int]]:
+            if isinstance(value, tuple) and len(value) == 2:
+                candidate = value
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                candidate = tuple(value[:2])  # type: ignore[index]
+                if len(candidate) != 2:
+                    return None
+            else:
+                return None
+            try:
+                x = int(candidate[0])
+                y = int(candidate[1])
+            except (TypeError, ValueError):
+                return None
+            return (x, y)
+
+        for room in dungeon.rooms:
+            raw = raw_positions.get(room.id)
+            if raw is None and use_room_attributes:
+                raw = getattr(room, "position", None)
+            normalised = normalise(raw)
+            if normalised is not None:
+                positions[room.id] = normalised
+                occupied.add(normalised)
+
+        adjacency: Dict[int, Set[int]] = {room.id: set() for room in dungeon.rooms}
+        for corridor in getattr(dungeon, "corridors", ()):
+            adjacency.setdefault(corridor.from_room, set()).add(corridor.to_room)
+            adjacency.setdefault(corridor.to_room, set()).add(corridor.from_room)
+
+        unplaced: Set[int] = {
+            room.id for room in dungeon.rooms if room.id not in positions
+        }
+
+        directions: tuple[tuple[int, int], ...] = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+        def search_ring(origin: tuple[int, int]) -> tuple[int, int]:
+            radius = 0
+            while True:
+                for dy in range(-radius, radius + 1):
+                    for dx in range(-radius, radius + 1):
+                        if abs(dx) + abs(dy) != radius:
+                            continue
+                        candidate = (origin[0] + dx, origin[1] + dy)
+                        if candidate not in occupied:
+                            return candidate
+                radius += 1
+
+        def allocate_neighbor(anchor_id: int, target_id: int) -> tuple[int, int]:
+            anchor_position = positions[anchor_id]
+            for dx, dy in directions:
+                candidate = (anchor_position[0] + dx, anchor_position[1] + dy)
+                if candidate not in occupied:
+                    return candidate
+
+            assigned_neighbors = [
+                positions[neighbor]
+                for neighbor in sorted(adjacency.get(target_id, ()))
+                if neighbor in positions and neighbor != anchor_id
+            ]
+            for neighbor_pos in assigned_neighbors:
+                for dx, dy in directions:
+                    candidate = (neighbor_pos[0] + dx, neighbor_pos[1] + dy)
+                    if candidate not in occupied:
+                        return candidate
+
+            return search_ring(anchor_position)
+
+        queue: deque[int] = deque(sorted(positions.keys()))
+        if not queue and dungeon.rooms:
+            start_id = dungeon.rooms[0].id
+            start_pos = (0, 0)
+            positions[start_id] = start_pos
+            occupied.add(start_pos)
+            queue.append(start_id)
+            unplaced.discard(start_id)
+
+        processed: Set[int] = set()
+        while queue or unplaced:
+            if not queue:
+                orphan_id = min(unplaced)
+                origin = (0, 0)
+                start = search_ring(origin)
+                positions[orphan_id] = start
+                occupied.add(start)
+                queue.append(orphan_id)
+                unplaced.remove(orphan_id)
+                continue
+
+            current = queue.popleft()
+            if current in processed:
+                continue
+            processed.add(current)
+
+            for neighbor in sorted(adjacency.get(current, ())):
+                if neighbor in positions:
+                    if neighbor not in processed:
+                        queue.append(neighbor)
+                    continue
+                if current not in positions:
+                    continue
+                assigned = allocate_neighbor(current, neighbor)
+                positions[neighbor] = assigned
+                occupied.add(assigned)
+                queue.append(neighbor)
+                unplaced.discard(neighbor)
+
+        return positions
+
     def _build_map_string(self, session: DungeonSession) -> str:
         dungeon = session.dungeon
-        raw_positions = getattr(dungeon, "room_positions", None)
-        positions: Dict[int, tuple[int, int]] = {}
-        for room in dungeon.rooms:
-            if raw_positions and room.id in raw_positions:
-                pos = raw_positions[room.id]
-            else:
-                pos = getattr(room, "position", None)
-                if not isinstance(pos, tuple) or len(pos) != 2:
-                    pos = (room.id, 0)
-            positions[room.id] = pos
+        positions = self._resolve_room_positions(dungeon)
 
         if not positions:
             return "(no rooms)"
