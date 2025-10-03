@@ -1423,7 +1423,7 @@ class DungeonCog(commands.Cog):
         if not session.party_ids:
             return "No adventurers yet."
 
-        names: list[str] = []
+        entries: list[str] = []
         guild: Optional[discord.Guild]
         if interaction is not None and interaction.guild is not None:
             guild = interaction.guild
@@ -1432,12 +1432,25 @@ class DungeonCog(commands.Cog):
         else:
             guild = None
         for user_id in sorted(session.party_ids):
-            names.append(
-                self._display_name_for_user(
-                    user_id, interaction=interaction, guild=guild
-                )
+            name = self._display_name_for_user(
+                user_id, interaction=interaction, guild=guild
             )
-        return "\n".join(f"• {name}" for name in names)
+            record = session.party_health.get(user_id)
+            max_hp_value = DEFAULT_PLAYER_HP
+            current_hp_value = DEFAULT_PLAYER_HP
+            if isinstance(record, Mapping):
+                try:
+                    max_hp_value = int(record.get("max", max_hp_value))
+                except (TypeError, ValueError):
+                    max_hp_value = DEFAULT_PLAYER_HP
+                try:
+                    current_hp_value = int(record.get("current", current_hp_value))
+                except (TypeError, ValueError):
+                    current_hp_value = max_hp_value
+            max_hp_value = max(1, max_hp_value)
+            current_hp_value = max(0, min(current_hp_value, max_hp_value))
+            entries.append(f"• {name} [{current_hp_value}/{max_hp_value}]")
+        return "\n".join(entries)
 
     def _display_name_for_user(
         self,
@@ -5099,8 +5112,6 @@ class DungeonCog(commands.Cog):
                 if trigger_monster_turns:
                     self._schedule_automatic_turns(session, session.combat_state)
 
-        await self._refresh_session_message(interaction, session)
-
         triggered_messages: list[str] = []
         if triggered_events:
             for _room_id, trap, reason in triggered_events:
@@ -5137,6 +5148,8 @@ class DungeonCog(commands.Cog):
             message = f"{message}\n\n" + "\n\n".join(triggered_messages)
 
         await interaction.followup.send(message, ephemeral=True)
+
+        await self._refresh_session_message(interaction, session)
 
     async def handle_search(self, interaction: discord.Interaction) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
