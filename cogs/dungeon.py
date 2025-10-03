@@ -889,7 +889,39 @@ class ReturnToTavernView(discord.ui.View):
     async def return_to_tavern(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:  # noqa: D401
-        tavern_channel = await self.cog._find_tavern_channel(self.session.guild_id)
+        guild_id = interaction.guild_id or self.session.guild_id
+        user_id = getattr(interaction.user, "id", None)
+        hero_removed = False
+
+        def mutator(session: DungeonSession) -> None:
+            nonlocal hero_removed
+            if user_id is None:
+                return
+            if user_id in session.party_ids:
+                session.party_ids.discard(user_id)
+                hero_removed = True
+
+        session_key = self.cog._session_key(guild_id, self.session.channel_id)
+        updated_session = await self.cog.sessions.update(session_key, mutator)
+        session_exists = updated_session is not None
+        if updated_session is None:
+            updated_session = self.session
+            if user_id is not None and user_id in updated_session.party_ids:
+                updated_session.party_ids.discard(user_id)
+                hero_removed = True
+
+        await self.cog._refresh_session_view(updated_session)
+
+        if guild_id is not None and hero_removed and session_exists:
+            try:
+                await self.cog._handle_party_membership_change(guild_id, updated_session)
+            except Exception:  # pragma: no cover - defensive logging
+                log.debug(
+                    "Failed to update party membership for guild %s after death.",
+                    guild_id,
+                )
+
+        tavern_channel = await self.cog._find_tavern_channel(guild_id)
         if tavern_channel is not None:
             await interaction.response.send_message(
                 f"Head back to {tavern_channel.mention} to regroup and recover.",
