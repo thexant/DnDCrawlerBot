@@ -1075,52 +1075,67 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         )
 
         parties = manager.parties()
-        if parties:
-            sections: list[str] = []
-            for party in parties:
-                header = (
-                    f"**{party.name}** — {len(party.members)}/{manager.max_size} "
-                    "seats filled"
-                )
-                member_lines: list[str] = []
-                if party.members:
-                    for user_id in party.members:
-                        mention = f"<@{user_id}>"
-                        status = "⏳ Pending"
-                        if party.active_vote:
-                            choice = party.active_vote.ballots.get(user_id)
-                            if choice:
-                                status = f"🗳️ {choice}"
-                        member_lines.append(f"• {mention} — {status}")
-                else:
-                    member_lines.append("• No members yet.")
+        if not parties:
+            embed.add_field(
+                name="Adventuring Parties",
+                value=(
+                    "No adventurers have rallied yet. Use **Create Party** to start a new group."
+                ),
+                inline=False,
+            )
+            embed.set_footer(text="The tavern board refreshes every five minutes.")
+            return embed
 
-                vote_lines: list[str] = []
-                if party.active_vote:
-                    counts = party.active_vote.counts(party.members)
-                    if counts:
+        embed.add_field(
+            name="Adventuring Parties",
+            value="Parties currently preparing for upcoming delves:",
+            inline=False,
+        )
+
+        for party in parties:
+            member_header = (
+                f"**Members ({len(party.members)}/{manager.max_size})**"
+            )
+            if party.members:
+                member_list = ", ".join(f"<@{user_id}>" for user_id in party.members)
+            else:
+                member_list = "No members yet."
+
+            status_lines: list[str] = ["**Status**"]
+            if not party.members:
+                status_lines.append("🚧 Recruiting adventurers.")
+            elif party.active_vote is None:
+                status_lines.append("🕯️ Awaiting a dungeon vote.")
+            else:
+                counts = party.active_vote.counts(party.members)
+                required = party.required_votes()
+                winner, votes_for = party._evaluate_majority()
+                expiry = party.active_vote.last_activity + manager.vote_ttl
+
+                if winner:
+                    status_lines.append(
+                        f"✅ Ready to delve — **{winner}** reached {votes_for}/{required} votes."
+                    )
+                else:
+                    status_lines.append(
+                        f"🗳️ Vote in progress — {len(party.active_vote.ballots)}/{len(party.members)} ballots cast."
+                    )
+
+                if counts:
+                    tally_lines = [
+                        f"• {dungeon_name} — {count} vote(s)"
                         for dungeon_name, count in sorted(
                             counts.items(), key=lambda item: (-item[1], item[0].lower())
-                        ):
-                            vote_lines.append(f"🗳️ {dungeon_name} — {count} vote(s)")
-                        expiry = party.active_vote.last_activity + manager.vote_ttl
-                        vote_lines.append(f"🕒 Votes expire {format_dt(expiry, style='R')}")
-                        vote_lines.append(
-                            f"✅ {party.required_votes()} vote(s) needed to delve."
                         )
-                    else:
-                        vote_lines.append("🗳️ Vote started. Waiting for the first ballot.")
+                    ]
+                    status_lines.extend(tally_lines)
                 else:
-                    vote_lines.append("🛑 No vote in progress.")
+                    status_lines.append("• Waiting for the first ballot.")
 
-                section = "\n".join([header, *member_lines, *vote_lines])
-                sections.append(section)
-            party_value = "\n\n".join(sections)
-        else:
-            party_value = (
-                "No adventurers have rallied yet. Use **Create Party** to start a new group."
-            )
-        embed.add_field(name="Adventuring Parties", value=party_value, inline=False)
+                status_lines.append(f"🕒 Vote expires {format_dt(expiry, style='R')}")
+
+            party_details = "\n".join([member_header, member_list, "", *status_lines])
+            embed.add_field(name=party.name, value=party_details, inline=False)
 
         embed.set_footer(text="The tavern board refreshes every five minutes.")
         return embed
