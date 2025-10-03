@@ -4200,7 +4200,11 @@ class DungeonCog(commands.Cog):
             await interaction.response.send_message(message, ephemeral=True)
 
     async def _start_prepared_dungeon(
-        self, interaction: discord.Interaction, stored: StoredDungeon
+        self,
+        interaction: discord.Interaction,
+        stored: StoredDungeon,
+        *,
+        party_members: Optional[Iterable[int]] = None,
     ) -> bool:
         if interaction.guild_id is None:
             await self._send_ephemeral_message(
@@ -4274,13 +4278,16 @@ class DungeonCog(commands.Cog):
             name=stored.name,
             difficulty=stored.difficulty or "standard",
         )
+        initial_party_ids = set(party_members or ())
+        initial_party_ids.add(interaction.user.id)
+
         session = DungeonSession(
             dungeon=dungeon,
             guild_id=interaction.guild_id,
             channel_id=party_channel.id,
             seed=stored.seed,
         )
-        session.party_ids.add(interaction.user.id)
+        session.party_ids.update(initial_party_ids)
         await self.sessions.set(key, session)
 
         await self._sync_party_channel_access(session)

@@ -70,6 +70,7 @@ class VoteProgress:
     required: int
     state_changed: bool = False
     party_name: Optional[str] = None
+    party_members: Optional[tuple[int, ...]] = None
 
 
 @dataclass
@@ -153,6 +154,7 @@ class PartyState:
                 required=self.required_votes(),
                 state_changed=pruned,
                 party_name=self.name,
+                party_members=tuple(sorted(self.members)) or None,
             )
 
         if self.active_vote is None:
@@ -173,6 +175,7 @@ class PartyState:
                 required=required,
                 state_changed=True,
                 party_name=self.name,
+                party_members=tuple(sorted(self.members)),
             )
 
         return VoteProgress(
@@ -182,6 +185,7 @@ class PartyState:
             required=required,
             state_changed=True,
             party_name=self.name,
+            party_members=tuple(sorted(self.members)) or None,
         )
 
 
@@ -532,7 +536,16 @@ class DungeonMapSelect(discord.ui.Select):
             return
 
         if progress.status == "majority":
-            started = await dungeon_cog._start_prepared_dungeon(interaction, stored)
+            party_members: Optional[tuple[int, ...]] = progress.party_members
+            if party_members is None and progress.party_name is not None:
+                party_state = manager._parties.get(progress.party_name)
+                if party_state is not None:
+                    party_members = tuple(sorted(party_state.members)) or None
+            started = await dungeon_cog._start_prepared_dungeon(
+                interaction,
+                stored,
+                party_members=party_members,
+            )
             if started:
                 if progress.party_name and manager.reset_party(progress.party_name):
                     await self.tavern.update_tavern_embed(guild.id)
