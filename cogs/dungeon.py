@@ -9,7 +9,7 @@ import random
 import re
 import secrets
 from datetime import datetime, timezone
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (
@@ -49,6 +49,7 @@ from dnd.dungeon import (
     DIFFICULTY_PROFILES,
     Dungeon,
     DungeonGenerator,
+    MonsterDefinition,
     Room,
     Theme,
     ThemeRegistry,
@@ -293,6 +294,7 @@ class CombatantState:
     death_save_failures: int = 0
     resources: Dict[str, object] = field(default_factory=dict)
     stable: bool = False
+    selected_target: Optional[str] = None
 
     @property
     def defeated(self) -> bool:
@@ -480,6 +482,7 @@ class CombatActionView(discord.ui.View):
         current = combat.current_combatant() if combat else None
         self._combat_active = bool(combat and combat.active)
         self._add_status_indicator(session)
+        self._add_target_select(combat, current)
         self._configure_controls(combat, current)
         if not self._combat_active:
             self._disable_children()
@@ -535,6 +538,68 @@ class CombatActionView(discord.ui.View):
         for child in self.children:
             if hasattr(child, "disabled"):
                 child.disabled = True
+
+    def _target_options(
+        self,
+        combat: Optional[CombatState],
+        current: Optional[CombatantState],
+    ) -> Tuple[List[discord.SelectOption], bool]:
+        if combat is None:
+            return ([
+                discord.SelectOption(
+                    label="No combat in progress",
+                    value="target:none",
+                    description="There is no active encounter.",
+                )
+            ], True)
+        enemies = [
+            combatant
+            for combatant in combat.order
+            if not combatant.is_player and not combatant.defeated
+        ]
+        if not enemies:
+            return ([
+                discord.SelectOption(
+                    label="No targets available",
+                    value="target:none",
+                    description="All enemies have been defeated.",
+                )
+            ], True)
+        disabled = (
+            current is None or not current.is_player or current.defeated
+        ) or not self._combat_active
+        selected_identifier = (
+            current.selected_target if current and current.is_player else None
+        )
+        options: List[discord.SelectOption] = []
+        for enemy in enemies:
+            ac_value = enemy.metadata.get("armor_class")
+            ac_text = f"AC {ac_value}" if ac_value is not None else "AC ?"
+            hp_text = f"HP {max(enemy.current_hp, 0)}/{enemy.max_hp}"
+            description = f"{ac_text} • {hp_text}"[:100]
+            options.append(
+                discord.SelectOption(
+                    label=enemy.name[:100],
+                    value=f"target:{enemy.identifier}",
+                    description=description,
+                    default=enemy.identifier == selected_identifier,
+                )
+            )
+        return options, disabled
+
+    def _add_target_select(
+        self, combat: Optional[CombatState], current: Optional[CombatantState]
+    ) -> None:
+        options, disabled = self._target_options(combat, current)
+        select = self._ActionSelect(
+            self.cog,
+            action="target",
+            placeholder="Choose a target",
+            options=options,
+            disabled=disabled,
+            custom_id="dungeon:combat:target",
+        )
+        self.add_item(select)
 
     class _ActionSelect(discord.ui.Select):
         def __init__(
@@ -1314,7 +1379,8 @@ class DungeonCog(commands.Cog):
         _, best_roll, best_mod, best_total = max(rolls, key=lambda entry: entry[3])
 
         passive_entries: list[tuple[str, int]] = []
-        for monster in session.room.encounter.monsters:
+        monster_labels = self._unique_monster_labels(session.room.encounter.monsters)
+        for monster, label in zip(session.room.encounter.monsters, monster_labels):
             ability_scores = monster.ability_scores or {}
             wisdom_value: Optional[int] = None
             for ability_key, score in ability_scores.items():
@@ -1325,7 +1391,7 @@ class DungeonCog(commands.Cog):
             if wisdom_value is None:
                 wisdom_value = 10
             passive = 10 + ability_modifier(wisdom_value)
-            passive_entries.append((monster.name, passive))
+            passive_entries.append((label, passive))
 
         if not passive_entries:
             return True, "No creatures are present to oppose the party's approach."
@@ -1687,6 +1753,67 @@ class DungeonCog(commands.Cog):
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _resolve_target_identifier(selection: Optional[str]) -> Optional[str]:
+        if selection is None:
+            return None
+        value = str(selection)
+        if value.startswith("target:"):
+            value = value.split(":", 1)[1]
+        cleaned = value.strip()
+        return cleaned or None
+
+    @staticmethod
+    def _find_combatant_by_identifier(
+        state: CombatState, identifier: str
+    ) -> Optional[CombatantState]:
+        for combatant in state.order:
+            if combatant.identifier == identifier:
+                return combatant
+        return None
+
+    @staticmethod
+    def _unique_monster_labels(monsters: Sequence[MonsterDefinition]) -> List[str]:
+        counts: Counter[str] = Counter(monster.name for monster in monsters)
+        seen: Dict[str, int] = {}
+        labels: List[str] = []
+        for monster in monsters:
+            base_name = monster.name
+            if counts[base_name] > 1:
+                seen[base_name] = seen.get(base_name, 0) + 1
+                labels.append(f"{base_name} {seen[base_name]}")
+            else:
+                labels.append(base_name)
+        return labels
+
+    def _select_player_target(
+        self,
+        state: CombatState,
+        player: CombatantState,
+        *,
+        update: bool = True,
+    ) -> Optional[CombatantState]:
+        enemies = [
+            combatant
+            for combatant in state.order
+            if not combatant.is_player and not combatant.defeated
+        ]
+        if not enemies:
+            if update:
+                player.selected_target = None
+            return None
+        chosen: Optional[CombatantState] = None
+        if player.selected_target:
+            for enemy in enemies:
+                if enemy.identifier == player.selected_target:
+                    chosen = enemy
+                    break
+        if chosen is None and update:
+            chosen = enemies[0]
+        if chosen is not None and update:
+            player.selected_target = chosen.identifier
+        return chosen
 
     def _consume_resource(
         self, player: CombatantState, requirement: Optional[Mapping[str, object]]
@@ -2732,10 +2859,9 @@ class DungeonCog(commands.Cog):
         player: CombatantState,
         selection: Optional[str],
     ) -> str:
-        targets = [combatant for combatant in state.order if not combatant.is_player and not combatant.defeated]
-        if not targets:
+        target = self._select_player_target(state, player)
+        if target is None:
             return "There are no foes left to strike."
-        target = targets[0]
         attack_bonus = int(player.metadata.get("attack_bonus", DEFAULT_PLAYER_ATTACK_BONUS))
         damage_expr = str(player.metadata.get("damage", DEFAULT_PLAYER_DAMAGE))
         weapon_label = str(player.metadata.get("weapon_name", "weapon"))
@@ -2831,12 +2957,14 @@ class DungeonCog(commands.Cog):
             return "That spell isn't available right now."
         spell = spells[spell_index]
         spell_name = str(spell.get("name", "Spell"))
-        targets = [combatant for combatant in state.order if not combatant.is_player and not combatant.defeated]
         effect_type = str(spell.get("type", "attack")).lower()
         target_required = effect_type in {"attack", "auto", "save", "damage"}
-        target = targets[0] if targets else None
-        if target_required and target is None:
-            return "There are no valid targets for that spell."
+        if target_required:
+            target = self._select_player_target(state, player)
+            if target is None:
+                return "There are no valid targets for that spell."
+        else:
+            target = self._select_player_target(state, player, update=False)
         requirement = spell.get("consumes")
         can_use, failure_reason = self._consume_resource(player, requirement)
         if not can_use:
@@ -3179,7 +3307,10 @@ class DungeonCog(commands.Cog):
             )
             self._sync_combatant_state(combatant)
             combatants.append(combatant)
-        for index, monster in enumerate(session.room.encounter.monsters):
+        monster_labels = self._unique_monster_labels(session.room.encounter.monsters)
+        for index, (monster, display_name) in enumerate(
+            zip(session.room.encounter.monsters, monster_labels)
+        ):
             roll = random.randint(1, 20)
             initiative_total = roll
             dex_score = monster.ability_scores.get("DEX") if monster.ability_scores else None
@@ -3188,7 +3319,7 @@ class DungeonCog(commands.Cog):
             monster_resources: Dict[str, object] = {}
             monster_combatant = CombatantState(
                 identifier=f"monster:{index}",
-                name=monster.name,
+                name=display_name,
                 initiative_roll=roll,
                 initiative_total=initiative_total,
                 max_hp=monster.hit_points,
@@ -3242,9 +3373,10 @@ class DungeonCog(commands.Cog):
         embed.add_field(name="Encounter", value=encounter_summary, inline=False)
 
         if room.encounter.monsters:
+            monster_labels = self._unique_monster_labels(room.encounter.monsters)
             monsters = "\n".join(
-                f"• {monster.name} (AC {monster.armor_class}, HP {monster.hit_points})"
-                for monster in room.encounter.monsters
+                f"• {label} (AC {monster.armor_class}, HP {monster.hit_points})"
+                for monster, label in zip(room.encounter.monsters, monster_labels)
             )
             embed.add_field(name="Monsters", value=monsters, inline=False)
 
@@ -5355,7 +5487,7 @@ class DungeonCog(commands.Cog):
     async def handle_combat_action(
         self,
         interaction: discord.Interaction,
-        action: Literal["weapon", "spell", "feature", "defend", "end", "attack"],
+        action: Literal["weapon", "spell", "feature", "defend", "end", "attack", "target"],
         selection: Optional[str] = None,
     ) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
@@ -5395,7 +5527,7 @@ class DungeonCog(commands.Cog):
                 error = "It isn't your turn to act."
                 return
 
-            combat.waiting_for = None
+            consumes_turn = True
             if action == "weapon" or action == "attack":
                 summary = self._player_weapon_attack(run, combat, current, selection)
                 pending_fallen.extend(self._identify_newly_fallen(run, combat))
@@ -5412,18 +5544,44 @@ class DungeonCog(commands.Cog):
                 combat.log.append(f"{current.name} ends their turn without further action.")
                 self._trim_combat_log(combat)
                 summary = "You end your turn."
+            elif action == "target":
+                consumes_turn = False
+                target_identifier = self._resolve_target_identifier(selection)
+                if not target_identifier:
+                    error = "That target cannot be selected."
+                    return
+                target = self._find_combatant_by_identifier(combat, target_identifier)
+                if target is None or target.is_player or target.defeated:
+                    error = "That target is no longer available."
+                    return
+                current.selected_target = target.identifier
+                summary = f"You focus on {target.name}."
+                combat.current_action = {
+                    "actor": current.name,
+                    "state": "targeting",
+                    "summary": f"Taking aim at {target.name}",
+                    "detail": summary,
+                    "emoji": "🎯",
+                    "team": "player",
+                }
+                combat.log.append(f"{current.name} focuses on {target.name}.")
+                self._trim_combat_log(combat)
             else:  # pragma: no cover - defensive
                 error = "Unknown combat action."
                 return
 
-            self._evaluate_combat_state(run, combat)
-            if combat.active:
-                next_combatant = combat.advance_turn()
-                if next_combatant is None:
-                    self._finish_combat(run, combat, victory=False)
-                else:
-                    nonlocal trigger_monster_turns
-                    trigger_monster_turns = True
+            if consumes_turn:
+                combat.waiting_for = None
+                self._evaluate_combat_state(run, combat)
+                if combat.active:
+                    next_combatant = combat.advance_turn()
+                    if next_combatant is None:
+                        self._finish_combat(run, combat, victory=False)
+                    else:
+                        nonlocal trigger_monster_turns
+                        trigger_monster_turns = True
+            else:
+                combat.waiting_for = current.user_id
 
         session = await self.sessions.update(key, mutate)
         if session is None:
