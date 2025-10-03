@@ -15,6 +15,7 @@ from cogs.dungeon import DungeonCog, DungeonSession
 from dnd.content import Item
 from dnd.content.models import EncounterTable, Theme, Trap
 from dnd.dungeon.generator import Dungeon, EncounterResult, Room, RoomExit
+from dnd.combat import SavingThrowResult
 from dnd.sessions import SessionManager
 
 
@@ -651,3 +652,138 @@ def test_disarm_button_requires_detection(monkeypatch: pytest.MonkeyPatch) -> No
         item for item in view_after.children if getattr(item, "custom_id", None) == "dungeon:disarm"
     )
     assert not disarm_button_after.disabled
+
+
+def test_trap_damage_updates_party_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    cog = _make_cog(monkeypatch)
+    session = _make_trap_session()
+    user_id = next(iter(session.party_ids))
+    interaction = DummyInteraction(user_id=user_id)
+    trap = session.room.encounter.traps[0]
+    session.party_health[user_id] = {"current": 20, "max": 20}
+
+    monkeypatch.setattr(
+        dungeon_module,
+        "saving_throw",
+        lambda *_, **__: SavingThrowResult(total=5, roll=5, natural=5, success=False),
+    )
+    monkeypatch.setattr(
+        DungeonCog,
+        "_roll_damage",
+        lambda self, expression, *, critical=False, extra_dice=None: 10,
+    )
+
+    async def runner() -> list[str]:
+        return await cog._resolve_trap_trigger(
+            interaction, session, trap=trap, party_snapshot=(user_id,)
+        )
+
+    lines = asyncio.run(runner())
+
+    assert session.party_health[user_id]["current"] == 10
+    assert session.room_damage_log[session.current_room]["traps"] == 10
+    assert any("10 damage" in line for line in lines)
+    assert any("10/20 HP" in line for line in lines)
+
+
+def test_trap_save_halves_damage(monkeypatch: pytest.MonkeyPatch) -> None:
+    cog = _make_cog(monkeypatch)
+    session = _make_trap_session()
+    user_id = next(iter(session.party_ids))
+    interaction = DummyInteraction(user_id=user_id)
+    trap = session.room.encounter.traps[0]
+    session.party_health[user_id] = {"current": 15, "max": 15}
+
+    monkeypatch.setattr(
+        dungeon_module,
+        "saving_throw",
+        lambda *_, **__: SavingThrowResult(total=18, roll=18, natural=18, success=True),
+    )
+    monkeypatch.setattr(
+        DungeonCog,
+        "_roll_damage",
+        lambda self, expression, *, critical=False, extra_dice=None: 9,
+    )
+
+    async def runner() -> list[str]:
+        return await cog._resolve_trap_trigger(
+            interaction, session, trap=trap, party_snapshot=(user_id,)
+        )
+
+    lines = asyncio.run(runner())
+
+    assert session.party_health[user_id]["current"] == 11
+    assert session.room_damage_log[session.current_room]["traps"] == 4
+    assert any("4 damage" in line for line in lines)
+    assert any("11/15 HP" in line for line in lines)
+
+
+def test_trap_knockout_updates_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    cog = _make_cog(monkeypatch)
+    session = _make_trap_session()
+    user_id = next(iter(session.party_ids))
+    interaction = DummyInteraction(user_id=user_id)
+    trap = session.room.encounter.traps[0]
+    session.party_health[user_id] = {"current": 6, "max": 12}
+
+    monkeypatch.setattr(
+        dungeon_module,
+        "saving_throw",
+        lambda *_, **__: SavingThrowResult(total=3, roll=3, natural=3, success=False),
+    )
+    monkeypatch.setattr(
+        DungeonCog,
+        "_roll_damage",
+        lambda self, expression, *, critical=False, extra_dice=None: 8,
+    )
+
+    async def runner() -> list[str]:
+        return await cog._resolve_trap_trigger(
+            interaction, session, trap=trap, party_snapshot=(user_id,)
+        )
+
+    lines = asyncio.run(runner())
+
+    assert session.party_health[user_id]["current"] == 0
+    assert session.room_damage_log[session.current_room]["traps"] == 6
+    assert any("knocked unconscious" in line for line in lines)
+
+
+def test_trap_death_triggers_announcement(monkeypatch: pytest.MonkeyPatch) -> None:
+    cog = _make_cog(monkeypatch)
+    session = _make_trap_session()
+    user_id = next(iter(session.party_ids))
+    interaction = DummyInteraction(user_id=user_id)
+    trap = session.room.encounter.traps[0]
+    session.party_health[user_id] = {"current": 10, "max": 10}
+
+    monkeypatch.setattr(
+        dungeon_module,
+        "saving_throw",
+        lambda *_, **__: SavingThrowResult(total=2, roll=2, natural=2, success=False),
+    )
+    monkeypatch.setattr(
+        DungeonCog,
+        "_roll_damage",
+        lambda self, expression, *, critical=False, extra_dice=None: 25,
+    )
+
+    announced: list[tuple[DungeonSession, object]] = []
+
+    async def record_death(session_arg: DungeonSession, combatant) -> None:
+        announced.append((session_arg, combatant))
+
+    cog._announce_player_death = record_death  # type: ignore[assignment]
+
+    async def runner() -> list[str]:
+        return await cog._resolve_trap_trigger(
+            interaction, session, trap=trap, party_snapshot=(user_id,)
+        )
+
+    lines = asyncio.run(runner())
+
+    assert session.party_health[user_id]["current"] == 0
+    assert session.room_damage_log[session.current_room]["traps"] == 10
+    assert any("slain" in line for line in lines)
+    assert user_id in session.fallen_players
+    assert announced, "Death announcements should be triggered"

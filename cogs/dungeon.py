@@ -1607,6 +1607,7 @@ class DungeonCog(commands.Cog):
             return lines
 
         lines.append(f"DC {dc} {ability} saving throws:")
+        pending_deaths: list[CombatantState] = []
         for user_id in ordered_party:
             bonus = 0
             character = characters.get(user_id)
@@ -1618,16 +1619,92 @@ class DungeonCog(commands.Cog):
             name = self._display_name_for_user(
                 user_id, interaction=interaction
             )
-            if damage_amount and not result.success:
-                lines.append(
-                    f"• {name}: {result.total} ({outcome}) — {damage_amount} damage"
+            stored_health = session.party_health.get(user_id)
+
+            def _coerce_int(value: object, default: int) -> int:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return default
+
+            max_hp_value = DEFAULT_PLAYER_HP
+            current_hp_value = DEFAULT_PLAYER_HP
+            if isinstance(stored_health, Mapping):
+                max_hp_value = _coerce_int(stored_health.get("max"), DEFAULT_PLAYER_HP)
+                current_hp_value = _coerce_int(
+                    stored_health.get("current"), max_hp_value
                 )
-            elif damage_amount:
-                lines.append(
-                    f"• {name}: {result.total} ({outcome}) — no damage"
-                )
+            elif character is not None:
+                try:
+                    hit_die = int(character.character_class.hit_die)
+                except (AttributeError, TypeError, ValueError):  # pragma: no cover - defensive
+                    hit_die = DEFAULT_PLAYER_HP
+                try:
+                    constitution = int(character.ability_scores.values.get("CON", 10))
+                except (TypeError, ValueError):
+                    constitution = 10
+                max_hp_value = max(1, hit_die + ability_modifier(constitution))
+                current_hp_value = max_hp_value
+            max_hp_value = max(1, max_hp_value)
+            current_hp_value = max(0, min(current_hp_value, max_hp_value))
+            record = session.party_health.setdefault(
+                user_id, {"current": current_hp_value, "max": max_hp_value}
+            )
+            record["max"] = max_hp_value
+            record["current"] = current_hp_value
+
+            damage_taken = 0
+            fatal = False
+            post_hp = current_hp_value
+            actual_damage = 0
+            if damage_amount:
+                damage_taken = damage_amount if not result.success else damage_amount // 2
+                damage_taken = max(0, damage_taken)
+                if damage_taken:
+                    post_hp = max(0, current_hp_value - damage_taken)
+                    actual_damage = current_hp_value - post_hp
+                    record["current"] = post_hp
+                    if actual_damage > 0:
+                        self._record_room_damage(session, actual_damage, source="trap")
+                    if post_hp <= 0:
+                        overkill = damage_taken - current_hp_value
+                        fatal = current_hp_value > 0 and overkill >= max_hp_value
+                        if fatal:
+                            death_state = CombatantState(
+                                identifier=f"player:{user_id}",
+                                name=name,
+                                initiative_roll=0,
+                                initiative_total=0,
+                                max_hp=max_hp_value,
+                                current_hp=post_hp,
+                                is_player=True,
+                                user_id=user_id,
+                            )
+                            death_state.conditions.add("Dead")
+                            death_state.death_save_failures = 3
+                            key = self._fallen_identifier(death_state)
+                            if key not in session.fallen_players:
+                                session.fallen_players.add(key)
+                                pending_deaths.append(death_state)
+                else:
+                    post_hp = current_hp_value
+            line = f"• {name}: {result.total} ({outcome})"
+            if damage_amount:
+                if damage_taken:
+                    line += f" — {damage_taken} damage"
+                else:
+                    line += " — no damage"
+                line += f" ({post_hp}/{max_hp_value} HP)"
+                if fatal:
+                    line += " — slain!"
+                elif damage_taken and post_hp <= 0:
+                    line += " — knocked unconscious!"
             else:
-                lines.append(f"• {name}: {result.total} ({outcome})")
+                line += f" — {post_hp}/{max_hp_value} HP"
+            lines.append(line)
+
+        for fallen in pending_deaths:
+            await self._announce_player_death(session, fallen)
         return lines
 
     def _roll_damage(
