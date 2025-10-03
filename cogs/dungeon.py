@@ -235,6 +235,8 @@ class DungeonSession:
     current_room: int = 0
     seed: Optional[int] = None
     party_ids: set[int] = field(default_factory=set)
+    party_health: Dict[int, Dict[str, int]] = field(default_factory=dict)
+    room_damage_log: Dict[int, Dict[str, int]] = field(default_factory=dict)
     fallen_players: set[object] = field(default_factory=set)
     message_id: Optional[int] = None
     combat_state: Optional["CombatState"] = None
@@ -276,6 +278,7 @@ class DungeonSession:
     def __post_init__(self) -> None:
         if not self.breadcrumbs:
             self.breadcrumbs.append(self.current_room)
+        self.room_damage_log.setdefault(self.current_room, {"monsters": 0, "traps": 0})
 
 
 @dataclass
@@ -1668,7 +1671,46 @@ class DungeonCog(commands.Cog):
             del state.log[0:excess]
 
     @staticmethod
-    def _sync_combatant_state(combatant: CombatantState) -> None:
+    def _ensure_room_damage_entry(
+        session: DungeonSession, room_id: Optional[int] = None
+    ) -> Dict[str, int]:
+        room_key = session.current_room if room_id is None else room_id
+        entry = session.room_damage_log.setdefault(room_key, {})
+        entry.setdefault("monsters", 0)
+        entry.setdefault("traps", 0)
+        return entry
+
+    def _update_party_health_tracking(
+        self, session: DungeonSession, combatant: CombatantState
+    ) -> None:
+        if not combatant.is_player or combatant.user_id is None:
+            return
+        record = session.party_health.setdefault(
+            combatant.user_id, {"current": combatant.max_hp, "max": combatant.max_hp}
+        )
+        record["max"] = combatant.max_hp
+        record["current"] = max(0, min(combatant.max_hp, combatant.current_hp))
+
+    def _record_room_damage(
+        self,
+        session: DungeonSession,
+        amount: int,
+        *,
+        source: Literal["monster", "trap", "other"] = "other",
+    ) -> None:
+        if amount <= 0:
+            return
+        if source not in {"monster", "trap"}:
+            return
+        entry = self._ensure_room_damage_entry(session)
+        key = "monsters" if source == "monster" else "traps"
+        entry[key] = entry.get(key, 0) + amount
+
+    def _sync_combatant_state(
+        self,
+        combatant: CombatantState,
+        session: Optional[DungeonSession] = None,
+    ) -> None:
         metadata = combatant.metadata
         metadata["current_hp"] = combatant.current_hp
         metadata["max_hp"] = combatant.max_hp
@@ -1681,9 +1723,17 @@ class DungeonCog(commands.Cog):
             "stable": combatant.stable,
         }
         metadata["is_dead"] = combatant.is_dead
+        if session is not None:
+            self._update_party_health_tracking(session, combatant)
 
     def _apply_damage_to_combatant(
-        self, combatant: CombatantState, amount: int, *, critical: bool = False
+        self,
+        session: Optional[DungeonSession],
+        combatant: CombatantState,
+        amount: int,
+        *,
+        critical: bool = False,
+        source: Literal["monster", "trap", "other"] = "other",
     ) -> int:
         if amount <= 0:
             return 0
@@ -1711,10 +1761,17 @@ class DungeonCog(commands.Cog):
             combatant.death_save_failures = 0
             combatant.stable = False
             combatant.conditions.discard("Dead")
-        self._sync_combatant_state(combatant)
+        self._sync_combatant_state(combatant, session)
+        if session is not None and combatant.is_player:
+            self._record_room_damage(session, dealt, source=source)
         return dealt
 
-    def _apply_healing_to_combatant(self, combatant: CombatantState, amount: int) -> int:
+    def _apply_healing_to_combatant(
+        self,
+        session: Optional[DungeonSession],
+        combatant: CombatantState,
+        amount: int,
+    ) -> int:
         if amount <= 0:
             return 0
         previous = combatant.current_hp
@@ -1726,14 +1783,16 @@ class DungeonCog(commands.Cog):
             combatant.death_save_failures = 0
             combatant.stable = False
         healed = combatant.current_hp - previous
-        self._sync_combatant_state(combatant)
+        self._sync_combatant_state(combatant, session)
         return healed
 
     @staticmethod
     def _death_save_roll() -> int:
         return random.randint(1, 20)
 
-    def _resolve_player_death_save(self, player: CombatantState) -> str:
+    def _resolve_player_death_save(
+        self, session: Optional[DungeonSession], player: CombatantState
+    ) -> str:
         roll = self._death_save_roll()
         message: list[str] = [f"{player.name} rolls a {roll} on their death save."]
         if roll == 20:
@@ -1762,16 +1821,22 @@ class DungeonCog(commands.Cog):
         elif roll != 20 and player.death_save_successes >= 3:
             player.stable = True
             message.append(f"{player.name} stabilises but remains unconscious.")
-        self._sync_combatant_state(player)
+        self._sync_combatant_state(player, session)
         return " ".join(message)
 
-    def _handle_player_zero_hp_turn(self, state: CombatState, player: CombatantState) -> bool:
+    def _handle_player_zero_hp_turn(
+        self,
+        state: CombatState,
+        player: CombatantState,
+        *,
+        session: Optional[DungeonSession] = None,
+    ) -> bool:
         if player.current_hp > 0:
             return False
         state.waiting_for = None
         if player.is_dead or player.stable:
             return True
-        message = self._resolve_player_death_save(player)
+        message = self._resolve_player_death_save(session, player)
         state.log.append(message)
         self._trim_combat_log(state)
         return True
@@ -1984,6 +2049,10 @@ class DungeonCog(commands.Cog):
         state.waiting_for = None
         state.current_action = None
         session.stealthed = False
+        self._ensure_room_damage_entry(session)
+        for combatant in state.order:
+            if combatant.is_player:
+                self._update_party_health_tracking(session, combatant)
         if victory:
             state.log.append("The party is victorious!")
             encounter = session.room.encounter
@@ -2173,7 +2242,11 @@ class DungeonCog(commands.Cog):
         )
 
     def _resolve_monster_action(
-        self, state: CombatState, monster: CombatantState
+        self,
+        state: CombatState,
+        monster: CombatantState,
+        *,
+        session: Optional[DungeonSession] = None,
     ) -> Optional[str]:
         potential_targets = [
             combatant
@@ -2212,6 +2285,7 @@ class DungeonCog(commands.Cog):
         if multiattack:
             action_payload["summary"] = f"Unleashing a flurry against {target.name}"
             message = self._execute_monster_multiattack(
+                session,
                 monster,
                 target,
                 multiattack,
@@ -2225,6 +2299,7 @@ class DungeonCog(commands.Cog):
             action_type = str(action.get("type", "attack")).lower() if action else "attack"
             if action_type == "save":
                 message = self._execute_monster_save_action(
+                    session,
                     monster,
                     target,
                     action,
@@ -2234,6 +2309,7 @@ class DungeonCog(commands.Cog):
                 )
             elif action_type == "auto":
                 message = self._execute_monster_auto_action(
+                    session,
                     monster,
                     target,
                     action,
@@ -2243,6 +2319,7 @@ class DungeonCog(commands.Cog):
                 )
             else:
                 message = self._execute_monster_attack_action(
+                    session,
                     monster,
                     target,
                     action,
@@ -2268,6 +2345,7 @@ class DungeonCog(commands.Cog):
 
     def _execute_monster_multiattack(
         self,
+        session: Optional[DungeonSession],
         monster: CombatantState,
         target: CombatantState,
         actions: Sequence[Mapping[str, object]],
@@ -2308,9 +2386,11 @@ class DungeonCog(commands.Cog):
             if outcome.roll_result.hits and pending_damage > 0:
                 was_unconscious = target.current_hp <= 0
                 dealt = self._apply_damage_to_combatant(
+                    session,
                     target,
                     pending_damage,
                     critical=outcome.roll_result.is_critical_hit or was_unconscious,
+                    source="monster",
                 )
             if outcome.roll_result.hits:
                 text = (
@@ -2337,6 +2417,7 @@ class DungeonCog(commands.Cog):
 
     def _execute_monster_attack_action(
         self,
+        session: Optional[DungeonSession],
         monster: CombatantState,
         target: CombatantState,
         action: Optional[Mapping[str, object]],
@@ -2375,9 +2456,11 @@ class DungeonCog(commands.Cog):
         if outcome.roll_result.hits and pending_damage > 0:
             was_unconscious = target.current_hp <= 0
             dealt = self._apply_damage_to_combatant(
+                session,
                 target,
                 pending_damage,
                 critical=outcome.roll_result.is_critical_hit or was_unconscious,
+                source="monster",
             )
         if outcome.roll_result.hits:
             message = (
@@ -2397,6 +2480,7 @@ class DungeonCog(commands.Cog):
 
     def _execute_monster_auto_action(
         self,
+        session: Optional[DungeonSession],
         monster: CombatantState,
         target: CombatantState,
         action: Optional[Mapping[str, object]],
@@ -2421,9 +2505,11 @@ class DungeonCog(commands.Cog):
         dealt = 0
         if damage > 0:
             dealt = self._apply_damage_to_combatant(
+                session,
                 target,
                 damage,
                 critical=target.current_hp <= 0,
+                source="monster",
             )
         condition_text = self._apply_conditions_to_target(target, action_data.get("conditions"))
         if dealt:
@@ -2440,6 +2526,7 @@ class DungeonCog(commands.Cog):
 
     def _execute_monster_save_action(
         self,
+        session: Optional[DungeonSession],
         monster: CombatantState,
         target: CombatantState,
         action: Optional[Mapping[str, object]],
@@ -2480,9 +2567,11 @@ class DungeonCog(commands.Cog):
         dealt = 0
         if damage > 0:
             dealt = self._apply_damage_to_combatant(
+                session,
                 target,
                 damage,
                 critical=target.current_hp <= 0,
+                source="monster",
             )
         if save_result.success:
             message = (
@@ -2808,7 +2897,7 @@ class DungeonCog(commands.Cog):
             if current is None:
                 break
             if current.is_player and current.current_hp <= 0:
-                handled = self._handle_player_zero_hp_turn(state, current)
+                handled = self._handle_player_zero_hp_turn(state, current, session=session)
                 if handled:
                     newly_fallen = self._identify_newly_fallen(session, state)
                     for fallen in newly_fallen:
@@ -2852,7 +2941,7 @@ class DungeonCog(commands.Cog):
             await asyncio.sleep(random.uniform(*MONSTER_THINKING_DELAY_RANGE))
             if state.log and state.log[-1] == thinking_entry:
                 state.log.pop()
-            self._resolve_monster_action(state, current)
+            self._resolve_monster_action(state, current, session=session)
             newly_fallen = self._identify_newly_fallen(session, state)
             for fallen in newly_fallen:
                 await self._announce_player_death(session, fallen)
@@ -2941,7 +3030,7 @@ class DungeonCog(commands.Cog):
                 extra_dice=extra_dice_values,
             )
             dealt = self._apply_damage_to_combatant(
-                target, damage, critical=result.is_critical_hit
+                session, target, damage, critical=result.is_critical_hit
             )
             weapon_text = "" if weapon_label.lower() == "weapon" else f" with your {weapon_label}"
             summary = (
@@ -3040,7 +3129,10 @@ class DungeonCog(commands.Cog):
                     extra_dice=critical_dice,
                 )
                 dealt = self._apply_damage_to_combatant(
-                    target, damage, critical=result.is_critical_hit
+                    session,
+                    target,
+                    damage,
+                    critical=result.is_critical_hit,
                 )
                 type_text = f" {str(damage_type).title()}" if damage_type else ""
                 summary = (
@@ -3067,7 +3159,7 @@ class DungeonCog(commands.Cog):
                 )
         elif effect_type == "auto" and target is not None:
             damage = self._roll_damage(damage_expr, extra_dice=critical_dice)
-            dealt = self._apply_damage_to_combatant(target, damage)
+            dealt = self._apply_damage_to_combatant(session, target, damage)
             type_text = f" {str(damage_type).title()}" if damage_type else ""
             summary = f"You unleash {spell_name}, automatically dealing {dealt}{type_text} damage to {target.name}."
             log_entry = (
@@ -3091,7 +3183,7 @@ class DungeonCog(commands.Cog):
             if save_result.success:
                 if spell.get("half_on_success"):
                     damage //= 2
-                    dealt = self._apply_damage_to_combatant(target, damage)
+                    dealt = self._apply_damage_to_combatant(session, target, damage)
                     summary = (
                         f"{target.name} resists some of your {spell_name}, taking {dealt} damage after succeeding "
                         f"the save (DC {dc})."
@@ -3108,7 +3200,7 @@ class DungeonCog(commands.Cog):
                     )
                     damage = 0
             else:
-                dealt = self._apply_damage_to_combatant(target, damage)
+                dealt = self._apply_damage_to_combatant(session, target, damage)
                 summary = (
                     f"{target.name} fails the save (DC {dc}) against your {spell_name}, taking {dealt} damage."
                 )
@@ -3122,13 +3214,13 @@ class DungeonCog(commands.Cog):
             log_entry = f"{player.name} casts {spell_name}, but it has no immediate effect."
         if spell.get("concentration"):
             player.concentration = spell_name
-            self._sync_combatant_state(player)
+            self._sync_combatant_state(player, session)
             summary += " You begin concentrating on the spell."
             log_entry += f" {player.name} begins concentrating on {spell_name}."
         status_text = self._resource_status_text(player, requirement)
         if status_text:
             summary += f" {status_text}"
-        self._sync_combatant_state(player)
+        self._sync_combatant_state(player, session)
         action_payload["detail"] = summary
         state.current_action = action_payload
         state.log.append(log_entry)
@@ -3138,6 +3230,7 @@ class DungeonCog(commands.Cog):
 
     def _player_use_feature(
         self,
+        session: DungeonSession,
         state: CombatState,
         player: CombatantState,
         selection: Optional[str],
@@ -3170,7 +3263,7 @@ class DungeonCog(commands.Cog):
             if effect_type == "heal":
                 heal_expr = str(effect.get("dice", "1d6"))
                 healed = self._roll_damage(heal_expr)
-                restored = self._apply_healing_to_combatant(player, healed)
+                restored = self._apply_healing_to_combatant(session, player, healed)
                 summary = f"You use {feature_name}, regaining {restored} HP."
                 log_entry = f"{player.name} uses {feature_name}, regaining {restored} HP."
             elif effect_type == "condition":
@@ -3179,13 +3272,13 @@ class DungeonCog(commands.Cog):
                 if condition:
                     if target_scope == "self":
                         player.conditions.add(condition)
-                        self._sync_combatant_state(player)
+                        self._sync_combatant_state(player, session)
                         summary = f"{feature_name} grants you {condition}."
                         log_entry = f"{player.name} uses {feature_name}, gaining {condition}."
         status_text = self._resource_status_text(player, requirement if isinstance(requirement, Mapping) else None)
         if status_text:
             summary += f" {status_text}"
-        self._sync_combatant_state(player)
+        self._sync_combatant_state(player, session)
         action_payload["detail"] = summary
         state.current_action = action_payload
         state.log.append(log_entry)
@@ -3325,13 +3418,31 @@ class DungeonCog(commands.Cog):
             else:
                 shared_resources = {}
             metadata["resources"] = shared_resources
+            stored_health = session.party_health.get(user_id)
+            if isinstance(stored_health, Mapping):
+                try:
+                    stored_max_hp = int(stored_health.get("max", max_hp))
+                except (TypeError, ValueError):
+                    stored_max_hp = max_hp
+                try:
+                    stored_current_hp = int(stored_health.get("current", max_hp))
+                except (TypeError, ValueError):
+                    stored_current_hp = max_hp
+            else:
+                stored_max_hp = max_hp
+                stored_current_hp = max_hp
+            max_hp_value = max_hp if max_hp > 0 else DEFAULT_PLAYER_HP
+            if stored_max_hp > 0:
+                max_hp_value = max(max_hp_value, stored_max_hp)
+            current_hp_value = max(0, min(max_hp_value, stored_current_hp))
+            metadata["max_hp"] = max_hp_value
             combatant = CombatantState(
                 identifier=f"player:{user_id}",
                 name=name,
                 initiative_roll=roll,
                 initiative_total=initiative_total,
-                max_hp=max_hp,
-                current_hp=max_hp,
+                max_hp=max_hp_value,
+                current_hp=current_hp_value,
                 is_player=True,
                 user_id=user_id,
                 metadata=metadata,
@@ -3339,7 +3450,7 @@ class DungeonCog(commands.Cog):
                 concentration=concentration,
                 resources=shared_resources,
             )
-            self._sync_combatant_state(combatant)
+            self._sync_combatant_state(combatant, session)
             combatants.append(combatant)
         monster_labels = self._unique_monster_labels(session.room.encounter.monsters)
         for index, (monster, display_name) in enumerate(
@@ -4721,6 +4832,7 @@ class DungeonCog(commands.Cog):
                 added_member = True
 
             current_room = run.room
+            self._ensure_room_damage_entry(run, current_room.id)
             self._ensure_room_trap_state(run, current_room)
             self._ensure_room_discovery_state(run, current_room)
             catalog = run.trap_catalog.setdefault(current_room.id, {})
@@ -4818,6 +4930,7 @@ class DungeonCog(commands.Cog):
                 backtracked = False
 
             run.current_room = destination_id
+            self._ensure_room_damage_entry(run, destination_id)
             run.last_exit_taken = selected_exit.key
             run.last_travel_description = corridor.description if corridor else None
             exit_label = selected_exit.label
@@ -5576,7 +5689,7 @@ class DungeonCog(commands.Cog):
                 summary = self._player_cast_spell(run, combat, current, selection)
                 pending_fallen.extend(self._identify_newly_fallen(run, combat))
             elif action == "feature":
-                summary = self._player_use_feature(combat, current, selection)
+                summary = self._player_use_feature(run, combat, current, selection)
                 pending_fallen.extend(self._identify_newly_fallen(run, combat))
             elif action == "defend":
                 summary = self._player_defend(combat, current)
