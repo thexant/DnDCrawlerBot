@@ -62,28 +62,29 @@ class LobbyVote:
 
 @dataclass
 class VoteProgress:
-    """Result of recording a ballot in the party lobby."""
+    """Result of recording a ballot within an adventuring party."""
 
     status: Literal["not_member", "started", "updated", "majority"]
     choice: Optional[str]
     votes_for: int
     required: int
     state_changed: bool = False
+    party_name: Optional[str] = None
 
 
-class PartyLobby:
-    """Manage party membership and voting for a guild lobby."""
+@dataclass
+class PartyState:
+    """Track membership and votes for a specific adventuring party."""
 
-    def __init__(self, *, max_size: int = MAX_PARTY_SIZE, vote_ttl: timedelta = VOTE_TTL) -> None:
-        self.max_size = max_size
-        self.vote_ttl = vote_ttl
-        self.members: list[int] = []
-        self.active_vote: Optional[LobbyVote] = None
+    name: str
+    created_at: datetime
+    members: list[int] = field(default_factory=list)
+    active_vote: Optional[LobbyVote] = None
 
-    def join(self, user_id: int) -> Literal["added", "exists", "full"]:
+    def join(self, user_id: int, *, max_size: int) -> Literal["added", "exists", "full"]:
         if user_id in self.members:
             return "exists"
-        if len(self.members) >= self.max_size:
+        if len(self.members) >= max_size:
             return "full"
         self.members.append(user_id)
         return "added"
@@ -98,11 +99,8 @@ class PartyLobby:
         self.members.clear()
         self.active_vote = None
 
-    def clear_vote(self) -> None:
-        self.active_vote = None
-
-    def prune(self, now: Optional[datetime] = None) -> bool:
-        """Remove stale ballots and clear empty votes."""
+    def prune(self, *, now: Optional[datetime] = None, vote_ttl: timedelta) -> bool:
+        """Remove stale ballots and expire dormant votes."""
 
         now = now or datetime.now(timezone.utc)
         changed = False
@@ -114,7 +112,7 @@ class PartyLobby:
                 del self.active_vote.ballots[user_id]
                 changed = True
 
-        if self.active_vote and self.active_vote.expired(now, self.vote_ttl):
+        if self.active_vote and self.active_vote.expired(now, vote_ttl):
             self.active_vote = None
             return True
 
@@ -143,9 +141,10 @@ class PartyLobby:
         choice: str,
         *,
         now: Optional[datetime] = None,
+        vote_ttl: timedelta,
     ) -> VoteProgress:
         current_time = now or datetime.now(timezone.utc)
-        pruned = self.prune(current_time)
+        pruned = self.prune(now=current_time, vote_ttl=vote_ttl)
         if user_id not in self.members:
             return VoteProgress(
                 status="not_member",
@@ -153,6 +152,7 @@ class PartyLobby:
                 votes_for=0,
                 required=self.required_votes(),
                 state_changed=pruned,
+                party_name=self.name,
             )
 
         if self.active_vote is None:
@@ -172,6 +172,7 @@ class PartyLobby:
                 votes_for=votes_for,
                 required=required,
                 state_changed=True,
+                party_name=self.name,
             )
 
         return VoteProgress(
@@ -180,7 +181,173 @@ class PartyLobby:
             votes_for=self.active_vote.counts(self.members).get(choice, 0),
             required=required,
             state_changed=True,
+            party_name=self.name,
         )
+
+
+class PartyManager:
+    """Manage a collection of parties for a guild's tavern."""
+
+    def __init__(self, *, max_size: int = MAX_PARTY_SIZE, vote_ttl: timedelta = VOTE_TTL) -> None:
+        self.max_size = max_size
+        self.vote_ttl = vote_ttl
+        self._parties: dict[str, PartyState] = {}
+        self._order: list[str] = []
+
+    def parties(self) -> list[PartyState]:
+        return [self._parties[name] for name in self._order if name in self._parties]
+
+    def party_for_member(self, user_id: int) -> Optional[PartyState]:
+        for party in self.parties():
+            if user_id in party.members:
+                return party
+        return None
+
+    def _unique_name(self, base_name: str) -> str:
+        existing = {name.casefold() for name in self._parties}
+        candidate = base_name
+        suffix = 2
+        while candidate.casefold() in existing:
+            candidate = f"{base_name} #{suffix}"
+            suffix += 1
+        return candidate
+
+    def prune(self, *, now: Optional[datetime] = None) -> bool:
+        current_time = now or datetime.now(timezone.utc)
+        changed = False
+        for party in list(self.parties()):
+            if party.prune(now=current_time, vote_ttl=self.vote_ttl):
+                changed = True
+            if not party.members and party.active_vote is None:
+                self._remove_party(party.name)
+                changed = True
+        return changed
+
+    def _remove_party(self, name: str) -> None:
+        if name in self._parties:
+            del self._parties[name]
+        if name in self._order:
+            self._order.remove(name)
+
+    def create_party(
+        self,
+        owner_id: int,
+        display_name: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> tuple[PartyState, Literal["created", "moved"], bool]:
+        current_time = now or datetime.now(timezone.utc)
+        state_changed = self.prune(now=current_time)
+
+        previous = self.party_for_member(owner_id)
+        if previous is not None:
+            result = previous.leave(owner_id)
+            if result == "removed":
+                state_changed = True
+            if previous.prune(now=current_time, vote_ttl=self.vote_ttl):
+                state_changed = True
+            if not previous.members and previous.active_vote is None:
+                self._remove_party(previous.name)
+                state_changed = True
+
+        base_name = display_name.strip() or "Adventurer"
+        party_name = f"{base_name}’s Party"
+        unique_name = self._unique_name(party_name)
+
+        party = PartyState(name=unique_name, created_at=current_time)
+        self._parties[unique_name] = party
+        self._order.append(unique_name)
+
+        join_result = party.join(owner_id, max_size=self.max_size)
+        if join_result != "added":  # pragma: no cover - defensive
+            raise RuntimeError("Failed to enrol creator into their party")
+
+        state_changed = True
+        status: Literal["created", "moved"] = "moved" if previous else "created"
+        return party, status, state_changed
+
+    def join_any(
+        self,
+        user_id: int,
+        *,
+        now: Optional[datetime] = None,
+    ) -> tuple[Literal["added", "exists", "full", "no_parties"], Optional[PartyState], bool]:
+        current_time = now or datetime.now(timezone.utc)
+        state_changed = self.prune(now=current_time)
+
+        current_party = self.party_for_member(user_id)
+        if current_party is not None:
+            return "exists", current_party, state_changed
+
+        parties = self.parties()
+        if not parties:
+            return "no_parties", None, state_changed
+
+        for party in parties:
+            result = party.join(user_id, max_size=self.max_size)
+            if result == "added":
+                return "added", party, True
+        return "full", None, state_changed
+
+    def leave_member(
+        self,
+        user_id: int,
+        *,
+        now: Optional[datetime] = None,
+    ) -> tuple[Literal["removed", "missing"], Optional[PartyState], bool]:
+        current_time = now or datetime.now(timezone.utc)
+        state_changed = self.prune(now=current_time)
+
+        party = self.party_for_member(user_id)
+        if party is None:
+            return "missing", None, state_changed
+
+        result = party.leave(user_id)
+        if result == "removed":
+            state_changed = True
+        if party.prune(now=current_time, vote_ttl=self.vote_ttl):
+            state_changed = True
+        if not party.members and party.active_vote is None:
+            self._remove_party(party.name)
+            state_changed = True
+        return result, party, state_changed
+
+    def record_vote(
+        self,
+        user_id: int,
+        choice: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> VoteProgress:
+        current_time = now or datetime.now(timezone.utc)
+        state_changed = self.prune(now=current_time)
+        party = self.party_for_member(user_id)
+        if party is None:
+            return VoteProgress(
+                status="not_member",
+                choice=None,
+                votes_for=0,
+                required=1,
+                state_changed=state_changed,
+                party_name=None,
+            )
+
+        progress = party.record_vote(
+            user_id,
+            choice,
+            now=current_time,
+            vote_ttl=self.vote_ttl,
+        )
+        progress.state_changed = progress.state_changed or state_changed
+        return progress
+
+    def reset_party(self, party_name: str) -> bool:
+        party = self._parties.get(party_name)
+        if party is None:
+            return False
+        party.reset()
+        self._remove_party(party_name)
+        return True
 
 
 class DungeonMapSelect(discord.ui.Select):
@@ -247,8 +414,8 @@ class DungeonMapSelect(discord.ui.Select):
             )
             return
 
-        lobby = self.tavern.get_lobby(guild.id)
-        progress = lobby.record_vote(interaction.user.id, stored.name)
+        manager = self.tavern.get_party_manager(guild.id)
+        progress = manager.record_vote(interaction.user.id, stored.name)
         if progress.state_changed:
             await self.tavern.update_tavern_embed(guild.id)
 
@@ -262,8 +429,8 @@ class DungeonMapSelect(discord.ui.Select):
         if progress.status == "majority":
             started = await dungeon_cog._start_prepared_dungeon(interaction, stored)
             if started:
-                lobby.reset()
-                await self.tavern.update_tavern_embed(guild.id)
+                if progress.party_name and manager.reset_party(progress.party_name):
+                    await self.tavern.update_tavern_embed(guild.id)
             elif not interaction.response.is_done():
                 await interaction.response.send_message(
                     "Unable to start the expedition. Resolve any issues and vote again.",
@@ -521,13 +688,13 @@ class TavernControlView(discord.ui.View):
         self.cog = cog
         self.guild_id = guild_id
 
-    def _resolve_lobby(self, interaction: discord.Interaction) -> Optional[PartyLobby]:
+    def _resolve_manager(self, interaction: discord.Interaction) -> Optional[PartyManager]:
         guild = interaction.guild
         if guild is None:
             return None
         if guild.id != self.guild_id:
             return None
-        return self.cog.get_lobby(guild.id)
+        return self.cog.get_party_manager(guild.id)
 
     @discord.ui.button(
         label="Visit the Shop",
@@ -562,8 +729,8 @@ class TavernControlView(discord.ui.View):
         custom_id="tavern:party_join",
     )
     async def join_party(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
-        lobby = self._resolve_lobby(interaction)
-        if lobby is None or interaction.guild is None:
+        manager = self._resolve_manager(interaction)
+        if manager is None or interaction.guild is None:
             await interaction.response.send_message(
                 "The party lobby is only available inside the tavern's guild.",
                 ephemeral=True,
@@ -585,19 +752,22 @@ class TavernControlView(discord.ui.View):
             )
             return
 
-        pruned = lobby.prune()
-        result = lobby.join(interaction.user.id)
-        if result == "full":
-            message = "The party is already full."
-        elif result == "exists":
-            message = "You are already waiting in the party lobby."
-        else:
-            message = "You take a seat with the adventuring party."
+        status, party, changed = manager.join_any(interaction.user.id)
+        if status == "full":
+            message = "All parties are full. Create a new party to start a fresh expedition."
+        elif status == "exists" and party is not None:
+            message = f"You are already part of **{party.name}**."
+        elif status == "no_parties":
+            message = "No parties are gathering yet. Use **Create Party** to start one."
+        elif status == "added" and party is not None:
+            message = f"You join **{party.name}** and wait for the next adventure."
+        else:  # defensive
+            message = "Unable to join a party right now."
 
         if not interaction.response.is_done():
             await interaction.response.send_message(message, ephemeral=True)
 
-        if pruned or result == "added":
+        if changed:
             await self.cog.update_tavern_embed(interaction.guild.id)
 
     @discord.ui.button(
@@ -606,25 +776,67 @@ class TavernControlView(discord.ui.View):
         custom_id="tavern:party_leave",
     )
     async def leave_party(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
-        lobby = self._resolve_lobby(interaction)
-        if lobby is None or interaction.guild is None:
+        manager = self._resolve_manager(interaction)
+        if manager is None or interaction.guild is None:
             await interaction.response.send_message(
                 "The party lobby is only available inside the tavern's guild.",
                 ephemeral=True,
             )
             return
 
-        pruned = lobby.prune()
-        result = lobby.leave(interaction.user.id)
-        if result == "missing":
+        status, party, changed = manager.leave_member(interaction.user.id)
+        if status == "missing":
             message = "You are not currently part of the party lobby."
+        elif party is not None:
+            message = f"You leave **{party.name}** to rest by the fire."
         else:
-            message = "You leave the party to rest by the fire."
+            message = "You step away from the party."
 
         if not interaction.response.is_done():
             await interaction.response.send_message(message, ephemeral=True)
 
-        if pruned or result == "removed":
+        if changed and interaction.guild is not None:
+            await self.cog.update_tavern_embed(interaction.guild.id)
+
+    @discord.ui.button(
+        label="Create Party",
+        style=discord.ButtonStyle.primary,
+        custom_id="tavern:party_create",
+    )
+    async def create_party(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+        manager = self._resolve_manager(interaction)
+        if manager is None or interaction.guild is None:
+            await interaction.response.send_message(
+                "The party lobby is only available inside the tavern's guild.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.user is None:
+            await interaction.response.send_message(
+                "Unable to resolve who clicked the button. Try again.",
+                ephemeral=True,
+            )
+            return
+
+        has_character = await self.cog.characters.exists(interaction.guild.id, interaction.user.id)
+        if not has_character:
+            await interaction.response.send_message(
+                "Create a character before forming a new party.",
+                ephemeral=True,
+            )
+            return
+
+        party, status, changed = manager.create_party(interaction.user.id, interaction.user.display_name)
+        if status == "moved":
+            message = f"You form **{party.name}** and lead the way."  # moved from another party
+        else:
+            message = f"You create **{party.name}** and take the first seat."
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
+
+        if changed:
             await self.cog.update_tavern_embed(interaction.guild.id)
 
     @discord.ui.button(
@@ -654,18 +866,18 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         self.config_store = TavernConfigStore(data_path / "taverns.json")
         self.characters = CharacterRepository(data_path / "characters.json")
         self.shop = TavernShop.default_shop()
-        self.lobbies: dict[int, PartyLobby] = {}
+        self.party_managers: dict[int, PartyManager] = {}
         self.refresh_views.start()
 
     def cog_unload(self) -> None:  # noqa: D401 - discord.py hook
         self.refresh_views.cancel()
 
-    def get_lobby(self, guild_id: int) -> PartyLobby:
-        lobby = self.lobbies.get(guild_id)
-        if lobby is None:
-            lobby = PartyLobby()
-            self.lobbies[guild_id] = lobby
-        return lobby
+    def get_party_manager(self, guild_id: int) -> PartyManager:
+        manager = self.party_managers.get(guild_id)
+        if manager is None:
+            manager = PartyManager()
+            self.party_managers[guild_id] = manager
+        return manager
 
     async def update_tavern_embed(self, guild_id: int) -> None:
         config = await self.config_store.get_config(guild_id)
@@ -697,8 +909,8 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
             log.debug("Failed to update tavern embed in %s", channel.name)
 
     def _build_tavern_embed(self, guild: discord.Guild) -> discord.Embed:
-        lobby = self.get_lobby(guild.id)
-        lobby.prune()
+        manager = self.get_party_manager(guild.id)
+        manager.prune()
 
         embed = discord.Embed(
             title="The Adventurers' Tavern",
@@ -714,38 +926,53 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
             inline=False,
         )
 
-        if lobby.members:
-            lines: list[str] = []
-            for user_id in lobby.members:
-                mention = f"<@{user_id}>"
-                status = "⏳ Pending"
-                if lobby.active_vote:
-                    choice = lobby.active_vote.ballots.get(user_id)
-                    if choice:
-                        status = f"🗳️ {choice}"
-                lines.append(f"• {mention} — {status}")
-            party_value = "\n".join(lines)
-        else:
-            party_value = "No adventurers have rallied yet. Use **Join Party** to form a group."
-        embed.add_field(name="Party Lobby", value=party_value, inline=False)
+        parties = manager.parties()
+        if parties:
+            sections: list[str] = []
+            for party in parties:
+                header = (
+                    f"**{party.name}** — {len(party.members)}/{manager.max_size} "
+                    "seats filled"
+                )
+                member_lines: list[str] = []
+                if party.members:
+                    for user_id in party.members:
+                        mention = f"<@{user_id}>"
+                        status = "⏳ Pending"
+                        if party.active_vote:
+                            choice = party.active_vote.ballots.get(user_id)
+                            if choice:
+                                status = f"🗳️ {choice}"
+                        member_lines.append(f"• {mention} — {status}")
+                else:
+                    member_lines.append("• No members yet.")
 
-        if lobby.active_vote and lobby.active_vote.ballots:
-            counts = lobby.active_vote.counts(lobby.members)
-            if counts:
                 vote_lines: list[str] = []
-                for dungeon_name, count in sorted(
-                    counts.items(), key=lambda item: (-item[1], item[0].lower())
-                ):
-                    vote_lines.append(f"• **{dungeon_name}** — {count} vote(s)")
-                expiry = lobby.active_vote.last_activity + lobby.vote_ttl
-                vote_lines.append(f"Votes expire {format_dt(expiry, style='R')}")
-                vote_lines.append(f"{lobby.required_votes()} vote(s) needed to delve.")
-                vote_value = "\n".join(vote_lines)
-            else:
-                vote_value = "Waiting for the first ballot."
+                if party.active_vote:
+                    counts = party.active_vote.counts(party.members)
+                    if counts:
+                        for dungeon_name, count in sorted(
+                            counts.items(), key=lambda item: (-item[1], item[0].lower())
+                        ):
+                            vote_lines.append(f"🗳️ {dungeon_name} — {count} vote(s)")
+                        expiry = party.active_vote.last_activity + manager.vote_ttl
+                        vote_lines.append(f"🕒 Votes expire {format_dt(expiry, style='R')}")
+                        vote_lines.append(
+                            f"✅ {party.required_votes()} vote(s) needed to delve."
+                        )
+                    else:
+                        vote_lines.append("🗳️ Vote started. Waiting for the first ballot.")
+                else:
+                    vote_lines.append("🛑 No vote in progress.")
+
+                section = "\n".join([header, *member_lines, *vote_lines])
+                sections.append(section)
+            party_value = "\n\n".join(sections)
         else:
-            vote_value = "No vote in progress."
-        embed.add_field(name="Active Expedition Vote", value=vote_value, inline=False)
+            party_value = (
+                "No adventurers have rallied yet. Use **Create Party** to start a new group."
+            )
+        embed.add_field(name="Adventuring Parties", value=party_value, inline=False)
 
         embed.set_footer(text="The tavern board refreshes every five minutes.")
         return embed
