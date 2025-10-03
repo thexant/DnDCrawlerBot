@@ -51,6 +51,7 @@ from dnd.dungeon import (
     DungeonGenerator,
     MonsterDefinition,
     Room,
+    RoomExit,
     Theme,
     ThemeRegistry,
 )
@@ -89,6 +90,7 @@ def _format_difficulty_label(value: str) -> str:
 
 DEFAULT_PERCEPTION_DC = 15
 PERCEPTION_DC_INCREASE_CHANCE = 0.25
+HIDDEN_EXIT_BASE_CHANCE = 0.25
 ABILITY_NAME_OVERRIDES = {
     "STR": "Strength",
     "DEX": "Dexterity",
@@ -248,6 +250,7 @@ class DungeonSession:
     discovered_traps: Dict[int, Set[str]] = field(default_factory=dict)
     discovered_loot: Dict[int, Set[str]] = field(default_factory=dict)
     discovered_exits: Dict[int, Set[str]] = field(default_factory=dict)
+    exit_visibility: Dict[int, Dict[str, bool]] = field(default_factory=dict)
     perception_attempts: Dict[int, Dict[int, int]] = field(default_factory=dict)
     perception_difficulties: Dict[int, Dict[tuple[str, str], int]] = field(
         default_factory=dict
@@ -1469,8 +1472,20 @@ class DungeonCog(commands.Cog):
         session.discovered_traps.setdefault(room.id, set())
         session.discovered_loot.setdefault(room.id, set())
         discovered_exits = session.discovered_exits.setdefault(room.id, set())
+        visibility_map = session.exit_visibility.setdefault(room.id, {})
         session.perception_attempts.setdefault(room.id, {})
         session.perception_difficulties.setdefault(room.id, {})
+
+        for exit_option in room.exits:
+            if exit_option.key in discovered_exits:
+                visibility_map[exit_option.key] = True
+
+        previous_room = session.breadcrumbs[-2] if len(session.breadcrumbs) >= 2 else None
+
+        for exit_option in room.exits:
+            if exit_option.destination == previous_room:
+                discovered_exits.add(exit_option.key)
+                visibility_map[exit_option.key] = True
 
         if not discovered_exits and session.dungeon.rooms:
             starting_room_id = session.dungeon.rooms[0].id
@@ -1481,9 +1496,28 @@ class DungeonCog(commands.Cog):
                     destination is not None and destination != room.id
                 ):
                     discovered_exits.add(first_exit.key)
+                    visibility_map[first_exit.key] = True
         for exit_option in room.exits:
             if getattr(exit_option, "completes_delve", False):
                 discovered_exits.add(exit_option.key)
+                visibility_map[exit_option.key] = True
+                continue
+
+            if exit_option.key not in visibility_map:
+                hidden = self._exit_starts_hidden(session, room, exit_option)
+                visibility_map[exit_option.key] = not hidden
+
+            if visibility_map[exit_option.key]:
+                discovered_exits.add(exit_option.key)
+
+    def _exit_starts_hidden(
+        self, session: DungeonSession, room: Room, exit_option: RoomExit
+    ) -> bool:
+        label = (exit_option.label or "").lower()
+        key = exit_option.key.lower()
+        if "secret" in label or "hidden" in label or "secret" in key or "hidden" in key:
+            return True
+        return random.random() < HIDDEN_EXIT_BASE_CHANCE
 
     def _get_trap_status(
         self, session: DungeonSession, room_id: int, trap_key: str
