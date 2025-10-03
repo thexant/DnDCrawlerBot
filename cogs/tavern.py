@@ -350,6 +350,111 @@ class PartyManager:
         return True
 
 
+class PartyJoinSelect(discord.ui.Select):
+    """Selection component for choosing a party to join."""
+
+    def __init__(
+        self,
+        view: "PartyJoinView",
+        parties: Sequence[PartyState],
+        *,
+        max_size: int,
+    ) -> None:
+        options: list[discord.SelectOption] = []
+        for party in parties[:25]:
+            label = party.name[:100]
+            description = f"{len(party.members)}/{max_size} adventurers"[:100]
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=party.name,
+                    description=description,
+                )
+            )
+        super().__init__(
+            placeholder="Choose a party to join",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.join_view = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # noqa: D401
+        await self.join_view.handle_selection(interaction, self.values[0])
+
+
+class PartyJoinView(discord.ui.View):
+    """Ephemeral view that allows a user to select a party to join."""
+
+    def __init__(
+        self,
+        cog: "Tavern",
+        manager: PartyManager,
+        *,
+        guild_id: int,
+        user_id: int,
+        parties: Sequence[PartyState],
+    ) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.manager = manager
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.add_item(PartyJoinSelect(self, parties, max_size=manager.max_size))
+
+    def disable_all_items(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def handle_selection(self, interaction: discord.Interaction, party_name: str) -> None:
+        if interaction.user is None or interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This selection isn't for you.",
+                ephemeral=True,
+            )
+            return
+
+        current_party = self.manager.party_for_member(self.user_id)
+        if current_party is not None:
+            if current_party.name == party_name:
+                message = f"You are already part of **{current_party.name}**."
+            else:
+                message = (
+                    f"You are already part of **{current_party.name}**. Leave that party before joining another."
+                )
+            self.disable_all_items()
+            await interaction.response.edit_message(content=message, view=self)
+            self.stop()
+            return
+
+        party = next((p for p in self.manager.parties() if p.name == party_name), None)
+        if party is None:
+            self.disable_all_items()
+            await interaction.response.edit_message(
+                "That party is no longer gathering. Try joining again.",
+                view=self,
+            )
+            await self.cog.update_tavern_embed(self.guild_id)
+            self.stop()
+            return
+
+        result = party.join(self.user_id, max_size=self.manager.max_size)
+        if result == "full":
+            message = f"**{party.name}** filled up before you could join."
+        elif result == "exists":  # defensive – should be caught earlier
+            message = f"You are already part of **{party.name}**."
+        else:
+            message = f"You join **{party.name}** and wait for the next adventure."
+
+        self.disable_all_items()
+        await interaction.response.edit_message(content=message, view=self)
+
+        if result == "added":
+            await self.cog.update_tavern_embed(self.guild_id)
+
+        self.stop()
+
+
 class DungeonMapSelect(discord.ui.Select):
     """Select menu for choosing a prepared dungeon to explore."""
 
@@ -752,22 +857,53 @@ class TavernControlView(discord.ui.View):
             )
             return
 
-        status, party, changed = manager.join_any(interaction.user.id)
-        if status == "full":
-            message = "All parties are full. Create a new party to start a fresh expedition."
-        elif status == "exists" and party is not None:
-            message = f"You are already part of **{party.name}**."
-        elif status == "no_parties":
-            message = "No parties are gathering yet. Use **Create Party** to start one."
-        elif status == "added" and party is not None:
-            message = f"You join **{party.name}** and wait for the next adventure."
-        else:  # defensive
-            message = "Unable to join a party right now."
+        state_changed = manager.prune()
 
-        if not interaction.response.is_done():
-            await interaction.response.send_message(message, ephemeral=True)
+        current_party = manager.party_for_member(interaction.user.id)
+        if current_party is not None:
+            await interaction.response.send_message(
+                f"You are already part of **{current_party.name}**.",
+                ephemeral=True,
+            )
+            if state_changed:
+                await self.cog.update_tavern_embed(interaction.guild.id)
+            return
 
-        if changed:
+        parties = manager.parties()
+        available = [party for party in parties if len(party.members) < manager.max_size]
+
+        if not parties:
+            await interaction.response.send_message(
+                "No parties are gathering yet. Use **Create Party** to start one.",
+                ephemeral=True,
+            )
+            if state_changed:
+                await self.cog.update_tavern_embed(interaction.guild.id)
+            return
+
+        if not available:
+            await interaction.response.send_message(
+                "All parties are full. Create a new party to start a fresh expedition.",
+                ephemeral=True,
+            )
+            if state_changed:
+                await self.cog.update_tavern_embed(interaction.guild.id)
+            return
+
+        view = PartyJoinView(
+            self.cog,
+            manager,
+            guild_id=interaction.guild.id,
+            user_id=interaction.user.id,
+            parties=available,
+        )
+        await interaction.response.send_message(
+            "Select a party to join from the list below.",
+            view=view,
+            ephemeral=True,
+        )
+
+        if state_changed:
             await self.cog.update_tavern_embed(interaction.guild.id)
 
     @discord.ui.button(
@@ -784,18 +920,30 @@ class TavernControlView(discord.ui.View):
             )
             return
 
-        status, party, changed = manager.leave_member(interaction.user.id)
-        if status == "missing":
-            message = "You are not currently part of the party lobby."
-        elif party is not None:
+        if interaction.user is None:
+            await interaction.response.send_message(
+                "Unable to resolve who clicked the button. Try again.",
+                ephemeral=True,
+            )
+            return
+
+        party = manager.party_for_member(interaction.user.id)
+        if party is None:
+            await interaction.response.send_message(
+                "You are not currently part of any party in the tavern.",
+                ephemeral=True,
+            )
+            return
+
+        status, _, changed = manager.leave_member(interaction.user.id)
+        if status == "removed":
             message = f"You leave **{party.name}** to rest by the fire."
-        else:
+        else:  # defensive
             message = "You step away from the party."
 
-        if not interaction.response.is_done():
-            await interaction.response.send_message(message, ephemeral=True)
+        await interaction.response.send_message(message, ephemeral=True)
 
-        if changed and interaction.guild is not None:
+        if changed:
             await self.cog.update_tavern_embed(interaction.guild.id)
 
     @discord.ui.button(
