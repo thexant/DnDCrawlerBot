@@ -9,7 +9,7 @@ import pytest
 
 import dnd.combat as combat_utils
 from cogs.dungeon import CombatantState, CombatState, DungeonCog, DungeonSession
-from dnd.content.models import EncounterTable, Theme
+from dnd.content.models import EncounterTable, Monster, Theme
 from dnd.dungeon.generator import Dungeon, EncounterResult, Room
 
 
@@ -33,6 +33,94 @@ def _make_session() -> DungeonSession:
 
 def _make_cog() -> DungeonCog:
     return DungeonCog.__new__(DungeonCog)
+
+
+def test_unique_monster_labels_assign_suffixes() -> None:
+    monsters = (
+        Monster(
+            key="skeleton_a",
+            name="Skeleton",
+            challenge=0.25,
+            armor_class=13,
+            hit_points=13,
+            attack_bonus=4,
+            damage="1d6+2",
+        ),
+        Monster(
+            key="skeleton_b",
+            name="Skeleton",
+            challenge=0.25,
+            armor_class=13,
+            hit_points=13,
+            attack_bonus=4,
+            damage="1d6+2",
+        ),
+        Monster(
+            key="zombie",
+            name="Zombie",
+            challenge=0.25,
+            armor_class=8,
+            hit_points=22,
+            attack_bonus=3,
+            damage="1d6+1",
+        ),
+    )
+    labels = DungeonCog._unique_monster_labels(monsters)
+    assert labels == ["Skeleton 1", "Skeleton 2", "Zombie"]
+
+
+def test_select_player_target_prefers_existing_selection() -> None:
+    cog = _make_cog()
+    player = CombatantState(
+        identifier="player:hero",
+        name="Hero",
+        initiative_roll=10,
+        initiative_total=15,
+        max_hp=20,
+        current_hp=20,
+        is_player=True,
+        user_id=1,
+        metadata={},
+    )
+    enemy_a = CombatantState(
+        identifier="monster:0",
+        name="Skeleton 1",
+        initiative_roll=5,
+        initiative_total=7,
+        max_hp=13,
+        current_hp=13,
+        is_player=False,
+        metadata={"armor_class": 13},
+    )
+    enemy_b = CombatantState(
+        identifier="monster:1",
+        name="Skeleton 2",
+        initiative_roll=4,
+        initiative_total=6,
+        max_hp=13,
+        current_hp=13,
+        is_player=False,
+        metadata={"armor_class": 13},
+    )
+    state = CombatState(order=[player, enemy_a, enemy_b], active=True)
+
+    target = cog._select_player_target(state, player)
+    assert target is enemy_a
+    assert player.selected_target == enemy_a.identifier
+
+    player.selected_target = enemy_b.identifier
+    target = cog._select_player_target(state, player)
+    assert target is enemy_b
+
+    enemy_b.current_hp = 0
+    target = cog._select_player_target(state, player)
+    assert target is enemy_a
+    assert player.selected_target == enemy_a.identifier
+
+    enemy_a.current_hp = 0
+    target = cog._select_player_target(state, player)
+    assert target is None
+    assert player.selected_target is None
 
 
 def test_combat_embed_highlights_player_action() -> None:
