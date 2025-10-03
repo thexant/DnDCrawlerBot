@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Sequence, Set, TYPE_CHECKING
+from typing import Literal, Optional, Sequence, Set, TYPE_CHECKING
 
 import discord
 from discord import app_commands
+from discord.utils import format_dt
 from discord.ext import commands, tasks
 
 from dnd import (
@@ -29,6 +32,155 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
 log = logging.getLogger(__name__)
 
 TAVERN_ROLE_NAME = "Tavern Adventurer"
+MAX_PARTY_SIZE = 4
+VOTE_TTL = timedelta(minutes=10)
+
+
+@dataclass
+class LobbyVote:
+    """Track ballots for a prepared dungeon selection vote."""
+
+    started_at: datetime
+    last_activity: datetime
+    ballots: dict[int, str] = field(default_factory=dict)
+
+    def touch(self, now: datetime) -> None:
+        self.last_activity = now
+
+    def expired(self, now: datetime, ttl: timedelta) -> bool:
+        return now - self.last_activity >= ttl
+
+    def counts(self, members: Sequence[int]) -> dict[str, int]:
+        tally: dict[str, int] = {}
+        for user_id in members:
+            choice = self.ballots.get(user_id)
+            if choice is None:
+                continue
+            tally[choice] = tally.get(choice, 0) + 1
+        return tally
+
+
+@dataclass
+class VoteProgress:
+    """Result of recording a ballot in the party lobby."""
+
+    status: Literal["not_member", "started", "updated", "majority"]
+    choice: Optional[str]
+    votes_for: int
+    required: int
+    state_changed: bool = False
+
+
+class PartyLobby:
+    """Manage party membership and voting for a guild lobby."""
+
+    def __init__(self, *, max_size: int = MAX_PARTY_SIZE, vote_ttl: timedelta = VOTE_TTL) -> None:
+        self.max_size = max_size
+        self.vote_ttl = vote_ttl
+        self.members: list[int] = []
+        self.active_vote: Optional[LobbyVote] = None
+
+    def join(self, user_id: int) -> Literal["added", "exists", "full"]:
+        if user_id in self.members:
+            return "exists"
+        if len(self.members) >= self.max_size:
+            return "full"
+        self.members.append(user_id)
+        return "added"
+
+    def leave(self, user_id: int) -> Literal["removed", "missing"]:
+        if user_id not in self.members:
+            return "missing"
+        self.members.remove(user_id)
+        return "removed"
+
+    def reset(self) -> None:
+        self.members.clear()
+        self.active_vote = None
+
+    def clear_vote(self) -> None:
+        self.active_vote = None
+
+    def prune(self, now: Optional[datetime] = None) -> bool:
+        """Remove stale ballots and clear empty votes."""
+
+        now = now or datetime.now(timezone.utc)
+        changed = False
+        if self.active_vote is None:
+            return changed
+
+        for user_id in list(self.active_vote.ballots):
+            if user_id not in self.members:
+                del self.active_vote.ballots[user_id]
+                changed = True
+
+        if self.active_vote and self.active_vote.expired(now, self.vote_ttl):
+            self.active_vote = None
+            return True
+
+        if self.active_vote and not self.active_vote.ballots:
+            self.active_vote = None
+            return True
+
+        return changed
+
+    def required_votes(self) -> int:
+        return max(1, (len(self.members) // 2) + 1)
+
+    def _evaluate_majority(self) -> tuple[Optional[str], int]:
+        if not self.active_vote:
+            return None, 0
+        counts = self.active_vote.counts(self.members)
+        required = self.required_votes()
+        for name, count in counts.items():
+            if count >= required:
+                return name, count
+        return None, 0
+
+    def record_vote(
+        self,
+        user_id: int,
+        choice: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> VoteProgress:
+        current_time = now or datetime.now(timezone.utc)
+        pruned = self.prune(current_time)
+        if user_id not in self.members:
+            return VoteProgress(
+                status="not_member",
+                choice=None,
+                votes_for=0,
+                required=self.required_votes(),
+                state_changed=pruned,
+            )
+
+        if self.active_vote is None:
+            self.active_vote = LobbyVote(started_at=current_time, last_activity=current_time)
+            status: Literal["started", "updated", "majority"] = "started"
+        else:
+            status = "updated"
+        self.active_vote.ballots[user_id] = choice
+        self.active_vote.touch(current_time)
+
+        winner, votes_for = self._evaluate_majority()
+        required = self.required_votes()
+        if winner is not None:
+            return VoteProgress(
+                status="majority",
+                choice=winner,
+                votes_for=votes_for,
+                required=required,
+                state_changed=True,
+            )
+
+        return VoteProgress(
+            status=status,
+            choice=choice,
+            votes_for=self.active_vote.counts(self.members).get(choice, 0),
+            required=required,
+            state_changed=True,
+        )
 
 
 class DungeonMapSelect(discord.ui.Select):
@@ -87,7 +239,52 @@ class DungeonMapSelect(discord.ui.Select):
             )
             return
 
-        await dungeon_cog._start_prepared_dungeon(interaction, stored)
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Expeditions can only be planned from within a guild channel.",
+                ephemeral=True,
+            )
+            return
+
+        lobby = self.tavern.get_lobby(guild.id)
+        progress = lobby.record_vote(interaction.user.id, stored.name)
+        if progress.state_changed:
+            await self.tavern.update_tavern_embed(guild.id)
+
+        if progress.status == "not_member":
+            await interaction.response.send_message(
+                "Join the party lobby with **Join Party** before casting a vote.",
+                ephemeral=True,
+            )
+            return
+
+        if progress.status == "majority":
+            started = await dungeon_cog._start_prepared_dungeon(interaction, stored)
+            if started:
+                lobby.reset()
+                await self.tavern.update_tavern_embed(guild.id)
+            elif not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Unable to start the expedition. Resolve any issues and vote again.",
+                    ephemeral=True,
+                )
+            return
+
+        if interaction.response.is_done():
+            return
+
+        if progress.status == "started":
+            message = (
+                f"A new expedition vote has begun for **{progress.choice}**. "
+                f"{progress.votes_for}/{progress.required} votes recorded."
+            )
+        else:
+            message = (
+                f"Your vote for **{progress.choice}** is logged. "
+                f"{progress.votes_for}/{progress.required} votes recorded."
+            )
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 class DungeonMapView(discord.ui.View):
@@ -319,9 +516,18 @@ class TavernShopView(discord.ui.View):
 class TavernControlView(discord.ui.View):
     """Interactive controls for the tavern hub embed."""
 
-    def __init__(self, cog: "Tavern") -> None:
+    def __init__(self, cog: "Tavern", *, guild_id: int) -> None:
         super().__init__(timeout=None)
         self.cog = cog
+        self.guild_id = guild_id
+
+    def _resolve_lobby(self, interaction: discord.Interaction) -> Optional[PartyLobby]:
+        guild = interaction.guild
+        if guild is None:
+            return None
+        if guild.id != self.guild_id:
+            return None
+        return self.cog.get_lobby(guild.id)
 
     @discord.ui.button(
         label="Visit the Shop",
@@ -351,6 +557,77 @@ class TavernControlView(discord.ui.View):
             view.message = None
 
     @discord.ui.button(
+        label="Join Party",
+        style=discord.ButtonStyle.success,
+        custom_id="tavern:party_join",
+    )
+    async def join_party(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+        lobby = self._resolve_lobby(interaction)
+        if lobby is None or interaction.guild is None:
+            await interaction.response.send_message(
+                "The party lobby is only available inside the tavern's guild.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.user is None:
+            await interaction.response.send_message(
+                "Unable to resolve who clicked the button. Try again.",
+                ephemeral=True,
+            )
+            return
+
+        has_character = await self.cog.characters.exists(interaction.guild.id, interaction.user.id)
+        if not has_character:
+            await interaction.response.send_message(
+                "Create a character before joining the party lobby.",
+                ephemeral=True,
+            )
+            return
+
+        pruned = lobby.prune()
+        result = lobby.join(interaction.user.id)
+        if result == "full":
+            message = "The party is already full."
+        elif result == "exists":
+            message = "You are already waiting in the party lobby."
+        else:
+            message = "You take a seat with the adventuring party."
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
+
+        if pruned or result == "added":
+            await self.cog.update_tavern_embed(interaction.guild.id)
+
+    @discord.ui.button(
+        label="Leave Party",
+        style=discord.ButtonStyle.danger,
+        custom_id="tavern:party_leave",
+    )
+    async def leave_party(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # noqa: D401
+        lobby = self._resolve_lobby(interaction)
+        if lobby is None or interaction.guild is None:
+            await interaction.response.send_message(
+                "The party lobby is only available inside the tavern's guild.",
+                ephemeral=True,
+            )
+            return
+
+        pruned = lobby.prune()
+        result = lobby.leave(interaction.user.id)
+        if result == "missing":
+            message = "You are not currently part of the party lobby."
+        else:
+            message = "You leave the party to rest by the fire."
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
+
+        if pruned or result == "removed":
+            await self.cog.update_tavern_embed(interaction.guild.id)
+
+    @discord.ui.button(
         label="View Dungeon Map",
         style=discord.ButtonStyle.primary,
         custom_id="tavern:map",
@@ -377,10 +654,101 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         self.config_store = TavernConfigStore(data_path / "taverns.json")
         self.characters = CharacterRepository(data_path / "characters.json")
         self.shop = TavernShop.default_shop()
+        self.lobbies: dict[int, PartyLobby] = {}
         self.refresh_views.start()
 
     def cog_unload(self) -> None:  # noqa: D401 - discord.py hook
         self.refresh_views.cancel()
+
+    def get_lobby(self, guild_id: int) -> PartyLobby:
+        lobby = self.lobbies.get(guild_id)
+        if lobby is None:
+            lobby = PartyLobby()
+            self.lobbies[guild_id] = lobby
+        return lobby
+
+    async def update_tavern_embed(self, guild_id: int) -> None:
+        config = await self.config_store.get_config(guild_id)
+        if (
+            config is None
+            or config.channel_id is None
+            or config.message_id is None
+        ):
+            return
+
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return
+
+        channel = guild.get_channel(config.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        try:
+            message = await channel.fetch_message(config.message_id)
+        except (discord.NotFound, discord.HTTPException):
+            return
+
+        embed = self._build_tavern_embed(guild)
+        view = TavernControlView(self, guild_id=guild_id)
+        try:
+            await message.edit(embed=embed, view=view)
+        except discord.HTTPException:
+            log.debug("Failed to update tavern embed in %s", channel.name)
+
+    def _build_tavern_embed(self, guild: discord.Guild) -> discord.Embed:
+        lobby = self.get_lobby(guild.id)
+        lobby.prune()
+
+        embed = discord.Embed(
+            title="The Adventurers' Tavern",
+            description=(
+                "A warm hearth welcomes heroes between expeditions. Share tales, "
+                "recruit allies, and prepare for the next delve."
+            ),
+            color=discord.Color.gold(),
+        )
+        embed.add_field(
+            name="Planning",
+            value="Use the buttons below to browse services before embarking on your next dungeon run.",
+            inline=False,
+        )
+
+        if lobby.members:
+            lines: list[str] = []
+            for user_id in lobby.members:
+                mention = f"<@{user_id}>"
+                status = "⏳ Pending"
+                if lobby.active_vote:
+                    choice = lobby.active_vote.ballots.get(user_id)
+                    if choice:
+                        status = f"🗳️ {choice}"
+                lines.append(f"• {mention} — {status}")
+            party_value = "\n".join(lines)
+        else:
+            party_value = "No adventurers have rallied yet. Use **Join Party** to form a group."
+        embed.add_field(name="Party Lobby", value=party_value, inline=False)
+
+        if lobby.active_vote and lobby.active_vote.ballots:
+            counts = lobby.active_vote.counts(lobby.members)
+            if counts:
+                vote_lines: list[str] = []
+                for dungeon_name, count in sorted(
+                    counts.items(), key=lambda item: (-item[1], item[0].lower())
+                ):
+                    vote_lines.append(f"• **{dungeon_name}** — {count} vote(s)")
+                expiry = lobby.active_vote.last_activity + lobby.vote_ttl
+                vote_lines.append(f"Votes expire {format_dt(expiry, style='R')}")
+                vote_lines.append(f"{lobby.required_votes()} vote(s) needed to delve.")
+                vote_value = "\n".join(vote_lines)
+            else:
+                vote_value = "Waiting for the first ballot."
+        else:
+            vote_value = "No vote in progress."
+        embed.add_field(name="Active Expedition Vote", value=vote_value, inline=False)
+
+        embed.set_footer(text="The tavern board refreshes every five minutes.")
+        return embed
 
     async def build_dungeon_map_components(
         self, guild_id: int
@@ -564,22 +932,8 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
                 except discord.HTTPException:
                     log.debug("Could not delete previous tavern embed in %s", channel.name)
 
-        embed = discord.Embed(
-            title="The Adventurers' Tavern",
-            description=(
-                "A warm hearth welcomes heroes between expeditions. Share tales, "
-                "recruit allies, and prepare for the next delve."
-            ),
-            color=discord.Color.gold(),
-        )
-        embed.add_field(
-            name="Planning",
-            value="Use the buttons below to browse services before embarking on your next dungeon run.",
-            inline=False,
-        )
-        embed.set_footer(text="The tavern board refreshes every five minutes.")
-
-        view = TavernControlView(self)
+        embed = self._build_tavern_embed(channel.guild)
+        view = TavernControlView(self, guild_id=channel.guild.id)
         try:
             message = await channel.send(embed=embed, view=view)
         except discord.HTTPException:
