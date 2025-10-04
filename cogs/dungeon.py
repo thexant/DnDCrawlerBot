@@ -535,6 +535,9 @@ class CombatActionView(discord.ui.View):
             self._add_feature_select(None)
             self._add_common_buttons(disabled=not self._combat_active)
             return
+        if current.current_hp <= 0 and not current.is_dead and not current.stable:
+            self._add_death_save_button(disabled=not self._combat_active)
+            return
         self._add_weapon_select(current)
         self._add_spell_select(current)
         self._add_feature_select(current)
@@ -572,7 +575,10 @@ class CombatActionView(discord.ui.View):
                 )
             ], True)
         disabled = (
-            current is None or not current.is_player or current.defeated
+            current is None
+            or not current.is_player
+            or current.defeated
+            or (current.current_hp <= 0 if current else False)
         ) or not self._combat_active
         selected_identifier = (
             current.selected_target if current and current.is_player else None
@@ -801,6 +807,16 @@ class CombatActionView(discord.ui.View):
             custom_id="dungeon:combat:feature",
         )
         self.add_item(select)
+
+    def _add_death_save_button(self, *, disabled: bool) -> None:
+        button = discord.ui.Button(
+            label="Roll Death Save",
+            style=discord.ButtonStyle.danger,
+            custom_id="dungeon:combat:death_save",
+            disabled=disabled,
+        )
+        button.callback = self._make_action_callback("death_save")
+        self.add_item(button)
 
     def _add_common_buttons(self, *, disabled: bool) -> None:
         defend_button = discord.ui.Button(
@@ -1955,13 +1971,25 @@ class DungeonCog(commands.Cog):
     ) -> bool:
         if player.current_hp > 0:
             return False
-        state.waiting_for = None
         if player.is_dead or player.stable:
+            state.waiting_for = None
             return True
-        message = self._resolve_player_death_save(session, player)
-        state.log.append(message)
-        self._trim_combat_log(state)
-        return True
+        if player.user_id is None:
+            state.waiting_for = None
+            message = self._resolve_player_death_save(session, player)
+            state.log.append(message)
+            self._trim_combat_log(state)
+            return True
+        state.waiting_for = player.user_id
+        state.current_action = {
+            "actor": player.name,
+            "state": "awaiting death save",
+            "summary": "Awaiting a death saving throw...",
+            "detail": "Roll a death saving throw to cling to life.",
+            "emoji": "🩸",
+            "team": "player",
+        }
+        return False
 
     @staticmethod
     def _resolve_selection_index(selection: Optional[str], prefix: str, default: int = 0) -> int:
@@ -3032,6 +3060,8 @@ class DungeonCog(commands.Cog):
                     if next_combatant is None:
                         break
                     continue
+                await self._refresh_session_view(session)
+                break
             if current.defeated:
                 next_combatant = self._ensure_current_combatant(state)
                 if next_combatant is None:
@@ -3420,6 +3450,31 @@ class DungeonCog(commands.Cog):
         state.log.append(message)
         self._trim_combat_log(state)
         return "You brace yourself, gaining no additional effects but readying for the next turn."
+
+    def _player_roll_death_save(
+        self,
+        session: Optional[DungeonSession],
+        state: CombatState,
+        player: CombatantState,
+    ) -> str:
+        if player.current_hp > 0:
+            return "You are still conscious—you don't need a death save."
+        if player.is_dead:
+            return f"{player.name} has already succumbed to their wounds."
+        if player.stable:
+            return f"{player.name} is stable and does not need to roll."
+        message = self._resolve_player_death_save(session, player)
+        state.current_action = {
+            "actor": player.name,
+            "state": "death save",
+            "summary": "Rolling a death save",
+            "detail": message,
+            "emoji": "🩸",
+            "team": "player",
+        }
+        state.log.append(message)
+        self._trim_combat_log(state)
+        return message
 
     async def _build_combat_state(
         self,
@@ -5763,7 +5818,16 @@ class DungeonCog(commands.Cog):
     async def handle_combat_action(
         self,
         interaction: discord.Interaction,
-        action: Literal["weapon", "spell", "feature", "defend", "end", "attack", "target"],
+        action: Literal[
+            "weapon",
+            "spell",
+            "feature",
+            "defend",
+            "end",
+            "attack",
+            "target",
+            "death_save",
+        ],
         selection: Optional[str] = None,
     ) -> None:
         key = self._session_key(interaction.guild_id, interaction.channel_id)
@@ -5820,6 +5884,18 @@ class DungeonCog(commands.Cog):
                 combat.log.append(f"{current.name} ends their turn without further action.")
                 self._trim_combat_log(combat)
                 summary = "You end your turn."
+            elif action == "death_save":
+                if current.current_hp > 0:
+                    error = "You are still conscious—you don't need a death save."
+                    return
+                if current.is_dead:
+                    error = "You have already succumbed to your wounds."
+                    return
+                if current.stable:
+                    error = "You are stable and cannot roll another death save."
+                    return
+                summary = self._player_roll_death_save(run, combat, current)
+                pending_fallen.extend(self._identify_newly_fallen(run, combat))
             elif action == "target":
                 consumes_turn = False
                 target_identifier = self._resolve_target_identifier(selection)

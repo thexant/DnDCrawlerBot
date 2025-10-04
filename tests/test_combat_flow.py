@@ -1,6 +1,6 @@
 import asyncio
 import random
-from typing import Optional
+from typing import Callable, Optional
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -380,14 +380,21 @@ def test_player_death_saves_and_target_selection(monkeypatch: pytest.MonkeyPatch
     downed.death_save_successes = 0
     downed.death_save_failures = 0
     downed.stable = False
+    assert cog._handle_player_zero_hp_turn(state, downed) is False
+    assert state.waiting_for == downed.user_id
+    assert state.current_action and state.current_action["state"] == "awaiting death save"
+
     monkeypatch.setattr(DungeonCog, "_death_save_roll", lambda self=None: 15)
-    assert cog._handle_player_zero_hp_turn(state, downed) is True
+    summary = cog._player_roll_death_save(None, state, downed)
     assert downed.death_save_successes == 1
-    assert "15" in state.log[-1]
+    assert "15" in summary
+    assert state.log[-1] == summary
+    assert state.current_action and state.current_action["state"] == "death save"
 
     monkeypatch.setattr(DungeonCog, "_death_save_roll", lambda self=None: 1)
-    cog._handle_player_zero_hp_turn(state, downed)
+    summary = cog._player_roll_death_save(None, state, downed)
     assert downed.death_save_failures == 2
+    assert "Critical failure" in summary
 
 
 def test_player_spell_consumes_resources(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -513,6 +520,14 @@ def test_player_death_announcement_clears_character_and_offers_return() -> None:
         return_button = next(button for button in buttons if button.label == "Return to Tavern")
         fake_tavern = SimpleNamespace(mention="#tavern")
         cog._find_tavern_channel = AsyncMock(return_value=fake_tavern)
+        cog._refresh_session_view = AsyncMock()
+        cog._handle_party_membership_change = AsyncMock()
+
+        async def fake_update(key: object, mutator: Callable[[DungeonSession], None]) -> DungeonSession:
+            mutator(session)
+            return session
+
+        cog.sessions = SimpleNamespace(update=AsyncMock(side_effect=fake_update))
 
         class DummyResponse:
             def __init__(self) -> None:
@@ -521,7 +536,11 @@ def test_player_death_announcement_clears_character_and_offers_return() -> None:
             async def send_message(self, content: str, *, ephemeral: bool) -> None:
                 self.messages.append((content, ephemeral))
 
-        interaction = SimpleNamespace(response=DummyResponse())
+        interaction = SimpleNamespace(
+            response=DummyResponse(),
+            guild_id=session.guild_id,
+            user=SimpleNamespace(id=player.user_id),
+        )
         await return_button.callback(interaction)
 
         assert interaction.response.messages
