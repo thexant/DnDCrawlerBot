@@ -25,9 +25,11 @@
     }
   ],
   "monsters": [
-    "animated_armor",
-    "specter",
-    "helmed_horror"
+    {"key": "animated_broom", "weight": 2},
+    {"key": "flying_sword", "weight": 2},
+    {"key": "animated_armor", "weight": 1},
+    {"key": "helmed_horror", "weight": 1},
+    {"key": "specter", "weight": 1}
   ],
   "traps": [
     "glyph_of_detonation",

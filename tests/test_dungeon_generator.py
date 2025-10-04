@@ -108,6 +108,27 @@ def test_monster_challenge_bounds_applied(arcane_theme: Theme) -> None:
     assert exceeds_cap, "Harder tiers should still surface high-CR monsters"
 
 
+def test_easy_arcane_ruins_encounters_use_low_cr_constructs(arcane_theme: Theme) -> None:
+    easy_profile = DIFFICULTY_PROFILES["easy"]
+    assert easy_profile.max_monster_challenge is not None
+
+    low_cr_monsters = {
+        monster.key
+        for monster in arcane_theme.monsters
+        if monster.challenge <= easy_profile.max_monster_challenge
+    }
+    assert {"animated_broom", "flying_sword"}.issubset(low_cr_monsters)
+
+    encountered: set[str] = set()
+    for seed in range(60):
+        generator = DungeonGenerator(arcane_theme, seed=seed, difficulty="easy")
+        encounter = generator._build_encounter("combat", "easy")
+        encountered.update(monster.key for monster in encounter.monsters)
+        assert all(monster.challenge <= easy_profile.max_monster_challenge for monster in encounter.monsters)
+
+    assert encountered <= low_cr_monsters
+
+
 def test_trap_scaling_by_difficulty(arcane_theme: Theme) -> None:
     difficulties = list(DIFFICULTY_PROFILES.keys())
     average_counts: list[float] = []
