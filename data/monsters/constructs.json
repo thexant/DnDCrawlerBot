@@ -1,5 +1,27 @@
 [
   {
+    "key": "animated_broom",
+    "name": "Animated Broom",
+    "challenge": 0.25,
+    "armor_class": 15,
+    "hit_points": 17,
+    "attack_bonus": 4,
+    "damage": "1d4+2",
+    "ability_scores": {"STR": 10, "DEX": 16, "CON": 12},
+    "tags": ["construct", "arcane", "minion"]
+  },
+  {
+    "key": "flying_sword",
+    "name": "Flying Sword",
+    "challenge": 1,
+    "armor_class": 17,
+    "hit_points": 17,
+    "attack_bonus": 3,
+    "damage": "1d8+1",
+    "ability_scores": {"STR": 12, "DEX": 15, "CON": 11},
+    "tags": ["construct", "arcane", "skirmisher"]
+  },
+  {
     "key": "animated_armor",
     "name": "Animated Armor",
     "challenge": 3,
