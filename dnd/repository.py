@@ -18,15 +18,19 @@ class CharacterRepository:
         self._lock = asyncio.Lock()
         self._cache: Dict[str, Dict[str, Dict[str, object]]] = {}
         self._loaded = False
+        self._storage_serial: Optional[tuple[int, int]] = None
 
     async def _ensure_loaded(self) -> None:
-        if self._loaded:
+        current_serial = await self._current_storage_serial()
+        if self._loaded and self._storage_serial == current_serial:
             return
-        if not self._storage_path.exists():
+        if current_serial is None:
             self._storage_path.parent.mkdir(parents=True, exist_ok=True)
             self._cache = {}
             self._loaded = True
+            self._storage_serial = None
             return
+        self._cache = {}
         data = await asyncio.to_thread(self._storage_path.read_text)
         if data.strip():
             try:
@@ -43,10 +47,23 @@ class CharacterRepository:
                         for guild_id, guild_bucket in raw.items()
                     }
         self._loaded = True
+        self._storage_serial = current_serial
 
     async def _persist(self) -> None:
+        self._storage_path.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(self._cache, indent=2, sort_keys=True)
         await asyncio.to_thread(self._storage_path.write_text, text)
+        self._storage_serial = await self._current_storage_serial()
+        self._loaded = True
+
+    async def _current_storage_serial(self) -> Optional[tuple[int, int]]:
+        if not self._storage_path.exists():
+            return None
+        stat_result = await asyncio.to_thread(self._storage_path.stat)
+        mtime_ns = getattr(stat_result, "st_mtime_ns", None) or int(
+            stat_result.st_mtime * 1_000_000_000
+        )
+        return (mtime_ns, stat_result.st_size)
 
     async def get(self, guild_id: int, user_id: int) -> Optional[Character]:
         async with self._lock:
