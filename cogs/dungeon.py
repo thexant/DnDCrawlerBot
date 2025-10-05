@@ -1251,6 +1251,27 @@ class DungeonCog(commands.Cog):
             except (discord.HTTPException, discord.Forbidden):
                 log.debug("Failed to clear party access for %s in %s", target, channel)
 
+    async def _run_delayed_party_cleanup(self, session: DungeonSession) -> None:
+        await asyncio.sleep(60)
+
+        if session.guild_id is None:
+            return
+
+        guild = self.bot.get_guild(session.guild_id)
+        if guild is None:
+            return
+
+        channel = guild.get_channel(session.channel_id)
+        if channel is None:
+            return
+
+        try:
+            await self._clear_party_channel_access(session)
+        except Exception:  # pragma: no cover - defensive safeguard
+            log.exception(
+                "Unexpected error while clearing party channel access for %s", channel
+            )
+
     async def _ensure_character_available(
         self, interaction: discord.Interaction
     ) -> bool:
@@ -4457,10 +4478,27 @@ class DungeonCog(commands.Cog):
         if party_snapshot:
             removed.party_ids.update(party_snapshot)
 
+        guild = interaction.guild or (
+            self.bot.get_guild(removed.guild_id) if removed.guild_id is not None else None
+        )
+        party_channel: Optional[discord.TextChannel] = None
+        if isinstance(interaction.channel, discord.TextChannel):
+            party_channel = interaction.channel
+        elif guild is not None:
+            channel = guild.get_channel(removed.channel_id)
+            if isinstance(channel, discord.TextChannel):
+                party_channel = channel
+
+        announcement_channel = await self._find_tavern_channel(removed.guild_id)
+        if announcement_channel is not None:
+            tavern_reference = announcement_channel.mention
+        else:
+            tavern_reference = "the tavern"
+
         exit_phrase = exit_label.lower() if exit_label else "exit"
         await interaction.followup.send(
             (
-                f"You step through the {exit_phrase} and return to the tavern. "
+                f"You step through the {exit_phrase} and return to {tavern_reference}. "
                 "Your success is heralded for all to hear!"
             ),
             ephemeral=True,
@@ -4475,18 +4513,6 @@ class DungeonCog(commands.Cog):
             except discord.HTTPException:
                 pass
 
-        guild = interaction.guild or (
-            self.bot.get_guild(removed.guild_id) if removed.guild_id is not None else None
-        )
-        party_channel: Optional[discord.TextChannel] = None
-        if isinstance(interaction.channel, discord.TextChannel):
-            party_channel = interaction.channel
-        elif guild is not None:
-            channel = guild.get_channel(removed.channel_id)
-            if isinstance(channel, discord.TextChannel):
-                party_channel = channel
-
-        announcement_channel = await self._find_tavern_channel(removed.guild_id)
         embed = self._build_completion_embed(removed, exit_label=exit_label)
         targets: list[discord.TextChannel] = []
         if announcement_channel is not None:
@@ -4504,7 +4530,7 @@ class DungeonCog(commands.Cog):
                 continue
             delivered_channels.add(target.id)
 
-        await self._clear_party_channel_access(removed)
+        asyncio.create_task(self._run_delayed_party_cleanup(removed))
         await self._update_tavern_access(removed.guild_id)
     async def _send_ephemeral_message(
         self, interaction: discord.Interaction, message: str
