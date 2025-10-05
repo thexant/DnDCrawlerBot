@@ -4397,7 +4397,10 @@ class DungeonCog(commands.Cog):
         guild = self.bot.get_guild(guild_id)
         if guild is None:
             return None
-        channel = guild.get_channel(config.channel_id)
+        channel_id = config.tavern_channel_id or config.channel_id
+        if channel_id is None:
+            return None
+        channel = guild.get_channel(channel_id)
         return channel if isinstance(channel, discord.TextChannel) else None
 
     @staticmethod
