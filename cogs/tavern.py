@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,11 @@ from discord import app_commands
 from discord.utils import format_dt
 from discord.ext import commands, tasks
 
+from cogs.character_creation import (
+    CharacterCreation,
+    CharacterCreationView,
+    DeletionConfirmationView,
+)
 from dnd import (
     Character,
     CharacterRepository,
@@ -841,6 +847,117 @@ class TavernControlView(discord.ui.View):
         except discord.HTTPException:
             view.message = None
 
+class ManageCharacterView(discord.ui.View):
+    """Persistent controls for creating, viewing, and deleting characters."""
+
+    def __init__(self, cog: "Tavern", *, guild_id: int) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
+        guild = interaction.guild
+        if guild is None or guild.id != self.guild_id:
+            await interaction.response.send_message(
+                "These controls are only available inside the tavern's guild.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    def _get_character_cog(self) -> Optional[CharacterCreation]:
+        cog = self.cog.bot.get_cog("CharacterCreation")
+        if isinstance(cog, CharacterCreation):
+            return cog
+        return None
+
+    @discord.ui.button(
+        label="Create Character",
+        style=discord.ButtonStyle.success,
+        custom_id="manage_character:create",
+    )
+    async def create_character(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:  # noqa: D401
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Character creation is only available inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        user_id = interaction.user.id
+        if await self.cog.characters.exists(interaction.guild.id, user_id):
+            await interaction.response.send_message(
+                "You already have a saved character. Delete it first if you wish to recreate it.",
+                ephemeral=True,
+            )
+            return
+
+        if self.cog.creation_in_progress(user_id):
+            await interaction.response.send_message(
+                "You're already in the middle of character creation. Finish that flow before starting a new one.",
+                ephemeral=True,
+            )
+            return
+
+        view = CharacterCreationView(self.cog.characters, interaction.user)
+        view.rebuild_items()
+        await view.start(interaction)
+        self.cog.track_creation_session(user_id, view)
+
+    @discord.ui.button(
+        label="View Character",
+        style=discord.ButtonStyle.primary,
+        custom_id="manage_character:view",
+    )
+    async def view_character(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:  # noqa: D401
+        character_cog = self._get_character_cog()
+        if character_cog is None:
+            await interaction.response.send_message(
+                "Character viewing is currently unavailable. Try again later.",
+                ephemeral=True,
+            )
+            return
+        await character_cog.character_view(interaction)
+
+    @discord.ui.button(
+        label="Delete Character",
+        style=discord.ButtonStyle.danger,
+        custom_id="manage_character:delete",
+    )
+    async def delete_character(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:  # noqa: D401
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Character deletion is only available inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        exists = await self.cog.characters.exists(interaction.guild.id, interaction.user.id)
+        if not exists:
+            await interaction.response.send_message(
+                "You don't have a saved character yet.",
+                ephemeral=True,
+            )
+            return
+
+        confirmation = DeletionConfirmationView(
+            self.cog.characters,
+            requester_id=interaction.user.id,
+            guild_id=interaction.guild.id,
+            user_id=interaction.user.id,
+        )
+        await interaction.response.send_message(
+            "Are you sure you want to delete your saved character?",
+            view=confirmation,
+            ephemeral=True,
+        )
+
     @discord.ui.button(
         label="Join Party",
         style=discord.ButtonStyle.success,
@@ -1028,10 +1145,14 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         self.characters = CharacterRepository(data_path / "characters.json")
         self.shop = TavernShop.default_shop()
         self.party_managers: dict[int, PartyManager] = {}
+        self._active_creations: dict[int, asyncio.Task[None]] = {}
         self.refresh_views.start()
 
     def cog_unload(self) -> None:  # noqa: D401 - discord.py hook
         self.refresh_views.cancel()
+        for task in list(self._active_creations.values()):
+            task.cancel()
+        self._active_creations.clear()
 
     def get_party_manager(self, guild_id: int) -> PartyManager:
         manager = self.party_managers.get(guild_id)
@@ -1039,6 +1160,25 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
             manager = PartyManager()
             self.party_managers[guild_id] = manager
         return manager
+
+    def creation_in_progress(self, user_id: int) -> bool:
+        task = self._active_creations.get(user_id)
+        if task is None:
+            return False
+        if task.done():
+            self._active_creations.pop(user_id, None)
+            return False
+        return True
+
+    def track_creation_session(self, user_id: int, view: CharacterCreationView) -> None:
+        async def monitor() -> None:
+            try:
+                await view.wait()
+            finally:
+                self._active_creations.pop(user_id, None)
+
+        task = asyncio.create_task(monitor())
+        self._active_creations[user_id] = task
 
     async def update_tavern_embed(self, guild_id: int) -> None:
         config = await self.config_store.get_config(guild_id)
@@ -1068,6 +1208,20 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
             await message.edit(embed=embed, view=view)
         except discord.HTTPException:
             log.debug("Failed to update tavern embed in %s", channel.name)
+
+    def _build_manage_embed(self, guild: discord.Guild) -> discord.Embed:
+        embed = discord.Embed(
+            title="Manage Your Adventurer",
+            description=(
+                "Use the buttons below to manage your character.\n"
+                "• **Create Character** starts a private, step-by-step creation flow.\n"
+                "• **View Character** shows your saved hero just to you.\n"
+                "• **Delete Character** asks for confirmation before removal."
+            ),
+            colour=discord.Colour.blurple(),
+        )
+        embed.set_footer(text="All actions reply privately to the requesting player.")
+        return embed
 
     def _build_tavern_embed(self, guild: discord.Guild) -> discord.Embed:
         manager = self.get_party_manager(guild.id)
@@ -1393,6 +1547,9 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         for channel in (c for c in (manage_channel, tavern_channel) if c is not None):
             await self._sync_channel_access(channel)
 
+        if manage_channel is not None:
+            await self._refresh_manage_embed(manage_channel, config)
+
         if tavern_channel is not None:
             await self._refresh_tavern_embed(tavern_channel, config)
 
@@ -1444,9 +1601,40 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
             message = await channel.send(embed=embed, view=view)
         except discord.HTTPException:
             log.warning("Failed to send tavern embed in %s", channel.name)
-            await self.config_store.update_message(channel.guild.id, None)
+            await self.config_store.update_message(channel.guild.id, None, target="tavern")
             return
-        await self.config_store.update_message(channel.guild.id, message.id)
+        await self.config_store.update_message(channel.guild.id, message.id, target="tavern")
+
+    async def _refresh_manage_embed(
+        self, channel: discord.TextChannel, config: TavernConfig
+    ) -> None:
+        embed = self._build_manage_embed(channel.guild)
+        view = ManageCharacterView(self, guild_id=channel.guild.id)
+
+        message: Optional[discord.Message] = None
+        if config.manage_message_id:
+            try:
+                message = await channel.fetch_message(config.manage_message_id)
+            except (discord.NotFound, discord.HTTPException):
+                message = None
+
+        if message is not None:
+            try:
+                await message.edit(embed=embed, view=view)
+            except discord.HTTPException:
+                message = None
+
+        if message is None:
+            try:
+                message = await channel.send(embed=embed, view=view)
+            except discord.HTTPException:
+                log.warning("Failed to send manage-character embed in %s", channel.name)
+                await self.config_store.update_message(channel.guild.id, None, target="manage")
+                return
+
+        await self.config_store.update_message(
+            channel.guild.id, message.id, target="manage"
+        )
 
     async def _delete_previous_message(self, guild: discord.Guild, config: TavernConfig) -> None:
         if config.tavern_channel_id is None:

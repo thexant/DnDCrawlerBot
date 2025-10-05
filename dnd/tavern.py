@@ -6,7 +6,7 @@ import asyncio
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Literal, Optional, Sequence, Tuple
 
 from .characters import Character
 
@@ -20,6 +20,7 @@ class TavernConfig:
     manage_channel_id: Optional[int] = None
     tavern_channel_id: Optional[int] = None
     message_id: Optional[int] = None
+    manage_message_id: Optional[int] = None
 
     @property
     def channel_id(self) -> Optional[int]:
@@ -73,6 +74,7 @@ class TavernConfigStore:
                         if tavern_channel_id is None:
                             continue
                         message_id = payload.get("message_id")
+                        manage_message_id = payload.get("manage_message_id")
                         config = TavernConfig(
                             guild_id=numeric_id,
                             category_id=category_id if isinstance(category_id, int) else None,
@@ -81,6 +83,9 @@ class TavernConfigStore:
                             ),
                             tavern_channel_id=tavern_channel_id,
                             message_id=message_id if isinstance(message_id, int) else None,
+                            manage_message_id=(
+                                manage_message_id if isinstance(manage_message_id, int) else None
+                            ),
                         )
                         cache[str(numeric_id)] = config
                 self._cache = cache
@@ -98,6 +103,8 @@ class TavernConfigStore:
                 payload["tavern_channel_id"] = config.tavern_channel_id
             if config.message_id is not None:
                 payload["message_id"] = config.message_id
+            if config.manage_message_id is not None:
+                payload["manage_message_id"] = config.manage_message_id
             serialised[guild_id] = payload
         text = json.dumps(serialised, indent=2, sort_keys=True)
         await asyncio.to_thread(self._storage_path.write_text, text, encoding="utf-8")
@@ -114,6 +121,7 @@ class TavernConfigStore:
                 manage_channel_id=config.manage_channel_id,
                 tavern_channel_id=config.tavern_channel_id,
                 message_id=config.message_id,
+                manage_message_id=config.manage_message_id,
             )
 
     async def set_channels(
@@ -127,27 +135,41 @@ class TavernConfigStore:
         async with self._lock:
             await self._ensure_loaded()
             existing = self._cache.get(str(guild_id))
-            message_id = None
-            if existing and existing.tavern_channel_id == tavern_channel_id:
-                message_id = existing.message_id
+            tavern_message_id = None
+            manage_message_id = None
+            if existing:
+                if existing.tavern_channel_id == tavern_channel_id:
+                    tavern_message_id = existing.message_id
+                if existing.manage_channel_id == manage_channel_id:
+                    manage_message_id = existing.manage_message_id
             config = TavernConfig(
                 guild_id=guild_id,
                 category_id=category_id,
                 manage_channel_id=manage_channel_id,
                 tavern_channel_id=tavern_channel_id,
-                message_id=message_id,
+                message_id=tavern_message_id,
+                manage_message_id=manage_message_id,
             )
             self._cache[str(guild_id)] = config
             await self._persist()
             return config
 
-    async def update_message(self, guild_id: int, message_id: Optional[int]) -> Optional[TavernConfig]:
+    async def update_message(
+        self,
+        guild_id: int,
+        message_id: Optional[int],
+        *,
+        target: Literal["tavern", "manage"] = "tavern",
+    ) -> Optional[TavernConfig]:
         async with self._lock:
             await self._ensure_loaded()
             config = self._cache.get(str(guild_id))
             if config is None:
                 return None
-            config.message_id = message_id
+            if target == "manage":
+                config.manage_message_id = message_id
+            else:
+                config.message_id = message_id
             await self._persist()
             return TavernConfig(
                 guild_id=config.guild_id,
@@ -155,6 +177,7 @@ class TavernConfigStore:
                 manage_channel_id=config.manage_channel_id,
                 tavern_channel_id=config.tavern_channel_id,
                 message_id=config.message_id,
+                manage_message_id=config.manage_message_id,
             )
 
     async def all_configs(self) -> Tuple[TavernConfig, ...]:
@@ -167,6 +190,7 @@ class TavernConfigStore:
                     manage_channel_id=config.manage_channel_id,
                     tavern_channel_id=config.tavern_channel_id,
                     message_id=config.message_id,
+                    manage_message_id=config.manage_message_id,
                 )
                 for config in self._cache.values()
             )
