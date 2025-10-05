@@ -4486,27 +4486,20 @@ class DungeonCog(commands.Cog):
             if isinstance(channel, discord.TextChannel):
                 party_channel = channel
 
-        if party_channel is not None:
-            try:
-                await party_channel.send(
-                    f"The party returns triumphant from {removed.dungeon.name}!"
-                )
-            except discord.HTTPException:
-                pass
-
-        embed = self._build_completion_embed(removed, exit_label=exit_label)
         announcement_channel = await self._find_tavern_channel(removed.guild_id)
+        embed = self._build_completion_embed(removed, exit_label=exit_label)
         targets: list[discord.TextChannel] = []
         if announcement_channel is not None:
             targets.append(announcement_channel)
         elif party_channel is not None:
             targets.append(party_channel)
         delivered_channels: set[int] = set()
+        triumph_text = f"The party returns triumphant from {removed.dungeon.name}!"
         for target in targets:
             if target.id in delivered_channels:
                 continue
             try:
-                await target.send(embed=embed)
+                await target.send(content=triumph_text, embed=embed)
             except discord.HTTPException:
                 continue
             delivered_channels.add(target.id)
