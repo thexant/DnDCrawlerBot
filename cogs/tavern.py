@@ -1044,7 +1044,7 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         config = await self.config_store.get_config(guild_id)
         if (
             config is None
-            or config.channel_id is None
+            or config.tavern_channel_id is None
             or config.message_id is None
         ):
             return
@@ -1053,7 +1053,7 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         if guild is None:
             return
 
-        channel = guild.get_channel(config.channel_id)
+        channel = guild.get_channel(config.tavern_channel_id)
         if not isinstance(channel, discord.TextChannel):
             return
 
@@ -1211,14 +1211,16 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         view = DungeonMapView(self, guild_id=guild_id, dungeons=display_dungeons)
         return embed, view, ""
 
-    @app_commands.command(name="set", description="Designate a channel as the guild's tavern hub")
-    @app_commands.describe(channel="Text channel to host the tavern. Defaults to the current channel.")
+    @app_commands.command(name="set", description="Configure the tavern hub category and channels")
+    @app_commands.describe(
+        category="Category that should contain the tavern channels. Leave blank to create one."
+    )
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def set_tavern(
         self,
         interaction: discord.Interaction,
-        channel: Optional[discord.TextChannel] = None,
+        category: Optional[discord.CategoryChannel] = None,
     ) -> None:
         if not interaction.guild:
             await interaction.response.send_message(
@@ -1227,26 +1229,116 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
             )
             return
 
-        target = channel or interaction.channel
-        if not isinstance(target, discord.TextChannel) or target.guild != interaction.guild:
+        guild = interaction.guild
+
+        if category is not None and category.guild != guild:
             await interaction.response.send_message(
-                "Please choose a text channel from this server to host the tavern.",
+                "Please choose a category from this server to host the tavern.",
                 ephemeral=True,
             )
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        previous = await self.config_store.get_config(interaction.guild.id)
-        new_config = await self.config_store.set_channel(interaction.guild.id, target.id)
+        previous = await self.config_store.get_config(guild.id)
 
-        if previous and previous.message_id and previous.channel_id != target.id:
-            await self._delete_previous_message(interaction.guild, previous)
+        reason = "Tavern hub configuration update"
+        target_category = category
+        if target_category is None:
+            if previous and previous.category_id:
+                existing_category = guild.get_channel(previous.category_id)
+                if isinstance(existing_category, discord.CategoryChannel):
+                    target_category = existing_category
+            if target_category is None:
+                try:
+                    target_category = await guild.create_category(
+                        "Tavern", reason="Initial tavern hub setup"
+                    )
+                except discord.HTTPException:
+                    await interaction.followup.send(
+                        "I couldn't create a Tavern category. Grant me Manage Channels permissions and try again.",
+                        ephemeral=True,
+                    )
+                    return
+
+        if target_category is None:  # Defensive — should not happen
+            await interaction.followup.send(
+                "I couldn't determine where to place the tavern. Specify a category explicitly and try again.",
+                ephemeral=True,
+            )
+            return
+
+        async def ensure_text_channel(
+            name: str, existing_id: Optional[int]
+        ) -> Optional[discord.TextChannel]:
+            channel: Optional[discord.TextChannel] = None
+            if existing_id:
+                fetched = guild.get_channel(existing_id)
+                if isinstance(fetched, discord.TextChannel):
+                    channel = fetched
+            if channel is None:
+                channel = discord.utils.get(target_category.text_channels, name=name)
+            if channel is None:
+                channel = discord.utils.get(guild.text_channels, name=name)
+            if channel is None:
+                try:
+                    return await guild.create_text_channel(
+                        name, category=target_category, reason=reason
+                    )
+                except discord.HTTPException as exc:
+                    log.warning("Failed to create %s channel in %s: %s", name, guild.name, exc)
+                    return None
+            if channel.category_id != target_category.id:
+                try:
+                    await channel.edit(category=target_category, reason=reason)
+                except discord.HTTPException as exc:
+                    log.warning("Failed to move %s into %s: %s", name, target_category.name, exc)
+                    return None
+            return channel
+
+        manage_existing = previous.manage_channel_id if previous else None
+        tavern_existing = previous.tavern_channel_id if previous else previous.channel_id
+
+        manage_channel = await ensure_text_channel("manage-character", manage_existing)
+        if manage_channel is None:
+            await interaction.followup.send(
+                "I couldn't configure the #manage-character channel. Check my permissions and try again.",
+                ephemeral=True,
+            )
+            return
+
+        tavern_channel = await ensure_text_channel("tavern", tavern_existing)
+        if tavern_channel is None:
+            await interaction.followup.send(
+                "I couldn't configure the #tavern channel. Check my permissions and try again.",
+                ephemeral=True,
+            )
+            return
+
+        if (
+            previous
+            and previous.message_id
+            and previous.tavern_channel_id
+            and previous.tavern_channel_id != tavern_channel.id
+        ):
+            await self._delete_previous_message(guild, previous)
+
+        new_config = await self.config_store.set_channels(
+            guild.id,
+            category_id=target_category.id,
+            manage_channel_id=manage_channel.id,
+            tavern_channel_id=tavern_channel.id,
+        )
 
         await self._refresh_tavern_for_config(new_config)
 
-        channel_mention = target.mention
-        await interaction.followup.send(f"The tavern is now located in {channel_mention}.", ephemeral=True)
+        await interaction.followup.send(
+            (
+                f"The tavern hub is now in {target_category.mention} with "
+                f"{manage_channel.mention} and {tavern_channel.mention}."
+            ),
+            ephemeral=True,
+        )
 
     @tasks.loop(minutes=5)
     async def refresh_views(self) -> None:
@@ -1286,12 +1378,23 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         guild = self.bot.get_guild(config.guild_id)
         if guild is None:
             return
-        channel = guild.get_channel(config.channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            return
+        manage_channel: Optional[discord.TextChannel] = None
+        if config.manage_channel_id:
+            channel = guild.get_channel(config.manage_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                manage_channel = channel
 
-        await self._sync_channel_access(channel)
-        await self._refresh_tavern_embed(channel, config)
+        tavern_channel: Optional[discord.TextChannel] = None
+        if config.tavern_channel_id:
+            channel = guild.get_channel(config.tavern_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                tavern_channel = channel
+
+        for channel in (c for c in (manage_channel, tavern_channel) if c is not None):
+            await self._sync_channel_access(channel)
+
+        if tavern_channel is not None:
+            await self._refresh_tavern_embed(tavern_channel, config)
 
     async def _sync_channel_access(self, channel: discord.TextChannel) -> None:
         guild = channel.guild
@@ -1346,7 +1449,9 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         await self.config_store.update_message(channel.guild.id, message.id)
 
     async def _delete_previous_message(self, guild: discord.Guild, config: TavernConfig) -> None:
-        channel = guild.get_channel(config.channel_id)
+        if config.tavern_channel_id is None:
+            return
+        channel = guild.get_channel(config.tavern_channel_id)
         if not isinstance(channel, discord.TextChannel):
             return
         try:
