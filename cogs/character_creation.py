@@ -746,7 +746,7 @@ class CharacterCreationView(discord.ui.View):
             await self.message.edit(embed=timeout_embed, view=None)
 
 
-class CharacterDeleteConfirmation(discord.ui.View):
+class DeletionConfirmationView(discord.ui.View):
     """Confirmation dialog for deleting a stored character."""
 
     def __init__(
@@ -792,6 +792,10 @@ class CharacterDeleteConfirmation(discord.ui.View):
             view=None,
         )
         self.stop()
+
+
+# Backwards compatibility alias until all imports use the new name.
+CharacterDeleteConfirmation = DeletionConfirmationView
 
 
 class CharacterCreation(commands.GroupCog, name="character", description="Create and manage D&D characters"):
@@ -890,7 +894,7 @@ class CharacterCreation(commands.GroupCog, name="character", description="Create
             )
             return
 
-        view = CharacterDeleteConfirmation(
+        view = DeletionConfirmationView(
             self.repository,
             requester_id=interaction.user.id,
             guild_id=interaction.guild.id,
