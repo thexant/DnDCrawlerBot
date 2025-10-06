@@ -800,6 +800,32 @@ class DeletionConfirmationView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:  # noqa: D401
         await self.repository.clear(self.guild_id, self.user_id)
+        guild_id = interaction.guild_id
+        if guild_id is not None:
+            tavern_cog = getattr(interaction.client, "get_cog", lambda _name: None)(
+                "Tavern"
+            )
+            if tavern_cog is None:
+                log.debug(
+                    "Tavern cog not loaded; skipping tavern access refresh for guild %s",
+                    guild_id,
+                )
+            else:
+                refresh = getattr(tavern_cog, "refresh_tavern_access", None)
+                if callable(refresh):
+                    try:
+                        await refresh(guild_id)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        log.debug(
+                            "Failed to refresh tavern access for guild %s after deletion: %s",
+                            guild_id,
+                            exc,
+                        )
+                else:
+                    log.debug(
+                        "Tavern cog for guild %s does not provide refresh_tavern_access; skipping",
+                        guild_id,
+                    )
         await interaction.response.edit_message(
             content="Your saved character has been deleted.",
             view=None,
