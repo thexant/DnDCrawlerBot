@@ -1047,6 +1047,7 @@ class DungeonCog(commands.Cog):
         if guild_id is not None and user_id is not None:
             try:
                 await self.characters.clear(guild_id, user_id)
+                await self._update_tavern_access(guild_id)
             except Exception as exc:  # pragma: no cover - defensive logging
                 log.warning(
                     "Failed to clear character %s in guild %s after death: %s",
