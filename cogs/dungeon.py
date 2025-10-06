@@ -1137,15 +1137,19 @@ class DungeonCog(commands.Cog):
     async def _handle_party_failure(self, session: DungeonSession) -> None:
         session.party_fall_announced = True
         key = self._session_key(session.guild_id, session.channel_id)
-        removed = await self.sessions.pop(key)
+        sessions = getattr(self, "sessions", None)
+        removed: Optional[DungeonSession] = None
+        if sessions is not None and hasattr(sessions, "pop"):
+            removed = await sessions.pop(key)
         if removed is None:
             removed = session
         else:
             removed.party_fall_announced = True
         removed.party_ids.update(session.party_ids)
 
-        if removed.guild_id is not None:
-            guild = self.bot.get_guild(removed.guild_id)
+        get_guild = getattr(self.bot, "get_guild", None)
+        if removed.guild_id is not None and callable(get_guild):
+            guild = get_guild(removed.guild_id)
         else:
             guild = None
 
@@ -1216,6 +1220,14 @@ class DungeonCog(commands.Cog):
     async def _preferred_delve_category(
         self, guild: discord.Guild
     ) -> Optional[discord.CategoryChannel]:
+        tavern_cog = self._get_tavern_cog()
+        if tavern_cog is not None:
+            config = await tavern_cog.config_store.get_config(guild.id)
+            if config and config.category_id:
+                category = guild.get_channel(config.category_id)
+                if isinstance(category, discord.CategoryChannel):
+                    return category
+
         category_id = await self.metadata_store.get_delve_category(guild.id)
         if category_id is None:
             return None
@@ -1478,7 +1490,10 @@ class DungeonCog(commands.Cog):
         return item_lines, gold_lines, (delivered_items, delivered_gold)
 
     def _get_tavern_cog(self) -> Optional["Tavern"]:
-        cog = self.bot.get_cog("Tavern")
+        get_cog = getattr(self.bot, "get_cog", None)
+        if get_cog is None:
+            return None
+        cog = get_cog("Tavern")
         if cog is None:
             return None
         try:
@@ -5112,69 +5127,6 @@ class DungeonCog(commands.Cog):
         self._guild_theme_cache[interaction.guild_id] = theme.key
         await interaction.response.send_message(
             f"Default dungeon theme set to {theme.name}.",
-            ephemeral=True,
-        )
-
-    @dungeon_group.command(
-        name="category",
-        description="Configure the category where delve channels are created.",
-    )
-    @app_commands.describe(
-        category="Category for new delve channels",
-        clear="Clear the configured category",
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def configure_category(
-        self,
-        interaction: discord.Interaction,
-        category: Optional[discord.CategoryChannel] = None,
-        clear: bool = False,
-    ) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "Delve categories can only be managed from within a guild.",
-                ephemeral=True,
-            )
-            return
-
-        if clear:
-            await self.metadata_store.set_delve_category(interaction.guild_id, None)
-            await interaction.response.send_message(
-                "Cleared the configured delve category.",
-                ephemeral=True,
-            )
-            return
-
-        if category is None:
-            await interaction.response.send_message(
-                "Please choose a category or enable the clear option.",
-                ephemeral=True,
-            )
-            return
-
-        if category.guild.id != interaction.guild_id:
-            await interaction.response.send_message(
-                "Please select a category from this server.",
-                ephemeral=True,
-            )
-            return
-
-        me = interaction.guild.me
-        if me is not None:
-            permissions = category.permissions_for(me)
-            if not permissions.manage_channels:
-                await interaction.response.send_message(
-                    (
-                        f"I cannot create channels in {category.name}. "
-                        "Grant me Manage Channels permission for that category or choose another."
-                    ),
-                    ephemeral=True,
-                )
-                return
-
-        await self.metadata_store.set_delve_category(interaction.guild_id, category.id)
-        await interaction.response.send_message(
-            f"New delve channels will be created under {category.name}.",
             ephemeral=True,
         )
 
