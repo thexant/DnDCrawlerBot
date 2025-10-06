@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 import random
 from typing import Dict, Mapping, Optional, Sequence
@@ -21,6 +22,9 @@ from dnd import (
     CharacterRepository,
 )
 from dnd.characters import EquipmentChoice, EquipmentChoiceOption, SkillSelection
+
+
+log = logging.getLogger(__name__)
 
 class CreationStateError(ValueError):
     """Raised when invalid state transitions occur during creation."""
@@ -711,6 +715,25 @@ class CharacterCreationView(discord.ui.View):
             name=f"{interaction.user.display_name}'s Adventurer",
         )
         await self.repository.save(character)
+        tavern_cog = getattr(interaction.client, "get_cog", lambda _name: None)("Tavern")
+        if tavern_cog is None:
+            log.debug("Tavern cog not loaded; skipping tavern access refresh for guild %s", interaction.guild.id)
+        else:
+            refresh = getattr(tavern_cog, "refresh_tavern_access", None)
+            if callable(refresh):
+                try:
+                    await refresh(interaction.guild.id)
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.debug(
+                        "Failed to refresh tavern access for guild %s after character creation: %s",
+                        interaction.guild.id,
+                        exc,
+                    )
+            else:
+                log.debug(
+                    "Tavern cog for guild %s does not provide refresh_tavern_access; skipping",
+                    interaction.guild.id,
+                )
         confirmation = discord.Embed(
             title=character.name,
             description="Character saved successfully!",
