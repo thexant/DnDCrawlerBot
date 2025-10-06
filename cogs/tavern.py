@@ -1514,8 +1514,13 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
             return None
         return cog if isinstance(cog, DungeonCog) else None
 
-    async def refresh_tavern_access(self, guild_id: int) -> None:
-        """Synchronise tavern role membership for ``guild_id``."""
+    async def refresh_tavern_access(
+        self,
+        guild_id: int,
+        *,
+        config: Optional[TavernConfig] = None,
+    ) -> None:
+        """Synchronise tavern role membership and channel visibility for ``guild_id``."""
 
         guild = self.bot.get_guild(guild_id)
         if guild is None:
@@ -1525,8 +1530,29 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         except discord.HTTPException as exc:
             log.debug("Unable to ensure tavern role in %s: %s", guild.name, exc)
             return
+
         allowed = await self._eligible_member_ids(guild_id)
         await self._sync_role_membership(role, allowed)
+
+        if config is None:
+            config = await self.config_store.get_config(guild_id)
+        if config is None:
+            return
+
+        manage_channel: Optional[discord.TextChannel] = None
+        if config.manage_channel_id:
+            channel = guild.get_channel(config.manage_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                manage_channel = channel
+
+        tavern_channel: Optional[discord.TextChannel] = None
+        if config.tavern_channel_id:
+            channel = guild.get_channel(config.tavern_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                tavern_channel = channel
+
+        for channel in (c for c in (manage_channel, tavern_channel) if c is not None):
+            await self._sync_channel_access(config, channel, role=role)
 
     async def _refresh_tavern_for_config(self, config: TavernConfig) -> None:
         guild = self.bot.get_guild(config.guild_id)
@@ -1544,8 +1570,9 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
             if isinstance(channel, discord.TextChannel):
                 tavern_channel = channel
 
-        for channel in (c for c in (manage_channel, tavern_channel) if c is not None):
-            await self._sync_channel_access(channel)
+        await self.refresh_tavern_access(config.guild_id, config=config)
+
+        await self._ensure_channel_order(manage_channel, tavern_channel)
 
         if manage_channel is not None:
             await self._refresh_manage_embed(manage_channel, config)
@@ -1553,35 +1580,104 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         if tavern_channel is not None:
             await self._refresh_tavern_embed(tavern_channel, config)
 
-    async def _sync_channel_access(self, channel: discord.TextChannel) -> None:
+    async def _sync_channel_access(
+        self,
+        config: TavernConfig,
+        channel: discord.TextChannel,
+        *,
+        role: discord.Role,
+    ) -> None:
         guild = channel.guild
-        try:
-            role = await self._ensure_tavern_role(guild)
-        except discord.HTTPException:
-            log.warning("Missing permissions to manage tavern role in %s", guild.name)
+        is_manage = config.manage_channel_id == channel.id
+        is_tavern = config.tavern_channel_id == channel.id
+        if not (is_manage or is_tavern):
             return
-        allowed = await self._eligible_member_ids(guild.id)
-        await self._sync_role_membership(role, allowed)
 
-        overwrites = channel.overwrites_for(guild.default_role)
-        if overwrites.view_channel is not False:
+        default_overwrites = channel.overwrites_for(guild.default_role)
+        default_changed = False
+        if is_manage:
+            if default_overwrites.view_channel is not True:
+                default_overwrites.view_channel = True
+                default_changed = True
+            if default_overwrites.send_messages is not False:
+                default_overwrites.send_messages = False
+                default_changed = True
+            if default_overwrites.read_message_history is not True:
+                default_overwrites.read_message_history = True
+                default_changed = True
+        else:
+            if default_overwrites.view_channel is not False:
+                default_overwrites.view_channel = False
+                default_changed = True
+            if default_overwrites.send_messages is not False:
+                default_overwrites.send_messages = False
+                default_changed = True
+
+        if default_changed:
             try:
-                await channel.set_permissions(guild.default_role, view_channel=False)
+                await channel.set_permissions(
+                    guild.default_role, overwrite=default_overwrites
+                )
             except discord.HTTPException:
-                log.warning("Failed to update default role permissions for tavern in %s", guild.name)
+                log.warning(
+                    "Failed to update default role permissions for %s in %s",
+                    channel.name,
+                    guild.name,
+                )
 
         role_overwrites = channel.overwrites_for(role)
-        changed = False
-        if role_overwrites.view_channel is not True or role_overwrites.send_messages is not True:
-            role_overwrites.view_channel = True
-            role_overwrites.send_messages = True
-            role_overwrites.read_message_history = True
-            changed = True
-        if changed:
+        role_changed = False
+        if is_manage:
+            if role_overwrites.view_channel is not True:
+                role_overwrites.view_channel = True
+                role_changed = True
+            if role_overwrites.send_messages is not False:
+                role_overwrites.send_messages = False
+                role_changed = True
+            if role_overwrites.read_message_history is not True:
+                role_overwrites.read_message_history = True
+                role_changed = True
+        else:
+            if role_overwrites.view_channel is not True:
+                role_overwrites.view_channel = True
+                role_changed = True
+            if role_overwrites.send_messages is not True:
+                role_overwrites.send_messages = True
+                role_changed = True
+            if role_overwrites.read_message_history is not True:
+                role_overwrites.read_message_history = True
+                role_changed = True
+
+        if role_changed:
             try:
                 await channel.set_permissions(role, overwrite=role_overwrites)
             except discord.HTTPException:
-                log.warning("Failed to apply tavern role permissions in %s", guild.name)
+                log.warning(
+                    "Failed to apply tavern role permissions for %s in %s",
+                    channel.name,
+                    guild.name,
+                )
+
+    async def _ensure_channel_order(
+        self,
+        manage_channel: Optional[discord.TextChannel],
+        tavern_channel: Optional[discord.TextChannel],
+    ) -> None:
+        if manage_channel is None or tavern_channel is None:
+            return
+        if manage_channel.category_id != tavern_channel.category_id:
+            return
+        if manage_channel.position <= tavern_channel.position:
+            return
+        try:
+            await manage_channel.edit(
+                position=tavern_channel.position,
+                reason="Maintain tavern channel ordering",
+            )
+        except discord.HTTPException:
+            log.warning(
+                "Failed to adjust tavern channel order in %s", manage_channel.guild.name
+            )
 
     async def _refresh_tavern_embed(self, channel: discord.TextChannel, config: TavernConfig) -> None:
         if config.message_id:
