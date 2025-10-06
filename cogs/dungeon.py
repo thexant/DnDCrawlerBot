@@ -263,6 +263,7 @@ class DungeonSession:
     traps_triggered: int = 0
     treasure_items_claimed: int = 0
     treasure_gold_claimed: int = 0
+    party_fall_announced: bool = False
 
     @property
     def room(self) -> Room:
@@ -1077,8 +1078,116 @@ class DungeonCog(commands.Cog):
             except Exception:  # pragma: no cover - defensive logging
                 log.debug("Failed to register death view for message %s", message_id)
 
+        await self._send_player_to_manage_channel(session, combatant)
+        await self._handle_party_failure_if_needed(session)
+
     def _session_key(self, guild_id: Optional[int], channel_id: Optional[int]) -> SessionKey:
         return SessionManager.make_key(guild_id, channel_id)
+
+    async def _send_player_to_manage_channel(
+        self, session: DungeonSession, combatant: CombatantState
+    ) -> None:
+        guild_id = session.guild_id
+        user_id = combatant.user_id
+        if guild_id is None or user_id is None:
+            return
+
+        manage_channel = await self._find_manage_channel(guild_id)
+        if manage_channel is None:
+            return
+
+        room = session.room
+        embed = discord.Embed(
+            colour=discord.Colour.blurple(),
+            title="Forge a New Legend",
+            description=(
+                f"{combatant.name} has fallen within {session.dungeon.name}. "
+                "Create a new character with `/character create` to rejoin the adventure."
+            ),
+        )
+        embed.add_field(
+            name="Final Stand",
+            value=f"Room {room.id + 1}: {room.name}",
+            inline=False,
+        )
+        embed.set_footer(text="Your story continues with a new hero.")
+
+        try:
+            await manage_channel.send(content=f"<@{user_id}>", embed=embed)
+        except discord.HTTPException:  # pragma: no cover - network guard
+            log.debug(
+                "Failed to send manage-channel prompt for %s in guild %s",
+                user_id,
+                guild_id,
+            )
+
+    async def _handle_party_failure_if_needed(self, session: DungeonSession) -> None:
+        if session.party_fall_announced:
+            return
+        state = session.combat_state
+        if state is None:
+            return
+        players = [c for c in state.order if c.is_player]
+        if not players:
+            return
+        if any(not combatant.is_dead for combatant in players):
+            return
+        await self._handle_party_failure(session)
+
+    async def _handle_party_failure(self, session: DungeonSession) -> None:
+        session.party_fall_announced = True
+        key = self._session_key(session.guild_id, session.channel_id)
+        removed = await self.sessions.pop(key)
+        if removed is None:
+            removed = session
+        else:
+            removed.party_fall_announced = True
+        removed.party_ids.update(session.party_ids)
+
+        if removed.guild_id is not None:
+            guild = self.bot.get_guild(removed.guild_id)
+        else:
+            guild = None
+
+        if removed.message_id is not None and guild is not None:
+            channel = guild.get_channel(removed.channel_id)
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    message = await channel.fetch_message(removed.message_id)
+                except (discord.HTTPException, AttributeError):
+                    message = None
+                else:
+                    try:
+                        await message.edit(view=None)
+                    except discord.HTTPException:
+                        pass
+
+        announcement_channel = await self._find_tavern_channel(removed.guild_id)
+        targets: list[discord.TextChannel] = []
+        if announcement_channel is not None:
+            targets.append(announcement_channel)
+        elif guild is not None:
+            channel = guild.get_channel(removed.channel_id)
+            if isinstance(channel, discord.TextChannel):
+                targets.append(channel)
+
+        embed = self._build_party_failure_embed(removed)
+        fallen_text = (
+            f"The party has fallen in {removed.dungeon.name}! No survivors returned."
+        )
+
+        delivered: set[int] = set()
+        for target in targets:
+            if target.id in delivered:
+                continue
+            try:
+                await target.send(content=fallen_text, embed=embed)
+            except discord.HTTPException:
+                continue
+            delivered.add(target.id)
+
+        asyncio.create_task(self._run_delayed_party_cleanup(removed))
+        await self._update_tavern_access(removed.guild_id)
 
     def _normalise_party_channel_name(self, dungeon_name: str) -> str:
         slug = re.sub(r"[^a-z0-9\-\s]", "", dungeon_name.lower())
@@ -4403,6 +4512,28 @@ class DungeonCog(commands.Cog):
         channel = guild.get_channel(channel_id)
         return channel if isinstance(channel, discord.TextChannel) else None
 
+    async def _find_manage_channel(
+        self, guild_id: Optional[int]
+    ) -> Optional[discord.TextChannel]:
+        if guild_id is None:
+            return None
+        tavern_cog = self._get_tavern_cog()
+        if tavern_cog is None:
+            return None
+        try:
+            config = await tavern_cog.config_store.get_config(guild_id)
+        except Exception:
+            return None
+        if config is None:
+            return None
+        if config.manage_channel_id is None:
+            return None
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return None
+        channel = guild.get_channel(config.manage_channel_id)
+        return channel if isinstance(channel, discord.TextChannel) else None
+
     @staticmethod
     def _format_duration(started_at: datetime) -> str:
         now = datetime.now(timezone.utc)
@@ -4464,6 +4595,60 @@ class DungeonCog(commands.Cog):
 
         duration_text = self._format_duration(session.started_at)
         embed.add_field(name="Duration", value=duration_text, inline=False)
+        return embed
+
+    def _build_party_failure_embed(self, session: DungeonSession) -> discord.Embed:
+        embed = discord.Embed(
+            colour=discord.Colour.dark_red(),
+            title=f"Party Fallen — {session.dungeon.name}",
+            description=(
+                f"The heroes were slain within {session.dungeon.name}. "
+                "No tales of victory escaped the depths."
+            ),
+        )
+
+        room = session.room
+        embed.add_field(
+            name="Final Stand",
+            value=f"Room {room.id + 1}: {room.name}",
+            inline=False,
+        )
+
+        party_ids = tuple(sorted(session.party_ids))
+        if party_ids:
+            adventurers = "\n".join(f"• <@{user_id}>" for user_id in party_ids)
+        else:
+            adventurers = "• Unknown adventurers"
+        embed.add_field(name="Adventurers", value=adventurers, inline=False)
+
+        rooms_explored = len(set(session.breadcrumbs)) or 1
+        summary_lines = [
+            f"Rooms explored: {rooms_explored}",
+            f"Monsters defeated: {session.monsters_defeated}",
+            f"Traps disarmed: {session.traps_disarmed}",
+        ]
+        if session.traps_triggered:
+            summary_lines.append(f"Traps sprung: {session.traps_triggered}")
+        embed.add_field(name="Summary", value="\n".join(summary_lines), inline=False)
+
+        if session.treasure_items_claimed or session.treasure_gold_claimed:
+            treasure_lines: list[str] = []
+            if session.treasure_items_claimed:
+                treasure_lines.append(
+                    f"Items recovered: {session.treasure_items_claimed}"
+                )
+            if session.treasure_gold_claimed:
+                treasure_lines.append(
+                    f"Gold secured: {session.treasure_gold_claimed}"
+                )
+            treasure_value = "\n".join(treasure_lines)
+        else:
+            treasure_value = "No treasure recovered."
+        embed.add_field(name="Treasure", value=treasure_value, inline=False)
+
+        duration_text = self._format_duration(session.started_at)
+        embed.add_field(name="Duration", value=duration_text, inline=False)
+        embed.set_footer(text="Raise a glass in the tavern for the fallen party.")
         return embed
 
     async def _handle_delve_completion(
