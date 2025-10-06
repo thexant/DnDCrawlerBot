@@ -1142,7 +1142,11 @@ class ManageCharacterView(discord.ui.View):
         )
 
 
-class Tavern(commands.GroupCog, name="tavern", description="Configure the guild's tavern hub"):
+class Tavern(
+    commands.GroupCog,
+    name="category",
+    description="Configure the shared tavern and dungeon category",
+):
     def __init__(self, bot: commands.Bot) -> None:
         super().__init__()
         self.bot = bot
@@ -1371,13 +1375,18 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
         view = DungeonMapView(self, guild_id=guild_id, dungeons=display_dungeons)
         return embed, view, ""
 
-    @app_commands.command(name="set", description="Configure the tavern hub category and channels")
+    @app_commands.command(
+        name="set", description="Configure the tavern and dungeon channel category"
+    )
     @app_commands.describe(
-        category="Category that should contain the tavern channels. Leave blank to create one."
+        category=(
+            "Category that should contain the tavern and delve channels. "
+            "Leave blank to create one."
+        )
     )
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def set_tavern(
+    async def set_category(
         self,
         interaction: discord.Interaction,
         category: Optional[discord.CategoryChannel] = None,
@@ -1402,7 +1411,7 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
 
         previous = await self.config_store.get_config(guild.id)
 
-        reason = "Tavern hub configuration update"
+        reason = "Tavern and dungeon category configuration update"
         target_category = category
         if target_category is None:
             if previous and previous.category_id:
@@ -1492,10 +1501,24 @@ class Tavern(commands.GroupCog, name="tavern", description="Configure the guild'
 
         await self._refresh_tavern_for_config(new_config)
 
+        dungeon_cog = self._get_dungeon_cog()
+        if dungeon_cog is not None:
+            try:
+                await dungeon_cog.metadata_store.set_delve_category(
+                    guild.id, target_category.id
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug(
+                    "Failed to synchronise dungeon category for %s: %s",
+                    guild.name,
+                    exc,
+                )
+
         await interaction.followup.send(
             (
                 f"The tavern hub is now in {target_category.mention} with "
-                f"{manage_channel.mention} and {tavern_channel.mention}."
+                f"{manage_channel.mention} and {tavern_channel.mention}. "
+                "Dungeon parties will gather here as well."
             ),
             ephemeral=True,
         )
