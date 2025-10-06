@@ -847,117 +847,6 @@ class TavernControlView(discord.ui.View):
         except discord.HTTPException:
             view.message = None
 
-class ManageCharacterView(discord.ui.View):
-    """Persistent controls for creating, viewing, and deleting characters."""
-
-    def __init__(self, cog: "Tavern", *, guild_id: int) -> None:
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.guild_id = guild_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
-        guild = interaction.guild
-        if guild is None or guild.id != self.guild_id:
-            await interaction.response.send_message(
-                "These controls are only available inside the tavern's guild.",
-                ephemeral=True,
-            )
-            return False
-        return True
-
-    def _get_character_cog(self) -> Optional[CharacterCreation]:
-        cog = self.cog.bot.get_cog("CharacterCreation")
-        if isinstance(cog, CharacterCreation):
-            return cog
-        return None
-
-    @discord.ui.button(
-        label="Create Character",
-        style=discord.ButtonStyle.success,
-        custom_id="manage_character:create",
-    )
-    async def create_character(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:  # noqa: D401
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "Character creation is only available inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        user_id = interaction.user.id
-        if await self.cog.characters.exists(interaction.guild.id, user_id):
-            await interaction.response.send_message(
-                "You already have a saved character. Delete it first if you wish to recreate it.",
-                ephemeral=True,
-            )
-            return
-
-        if self.cog.creation_in_progress(user_id):
-            await interaction.response.send_message(
-                "You're already in the middle of character creation. Finish that flow before starting a new one.",
-                ephemeral=True,
-            )
-            return
-
-        view = CharacterCreationView(self.cog.characters, interaction.user)
-        view.rebuild_items()
-        await view.start(interaction)
-        self.cog.track_creation_session(user_id, view)
-
-    @discord.ui.button(
-        label="View Character",
-        style=discord.ButtonStyle.primary,
-        custom_id="manage_character:view",
-    )
-    async def view_character(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:  # noqa: D401
-        character_cog = self._get_character_cog()
-        if character_cog is None:
-            await interaction.response.send_message(
-                "Character viewing is currently unavailable. Try again later.",
-                ephemeral=True,
-            )
-            return
-        await character_cog.character_view(interaction)
-
-    @discord.ui.button(
-        label="Delete Character",
-        style=discord.ButtonStyle.danger,
-        custom_id="manage_character:delete",
-    )
-    async def delete_character(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:  # noqa: D401
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "Character deletion is only available inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        exists = await self.cog.characters.exists(interaction.guild.id, interaction.user.id)
-        if not exists:
-            await interaction.response.send_message(
-                "You don't have a saved character yet.",
-                ephemeral=True,
-            )
-            return
-
-        confirmation = DeletionConfirmationView(
-            self.cog.characters,
-            requester_id=interaction.user.id,
-            guild_id=interaction.guild.id,
-            user_id=interaction.user.id,
-        )
-        await interaction.response.send_message(
-            "Are you sure you want to delete your saved character?",
-            view=confirmation,
-            ephemeral=True,
-        )
-
     @discord.ui.button(
         label="Join Party",
         style=discord.ButtonStyle.success,
@@ -1134,6 +1023,118 @@ class ManageCharacterView(discord.ui.View):
             await interaction.response.send_message(fallback, ephemeral=True)
             return
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class ManageCharacterView(discord.ui.View):
+    """Persistent controls for creating, viewing, and deleting characters."""
+
+    def __init__(self, cog: "Tavern", *, guild_id: int) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
+        guild = interaction.guild
+        if guild is None or guild.id != self.guild_id:
+            await interaction.response.send_message(
+                "These controls are only available inside the tavern's guild.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    def _get_character_cog(self) -> Optional[CharacterCreation]:
+        cog = self.cog.bot.get_cog("CharacterCreation")
+        if isinstance(cog, CharacterCreation):
+            return cog
+        return None
+
+    @discord.ui.button(
+        label="Create Character",
+        style=discord.ButtonStyle.success,
+        custom_id="manage_character:create",
+    )
+    async def create_character(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:  # noqa: D401
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Character creation is only available inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        user_id = interaction.user.id
+        if await self.cog.characters.exists(interaction.guild.id, user_id):
+            await interaction.response.send_message(
+                "You already have a saved character. Delete it first if you wish to recreate it.",
+                ephemeral=True,
+            )
+            return
+
+        if self.cog.creation_in_progress(user_id):
+            await interaction.response.send_message(
+                "You're already in the middle of character creation. Finish that flow before starting a new one.",
+                ephemeral=True,
+            )
+            return
+
+        view = CharacterCreationView(self.cog.characters, interaction.user)
+        view.rebuild_items()
+        await view.start(interaction)
+        self.cog.track_creation_session(user_id, view)
+
+    @discord.ui.button(
+        label="View Character",
+        style=discord.ButtonStyle.primary,
+        custom_id="manage_character:view",
+    )
+    async def view_character(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:  # noqa: D401
+        character_cog = self._get_character_cog()
+        if character_cog is None:
+            await interaction.response.send_message(
+                "Character viewing is currently unavailable. Try again later.",
+                ephemeral=True,
+            )
+            return
+        await character_cog.character_view(interaction)
+
+    @discord.ui.button(
+        label="Delete Character",
+        style=discord.ButtonStyle.danger,
+        custom_id="manage_character:delete",
+    )
+    async def delete_character(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:  # noqa: D401
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Character deletion is only available inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        exists = await self.cog.characters.exists(interaction.guild.id, interaction.user.id)
+        if not exists:
+            await interaction.response.send_message(
+                "You don't have a saved character yet.",
+                ephemeral=True,
+            )
+            return
+
+        confirmation = DeletionConfirmationView(
+            self.cog.characters,
+            requester_id=interaction.user.id,
+            guild_id=interaction.guild.id,
+            user_id=interaction.user.id,
+        )
+        await interaction.response.send_message(
+            "Are you sure you want to delete your saved character?",
+            view=confirmation,
+            ephemeral=True,
+        )
 
 
 class Tavern(commands.GroupCog, name="tavern", description="Configure the guild's tavern hub"):
