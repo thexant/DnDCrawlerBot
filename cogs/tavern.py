@@ -889,9 +889,14 @@ class TavernControlView(discord.ui.View):
             return
 
         parties = manager.parties()
-        available = [party for party in parties if len(party.members) < manager.max_size]
+        active_parties = [party for party in parties if party.members]
+        available = [
+            party
+            for party in active_parties
+            if len(party.members) < manager.max_size
+        ]
 
-        if not parties:
+        if not active_parties:
             await interaction.response.send_message(
                 "No parties are gathering yet. Use **Create Party** to start one.",
                 ephemeral=True,
