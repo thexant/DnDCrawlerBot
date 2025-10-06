@@ -46,6 +46,7 @@ class Room:
     encounter: EncounterResult
     exits: Sequence["RoomExit"] = field(default_factory=tuple)
     position: tuple[int, int] = (0, 0)
+    is_corridor: bool = False
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ class Corridor:
     description: str
     from_label: str
     to_label: str
+    room_id: int | None = None
 
 
 @dataclass
@@ -145,7 +147,7 @@ DIFFICULTY_PROFILES: Dict[str, DifficultyProfile] = {
     "challenging": DifficultyProfile(
         monster_count=(2, 4),
         challenge_bias=1.3,
-        min_monster_challenge=1.0,
+        min_monster_challenge=1.2,
         trap_count=(1, 2),
         trap_danger_bias=1.3,
         trap_min_dc=13,
@@ -321,6 +323,95 @@ class DungeonGenerator:
                 add_corridor_between(first, second)
                 added += 1
 
+        # Expand the coordinate grid to leave space for corridor rooms between chambers.
+        scale = 2
+        scaled_positions: Dict[int, tuple[int, int]] = {}
+        occupied_scaled: set[tuple[int, int]] = set()
+        for room_id, coord in positions.items():
+            scaled = (coord[0] * scale, coord[1] * scale)
+            scaled_positions[room_id] = scaled
+            occupied_scaled.add(scaled)
+
+        for room in rooms:
+            if room.id in scaled_positions:
+                room.position = scaled_positions[room.id]
+
+        room_lookup: Dict[int, Room] = {room.id: room for room in rooms}
+
+        next_room_id = len(rooms)
+
+        def find_midpoint(first_coord: tuple[int, int], second_coord: tuple[int, int]) -> tuple[int, int]:
+            base = ((first_coord[0] + second_coord[0]) // 2, (first_coord[1] + second_coord[1]) // 2)
+            if base not in occupied_scaled:
+                return base
+            radius = 1
+            while True:
+                for dx in range(-radius, radius + 1):
+                    for dy in range(-radius, radius + 1):
+                        if abs(dx) + abs(dy) != radius:
+                            continue
+                        candidate = (base[0] + dx, base[1] + dy)
+                        if candidate not in occupied_scaled:
+                            return candidate
+                radius += 1
+
+        original_corridors = list(corridors)
+        corridors = []
+        for corridor in original_corridors:
+            from_room = room_lookup.get(corridor.from_room)
+            to_room = room_lookup.get(corridor.to_room)
+            if from_room is None or to_room is None:
+                continue
+
+            midpoint = find_midpoint(scaled_positions[from_room.id], scaled_positions[to_room.id])
+            corridor_room_id = next_room_id
+            next_room_id += 1
+
+            corridor_room = self._generate_corridor_room(
+                corridor_room_id,
+                corridor=corridor,
+                from_room=from_room,
+                to_room=to_room,
+                difficulty=active_difficulty,
+            )
+            corridor_room.position = midpoint
+
+            rooms.append(corridor_room)
+            room_lookup[corridor_room.id] = corridor_room
+            scaled_positions[corridor_room.id] = midpoint
+            occupied_scaled.add(midpoint)
+
+            adjacency[corridor.from_room].discard(corridor.to_room)
+            adjacency[corridor.to_room].discard(corridor.from_room)
+            adjacency.setdefault(corridor_room.id, set()).update(
+                {corridor.from_room, corridor.to_room}
+            )
+            adjacency[corridor.from_room].add(corridor_room.id)
+            adjacency[corridor.to_room].add(corridor_room.id)
+
+            corridors.append(
+                Corridor(
+                    from_room=corridor.from_room,
+                    to_room=corridor_room.id,
+                    description=corridor.description,
+                    from_label=corridor.from_label,
+                    to_label=f"Back toward {from_room.name}",
+                    room_id=corridor_room.id,
+                )
+            )
+            corridors.append(
+                Corridor(
+                    from_room=corridor_room.id,
+                    to_room=corridor.to_room,
+                    description=corridor.description,
+                    from_label=f"Continue to {to_room.name}",
+                    to_label=corridor.to_label,
+                    room_id=corridor_room.id,
+                )
+            )
+
+        positions = scaled_positions
+
         exits_map: dict[int, list[RoomExit]] = defaultdict(list)
         for corridor_index, corridor in enumerate(corridors):
             corridor_key = f"c{corridor_index}"
@@ -354,8 +445,13 @@ class DungeonGenerator:
                     distances[neighbor] = distance + 1
                     queue.append((neighbor, distance + 1))
             if distances:
+                candidate_items = [
+                    item for item in distances.items() if not room_lookup[item[0]].is_corridor
+                ]
+                if not candidate_items:
+                    candidate_items = list(distances.items())
                 farthest_room_id = max(
-                    distances.items(), key=lambda item: (item[1], item[0])
+                    candidate_items, key=lambda item: (item[1], item[0])
                 )[0]
         exit_key = f"delve-exit:r{farthest_room_id}"
         exits_map[farthest_room_id].append(
@@ -399,6 +495,46 @@ class DungeonGenerator:
             name=template.name,
             description=description,
             encounter=encounter,
+        )
+
+    def _select_corridor_encounter_kind(self) -> str:
+        weights = {
+            "trap": 3,
+            "treasure": 2,
+            "combat": 2,
+            "empty": 3,
+        }
+        table = EncounterTable(weights)
+        return table.roll(self._rng)
+
+    def _generate_corridor_room(
+        self,
+        room_id: int,
+        *,
+        corridor: Corridor,
+        from_room: Room,
+        to_room: Room,
+        difficulty: str,
+    ) -> Room:
+        encounter_kind = self._select_corridor_encounter_kind()
+        encounter = self._build_encounter(encounter_kind, difficulty)
+
+        description_parts = [
+            corridor.description,
+            f"This passage links {from_room.name} and {to_room.name}.",
+        ]
+        if encounter.summary:
+            description_parts.append(encounter.summary)
+        description = "\n\n".join(part.strip() for part in description_parts if part)
+
+        name = f"Passage between {from_room.name} and {to_room.name}"
+
+        return Room(
+            id=room_id,
+            name=name,
+            description=description,
+            encounter=encounter,
+            is_corridor=True,
         )
 
     def _generate_corridor(self, from_room: Room, to_room: Room) -> Corridor:

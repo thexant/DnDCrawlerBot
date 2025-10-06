@@ -209,6 +209,30 @@ def test_generate_builds_branching_graph(arcane_theme: Theme) -> None:
         )
 
 
+def test_generate_adds_interactive_corridor_rooms(arcane_theme: Theme) -> None:
+    generator = DungeonGenerator(arcane_theme, seed=187)
+    dungeon = generator.generate(room_count=4)
+
+    corridor_rooms = [room for room in dungeon.rooms if room.is_corridor]
+    assert corridor_rooms, "Corridor rooms should be generated for each passage"
+
+    for corridor_room in corridor_rooms:
+        assert corridor_room.encounter is not None
+        assert corridor_room.exits, "Corridor rooms should provide exits"
+        destinations = {
+            exit_option.destination
+            for exit_option in corridor_room.exits
+            if exit_option.destination is not None
+        }
+        assert destinations, "Corridor rooms should lead somewhere"
+        assert corridor_room.id not in destinations
+        assert corridor_room.description
+
+    for corridor in dungeon.corridors:
+        assert dungeon.get_room(corridor.from_room)
+        assert dungeon.get_room(corridor.to_room)
+
+
 def test_generated_corridors_allow_backtracking(arcane_theme: Theme) -> None:
     generator = DungeonGenerator(arcane_theme, seed=104)
     dungeon = generator.generate(room_count=6)
