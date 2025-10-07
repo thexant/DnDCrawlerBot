@@ -42,6 +42,7 @@ from .dungeon import (
     TrapDefinition,
 )
 from .repository import CharacterRepository
+from .games import GuildGame, GuildGameConfigStore
 from .tavern import (
     InsufficientFunds,
     ItemNotCarried,
@@ -63,6 +64,8 @@ __all__ = [
     "Character",
     "CharacterClass",
     "Race",
+    "GuildGame",
+    "GuildGameConfigStore",
     "CharacterRepository",
     "AttackRollResult",
     "Combatant",
