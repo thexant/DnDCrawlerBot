@@ -8,9 +8,10 @@ import logging
 import random
 import re
 import secrets
-from datetime import datetime, timezone
 from collections import Counter, deque
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import (
     Awaitable,
@@ -55,6 +56,7 @@ from dnd.dungeon import (
     Theme,
     ThemeRegistry,
 )
+from dnd.dungeon.map_render import render_dungeon_map
 from dnd.dungeon.state import DungeonMetadataStore, StoredDungeon
 from dnd.dungeon.rewards import (
     RewardShare,
@@ -280,6 +282,14 @@ class DungeonSession:
         if not self.breadcrumbs:
             self.breadcrumbs.append(self.current_room)
         self.room_damage_log.setdefault(self.current_room, {"monsters": 0, "traps": 0})
+
+
+@dataclass
+class SessionEmbedPayload:
+    """Container for embeds and files representing a dungeon session update."""
+
+    embeds: List[discord.Embed]
+    files: List[discord.File] = field(default_factory=list)
 
 
 @dataclass
@@ -4342,14 +4352,43 @@ class DungeonCog(commands.Cog):
 
         return "\n".join(lines) if lines else "(no rooms)"
 
+    def _build_map_image(self, session: DungeonSession) -> BytesIO:
+        dungeon = session.dungeon
+        positions = self._resolve_room_positions(dungeon)
+        if not positions:
+            raise ValueError("No rooms available to render the dungeon map")
+
+        image = render_dungeon_map(
+            rooms=dungeon.rooms,
+            corridors=getattr(dungeon, "corridors", ()),
+            positions=positions,
+            current_room=session.current_room,
+        )
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        buffer.seek(0)
+        return buffer
+
     def _build_session_embeds(
         self, session: DungeonSession, *, interaction: Optional[discord.Interaction] = None
-    ) -> List[discord.Embed]:
+    ) -> SessionEmbedPayload:
         map_string = self._build_map_string(session)
-        map_embed = discord.Embed(
-            title="Dungeon Map",
-            description=f"```\n{map_string}\n```",
-        )
+        map_embed = discord.Embed(title="Dungeon Map")
+
+        files: List[discord.File] = []
+        try:
+            image_buffer = self._build_map_image(session)
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and "Pillow" in str(exc):
+                log.warning("Dungeon map image unavailable: %s", exc)
+            else:
+                log.exception("Failed to render dungeon map image", exc_info=True)
+        else:
+            files.append(discord.File(image_buffer, filename="dungeon_map.png"))
+            map_embed.set_image(url="attachment://dungeon_map.png")
+
+        if not files:
+            map_embed.description = f"```\n{map_string}\n```"
 
         embeds: List[discord.Embed] = [map_embed]
         room_embed = self._build_room_embed(interaction, session)
@@ -4358,7 +4397,7 @@ class DungeonCog(commands.Cog):
         combat_embed = self._build_combat_embed(session)
         if combat_embed is not None:
             embeds.append(combat_embed)
-        return embeds
+        return SessionEmbedPayload(embeds=embeds, files=files)
 
     def _build_combat_embed(self, session: DungeonSession) -> Optional[discord.Embed]:
         combat = session.combat_state
@@ -4482,10 +4521,14 @@ class DungeonCog(commands.Cog):
                 message = await channel.fetch_message(session.message_id)
             except (discord.HTTPException, AttributeError):
                 return
-        embeds = self._build_session_embeds(session)
+        payload = self._build_session_embeds(session)
         view = self._build_navigation_view(session)
         try:
-            await message.edit(embeds=embeds, view=view)
+            await message.edit(
+                embeds=payload.embeds,
+                view=view,
+                attachments=payload.files or [],
+            )
         except discord.HTTPException:
             return
         self.bot.add_view(view, message_id=session.message_id)
@@ -4493,13 +4536,14 @@ class DungeonCog(commands.Cog):
     async def _refresh_session_message(self, interaction: discord.Interaction, session: DungeonSession) -> None:
         if session.message_id is None:
             return
-        embeds = self._build_session_embeds(session, interaction=interaction)
+        payload = self._build_session_embeds(session, interaction=interaction)
         view = self._build_navigation_view(session)
         try:
             await interaction.followup.edit_message(
                 message_id=session.message_id,
-                embeds=embeds,
+                embeds=payload.embeds,
                 view=view,
+                attachments=payload.files or [],
             )
             self.bot.add_view(view, message_id=session.message_id)
         except discord.HTTPException:
@@ -4837,10 +4881,14 @@ class DungeonCog(commands.Cog):
 
         await self._sync_party_channel_access(session)
 
-        embeds = self._build_session_embeds(session, interaction=interaction)
+        payload = self._build_session_embeds(session, interaction=interaction)
         view = self._build_navigation_view(session)
         try:
-            message = await party_channel.send(embeds=embeds, view=view)
+            message = await party_channel.send(
+                embeds=payload.embeds,
+                files=payload.files or None,
+                view=view,
+            )
         except discord.HTTPException as exc:
             removed = await self.sessions.pop(key)
             if removed is not None:
