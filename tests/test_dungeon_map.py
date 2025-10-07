@@ -1,5 +1,13 @@
 import sys
+from io import BytesIO
 from pathlib import Path
+
+try:
+    import PIL  # type: ignore[import]
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    HAS_PILLOW = False
+else:  # pragma: no cover - optional dependency
+    HAS_PILLOW = True
 
 import pytest
 
@@ -10,6 +18,7 @@ if str(ROOT) not in sys.path:
 from cogs.dungeon import DungeonCog, DungeonSession
 from dnd.content.models import EncounterTable, Theme
 from dnd.dungeon.generator import Corridor, Dungeon, EncounterResult, Room
+from dnd.dungeon.map_render import render_dungeon_map
 
 
 @pytest.fixture()
@@ -67,14 +76,36 @@ def test_map_highlights_current_room(simple_session: DungeonSession) -> None:
     assert first_map != second_map
 
 
+@pytest.mark.skipif(not HAS_PILLOW, reason="Pillow is required for image rendering")
 def test_session_embeds_include_map_first(simple_session: DungeonSession) -> None:
     cog = DungeonCog.__new__(DungeonCog)
-    embeds = cog._build_session_embeds(simple_session)
+    payload = cog._build_session_embeds(simple_session)
+    embeds = payload.embeds
     assert embeds
     assert embeds[0].title == "Dungeon Map"
-    assert embeds[0].description is not None
-    assert "```" in embeds[0].description
+    assert payload.files
+    image_file = payload.files[0]
+    image_file.fp.seek(0)
+    assert image_file.fp.read(8) == b"\x89PNG\r\n\x1a\n"
+    image_file.fp.seek(0)
+    assert embeds[0].image.url == "attachment://dungeon_map.png"
+    assert embeds[0].description in (None, "")
     assert any(embed.title and "Room" in embed.title for embed in embeds[1:])
+
+
+def test_session_embeds_fall_back_to_ascii_map(
+    simple_session: DungeonSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cog = DungeonCog.__new__(DungeonCog)
+
+    def _raise(*_args, **_kwargs) -> BytesIO:  # type: ignore[return-value]
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(DungeonCog, "_build_map_image", _raise)
+    payload = cog._build_session_embeds(simple_session)
+
+    assert not payload.files
+    assert "```" in (payload.embeds[0].description or "")
 
 
 def test_map_draws_vertical_corridors() -> None:
@@ -121,6 +152,22 @@ def test_map_draws_vertical_corridors() -> None:
     assert "[01]" in map_string or "[02]" in map_string
     assert "+----+" in map_string
     assert "   |" in map_string
+
+
+@pytest.mark.skipif(not HAS_PILLOW, reason="Pillow is required for image rendering")
+def test_render_dungeon_map_highlights_current_room(
+    simple_session: DungeonSession,
+) -> None:
+    image = render_dungeon_map(
+        rooms=simple_session.dungeon.rooms,
+        corridors=simple_session.dungeon.corridors,
+        positions=simple_session.dungeon.room_positions,
+        current_room=0,
+    )
+
+    assert image.size == (480, 288)
+    assert image.getpixel((144, 144))[:3] == (88, 129, 189)
+    assert image.getpixel((336, 144))[:3] == (54, 59, 82)
 
 
 def test_resolve_room_positions_infers_missing_coordinates() -> None:
