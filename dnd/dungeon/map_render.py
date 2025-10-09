@@ -143,10 +143,20 @@ def render_dungeon_map(
 
         if font is not None:
             label = f"{room.id + 1:02d}"
-            text_width, text_height = draw.textsize(label, font=font)
+            try:
+                bbox = draw.textbbox((0, 0), label, font=font)
+            except AttributeError:
+                text_width, text_height = draw.textsize(label, font=font)
+                text_offset_x = 0
+                text_offset_y = 0
+            else:
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+                text_offset_x = bbox[0]
+                text_offset_y = bbox[1]
             text_position = (
-                center_x - text_width // 2,
-                center_y - text_height // 2,
+                center_x - text_width // 2 - text_offset_x,
+                center_y - text_height // 2 - text_offset_y,
             )
             draw.text(text_position, label, fill=config.label_colour, font=font)
 

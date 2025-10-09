@@ -1325,7 +1325,13 @@ class DungeonCog(commands.Cog):
         for member_id in allowed_ids:
             member = guild.get_member(member_id)
             if member is None:
-                continue
+                try:
+                    member = await guild.fetch_member(member_id)
+                except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                    log.debug(
+                        "Failed to fetch party member %s for guild %s", member_id, guild.id
+                    )
+                    continue
             overwrite = channel.overwrites.get(member)
             if (
                 overwrite is not None
