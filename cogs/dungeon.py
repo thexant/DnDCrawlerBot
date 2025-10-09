@@ -10,7 +10,7 @@ import re
 import secrets
 from collections import Counter, deque
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import (
@@ -82,6 +82,8 @@ MONSTER_ACTION_PAUSE_RANGE = (3, 5)
 SPELLCASTING_ABILITIES: Dict[str, str] = {
     "wizard": "INT",
 }
+
+MOVEMENT_VOTE_TTL = timedelta(minutes=10)
 
 TrapStatus = Literal["hidden", "discovered", "disarmed", "sprung"]
 
@@ -259,6 +261,7 @@ class DungeonSession:
     perception_difficulties: Dict[int, Dict[tuple[str, str], int]] = field(
         default_factory=dict
     )
+    movement_vote: Optional["MovementVote"] = None
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     monsters_defeated: int = 0
     traps_disarmed: int = 0
@@ -365,6 +368,54 @@ class CombatState:
             if players is None or combatant.is_player is players:
                 results.append(combatant)
         return results
+
+
+@dataclass
+class MovementVote:
+    """Track ballots for selecting the next room exit."""
+
+    started_at: datetime
+    last_activity: datetime
+    ballots: Dict[int, str] = field(default_factory=dict)
+
+    def touch(self, now: datetime) -> None:
+        self.last_activity = now
+
+    def expired(self, now: datetime, ttl: timedelta) -> bool:
+        return now - self.last_activity >= ttl
+
+    def counts(self, members: Iterable[int]) -> Dict[str, int]:
+        tally: Dict[str, int] = {}
+        for user_id in members:
+            choice = self.ballots.get(user_id)
+            if choice is None:
+                continue
+            tally[choice] = tally.get(choice, 0) + 1
+        return tally
+
+
+@dataclass
+class MovementVoteResult:
+    """Outcome of recording a ballot for room navigation."""
+
+    status: Literal["started", "updated", "majority"]
+    choice: str
+    label: str
+    votes_for: int
+    required: int
+
+
+def _required_movement_votes(member_count: int) -> int:
+    return max(1, (member_count // 2) + 1)
+
+
+def _movement_majority_from_counts(
+    counts: Mapping[str, int], required: int
+) -> tuple[Optional[str], int]:
+    for option, tally in counts.items():
+        if tally >= required:
+            return option, tally
+    return None, 0
 
 
 class DungeonNavigationView(discord.ui.View):
@@ -5214,10 +5265,12 @@ class DungeonCog(commands.Cog):
         triggered_events: list[tuple[int, Trap, str]] = []
         avoidance_messages: list[str] = []
         completed_delve = False
+        vote_progress: Optional[MovementVoteResult] = None
 
         def mutate(run: DungeonSession) -> None:
             nonlocal moved, backtracked, added_member, exit_label, destination_room
             nonlocal party_snapshot, triggered_events, avoidance_messages, completed_delve
+            nonlocal vote_progress
             if interaction.user.id not in run.party_ids:
                 run.party_ids.add(interaction.user.id)
                 added_member = True
@@ -5230,6 +5283,12 @@ class DungeonCog(commands.Cog):
             states = run.trap_states.setdefault(current_room.id, {})
             traps = list(current_room.encounter.traps)
             traps_changed = False
+            discovered_exits = run.discovered_exits.setdefault(current_room.id, set())
+            exits_by_key = {
+                option.key: option
+                for option in current_room.exits
+                if option.key in discovered_exits
+            }
             for trap in list(traps):
                 status = states.get(trap.key, "hidden")
                 if status in ("disarmed", "sprung"):
@@ -5269,9 +5328,61 @@ class DungeonCog(commands.Cog):
                 run.room.encounter = replace(
                     current_room.encounter, traps=tuple(traps)
                 )
-            selected_exit = next((option for option in current_room.exits if option.key == exit_key), None)
+            selected_exit = exits_by_key.get(exit_key)
             if selected_exit is None:
                 return
+
+            party_snapshot = tuple(sorted(run.party_ids))
+            member_count = len(party_snapshot)
+            if member_count <= 1:
+                run.movement_vote = None
+            else:
+                now = datetime.now(timezone.utc)
+                vote = run.movement_vote
+                if vote is not None:
+                    for voter_id, choice in list(vote.ballots.items()):
+                        if voter_id not in run.party_ids or choice not in exits_by_key:
+                            del vote.ballots[voter_id]
+                    if vote.expired(now, MOVEMENT_VOTE_TTL):
+                        vote = None
+                vote_created = False
+                if vote is None:
+                    vote = MovementVote(started_at=now, last_activity=now)
+                    run.movement_vote = vote
+                    vote_created = True
+                vote.ballots[interaction.user.id] = selected_exit.key
+                vote.touch(now)
+                counts = vote.counts(party_snapshot)
+                required_votes = _required_movement_votes(member_count)
+                winner_key, votes_for_winner = _movement_majority_from_counts(
+                    counts, required_votes
+                )
+                if winner_key is None:
+                    votes_for_choice = counts.get(selected_exit.key, 0)
+                    status: Literal["started", "updated"] = (
+                        "started" if vote_created else "updated"
+                    )
+                    vote_progress = MovementVoteResult(
+                        status=status,
+                        choice=selected_exit.key,
+                        label=selected_exit.label,
+                        votes_for=votes_for_choice,
+                        required=required_votes,
+                    )
+                    return
+                winner_exit = exits_by_key.get(winner_key)
+                if winner_exit is None:
+                    run.movement_vote = None
+                    return
+                run.movement_vote = None
+                selected_exit = winner_exit
+                vote_progress = MovementVoteResult(
+                    status="majority",
+                    choice=winner_exit.key,
+                    label=winner_exit.label,
+                    votes_for=votes_for_winner,
+                    required=required_votes,
+                )
 
             origin_room_id = run.current_room
             if getattr(selected_exit, "completes_delve", False):
@@ -5344,6 +5455,23 @@ class DungeonCog(commands.Cog):
         session = await self.sessions.update(key, mutate)
         if session is None:
             await interaction.followup.send("No active dungeon for this party.", ephemeral=True)
+            return
+
+        if vote_progress is not None and vote_progress.status != "majority":
+            if added_member and interaction.guild_id is not None:
+                await self._handle_party_membership_change(interaction.guild_id, session)
+                added_member = False
+            if vote_progress.status == "started":
+                message = (
+                    f"A new movement vote has begun for **{vote_progress.label}**. "
+                    f"{vote_progress.votes_for}/{vote_progress.required} votes recorded."
+                )
+            else:
+                message = (
+                    f"Your vote for **{vote_progress.label}** is logged. "
+                    f"{vote_progress.votes_for}/{vote_progress.required} votes recorded."
+                )
+            await interaction.followup.send(message, ephemeral=True)
             return
 
         if completed_delve:

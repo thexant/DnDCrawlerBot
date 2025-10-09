@@ -173,6 +173,42 @@ def test_handle_exit_stealth_failure_triggers_combat(monkeypatch: pytest.MonkeyP
     asyncio.run(runner())
 
 
+def test_handle_exit_requires_majority_vote(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def runner() -> None:
+        cog = _make_cog(monkeypatch)
+        session = _make_session()
+        session.party_ids.add(200)
+        session.discovered_exits.setdefault(0, {"forward"})
+        session.exit_visibility.setdefault(0, {"forward": True})
+        key = cog._session_key(None, 1)
+        await cog.sessions.set(key, session)
+
+        interaction_one = DummyInteraction(user_id=100)
+        interaction_two = DummyInteraction(user_id=200)
+
+        async def fake_attempt(_interaction, _session, _party):
+            return True, "The party remains hidden."
+
+        monkeypatch.setattr(cog, "_attempt_room_stealth", fake_attempt)
+
+        await cog.handle_exit(interaction_one, "forward")
+
+        assert session.current_room == 0
+        assert session.movement_vote is not None
+        assert interaction_one.followup.sent_messages
+        assert "vote" in interaction_one.followup.sent_messages[-1].lower()
+
+        await cog.handle_exit(interaction_two, "forward")
+
+        assert session.current_room == 1
+        assert session.movement_vote is None
+        assert interaction_two.followup.sent_messages
+        travel_message = interaction_two.followup.sent_messages[-1].lower()
+        assert "take the" in travel_message or "backtrack" in travel_message
+
+    asyncio.run(runner())
+
+
 def test_attempt_room_stealth_uses_modifiers(monkeypatch: pytest.MonkeyPatch) -> None:
     async def runner() -> None:
         cog = _make_cog(monkeypatch)
